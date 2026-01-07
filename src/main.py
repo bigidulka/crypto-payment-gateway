@@ -146,7 +146,7 @@ def create_app() -> FastAPI:
 
     app.include_router(
         admin_router,
-        prefix="/v1",
+        prefix="/v1/admin",
         tags=["Admin API"],
     )
 

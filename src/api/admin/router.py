@@ -53,7 +53,7 @@ from src.db.models import (
 )
 from src.services.system_logger import SystemLogger
 
-router = APIRouter(prefix="/admin", tags=["Admin"])
+router = APIRouter(tags=["Admin"])
 
 
 # === Authentication ===
