@@ -563,6 +563,141 @@ async def reset_sweep(
     )
 
 
+# === Wallets ===
+
+
+@router.get(
+    "/wallets/balances",
+    response_model=CheckAllBalancesResponse,
+    summary="Проверить все балансы",
+)
+async def check_all_balances(
+    session: SessionDep,
+    with_balance_only: bool = Query(False, description="Только с балансом > 0"),
+) -> CheckAllBalancesResponse:
+    """
+    Проверить балансы всех deposit адресов.
+    Использует multicall для оптимизации RPC запросов.
+    """
+    from decimal import Decimal
+
+    # Получаем все deposit адреса
+    stmt = (
+        select(PaymentSession)
+        .options(
+            selectinload(PaymentSession.deposit_address),
+            selectinload(PaymentSession.invoice),
+        )
+        .where(PaymentSession.deposit_address_id.isnot(None))
+    )
+
+    result = await session.execute(stmt)
+    payment_sessions = result.scalars().unique().all()
+
+    balances_list: list[WalletBalanceItem] = []
+    total_balances: dict[str, Decimal] = {}
+    addresses_with_balance = 0
+    total_addresses_checked = 0
+
+    # Группируем по chain для batch запросов
+    chain_groups: dict[str, list[PaymentSession]] = {}
+    seen_addresses: set[tuple[str, str]] = set()
+
+    for ps in payment_sessions:
+        if not ps.deposit_address:
+            continue
+
+        key = (ps.deposit_address.address.lower(), ps.chain)
+        if key in seen_addresses:
+            continue
+        seen_addresses.add(key)
+
+        if ps.chain not in chain_groups:
+            chain_groups[ps.chain] = []
+        chain_groups[ps.chain].append(ps)
+
+    # Обрабатываем каждую сеть батчем
+    for chain_name, sessions in chain_groups.items():
+        try:
+            adapter = get_evm_adapter(chain_name)
+            chain_config = get_chain_config(chain_name)
+
+            addresses = [ps.deposit_address.address for ps in sessions]
+            token_contracts = [
+                chain_config.tokens["USDT"].contract_address,
+                chain_config.tokens["USDC"].contract_address,
+            ]
+
+            # Batch запросы
+            native_balances = await adapter.get_native_balances_batch(addresses)
+            token_balances = await adapter.get_balances_batch(
+                addresses, token_contracts
+            )
+
+            for ps in sessions:
+                addr = ps.deposit_address.address
+                addr_lower = addr.lower()
+                total_addresses_checked += 1
+
+                native_balance_wei = native_balances.get(addr_lower, 0)
+                addr_token_balances = token_balances.get(addr_lower, {})
+
+                # Проверяем токены
+                for token_symbol in ["USDT", "USDC"]:
+                    token_config = chain_config.tokens.get(token_symbol)
+                    if not token_config:
+                        continue
+
+                    balance = addr_token_balances.get(
+                        token_config.contract_address.lower(), Decimal(0)
+                    )
+
+                    if balance > 0 or not with_balance_only:
+                        balances_list.append(
+                            WalletBalanceItem(
+                                type="deposit_address",
+                                chain=chain_name,
+                                token=token_symbol,
+                                address=addr,
+                                balance=balance,
+                                native_balance_wei=native_balance_wei,
+                                invoice_id=(
+                                    str(ps.invoice.id) if ps.invoice else None
+                                ),
+                            )
+                        )
+
+                        key = f"{chain_name}/{token_symbol}"
+                        total_balances[key] = total_balances.get(key, Decimal(0)) + balance
+
+                        if balance > 0:
+                            addresses_with_balance += 1
+
+        except Exception as e:
+            # При ошибке добавляем с нулевыми балансами
+            if not with_balance_only:
+                for ps in sessions:
+                    total_addresses_checked += 1
+                    balances_list.append(
+                        WalletBalanceItem(
+                            type="deposit_address",
+                            chain=chain_name,
+                            token="ERROR",
+                            address=ps.deposit_address.address,
+                            balance=Decimal(0),
+                            native_balance_wei=0,
+                            invoice_id=str(ps.invoice.id) if ps.invoice else None,
+                        )
+                    )
+
+    return CheckAllBalancesResponse(
+        total_addresses_checked=total_addresses_checked,
+        addresses_with_balance=addresses_with_balance,
+        total_balances=total_balances,
+        balances=balances_list,
+    )
+
+
 # === Logs ===
 
 
