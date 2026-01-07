@@ -674,21 +674,26 @@ async def check_all_balances(
                             addresses_with_balance += 1
 
         except Exception as e:
-            # При ошибке добавляем с нулевыми балансами
+            # При ошибке добавляем с нулевыми балансами и логируем
+            import logging
+            logging.error(f"Error fetching balances for chain {chain_name}: {e}")
+            
             if not with_balance_only:
                 for ps in sessions:
                     total_addresses_checked += 1
-                    balances_list.append(
-                        WalletBalanceItem(
-                            type="deposit_address",
-                            chain=chain_name,
-                            token="ERROR",
-                            address=ps.deposit_address.address,
-                            balance=Decimal(0),
-                            native_balance_wei=0,
-                            invoice_id=str(ps.invoice.id) if ps.invoice else None,
+                    # Добавляем запись для каждого токена с пометкой об ошибке
+                    for token_symbol in ["USDT", "USDC"]:
+                        balances_list.append(
+                            WalletBalanceItem(
+                                type="deposit_address",
+                                chain=chain_name,
+                                token=f"{token_symbol} (RPC error)",
+                                address=ps.deposit_address.address,
+                                balance=Decimal(0),
+                                native_balance_wei=0,
+                                invoice_id=str(ps.invoice.id) if ps.invoice else None,
+                            )
                         )
-                    )
 
     return CheckAllBalancesResponse(
         total_addresses_checked=total_addresses_checked,
