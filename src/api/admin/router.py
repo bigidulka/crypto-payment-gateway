@@ -639,7 +639,8 @@ async def check_all_balances(
                 addr_lower = addr.lower()
                 total_addresses_checked += 1
 
-                native_balance_wei = native_balances.get(addr_lower, 0)
+                native_balance_ether = native_balances.get(addr_lower, Decimal(0))
+                native_balance_wei = int(native_balance_ether * 10**18)
                 addr_token_balances = token_balances.get(addr_lower, {})
 
                 # Проверяем токены
