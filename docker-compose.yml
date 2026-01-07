@@ -1,0 +1,159 @@
+services:
+  # ========== Database (SQLite - Local) ==========
+  # Using SQLite locally for development/testing
+  # Database file: ./arbitron_payment.db
+
+  # ========== Redis ==========
+  redis:
+    image: redis:7-alpine
+    container_name: arbitron-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ========== API Server ==========
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: arbitron-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: UTC
+      DATABASE_URL: sqlite+aiosqlite:////data/arbitron_payment.db
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8123:8000"
+    volumes:
+      - ./data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ========== EVM Log Poller Worker ==========
+  worker-poller:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: arbitron-worker-poller
+    restart: unless-stopped
+    command: ["python", "-m", "src.workers.evm_log_poller"]
+    env_file:
+      - .env
+    environment:
+      TZ: UTC
+      DATABASE_URL: sqlite+aiosqlite:////data/arbitron_payment.db
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ========== Persistent Deposit Poller (User Wallets) ==========
+  worker-persistent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: arbitron-worker-persistent
+    restart: unless-stopped
+    command: ["python", "-m", "src.workers.persistent_poller"]
+    env_file:
+      - .env
+    environment:
+      TZ: UTC
+      DATABASE_URL: sqlite+aiosqlite:////data/arbitron_payment.db
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ========== Webhook Dispatcher Worker ==========
+  worker-webhook:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: arbitron-worker-webhook
+    restart: unless-stopped
+    command: ["python", "-m", "src.workers.webhook_dispatcher"]
+    env_file:
+      - .env
+    environment:
+      TZ: UTC
+      DATABASE_URL: sqlite+aiosqlite:////data/arbitron_payment.db
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ========== Sweeper Worker ==========
+  worker-sweeper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: arbitron-worker-sweeper
+    restart: unless-stopped
+    command: ["python", "-m", "src.workers.sweeper"]
+    env_file:
+      - .env
+    environment:
+      TZ: UTC
+      DATABASE_URL: sqlite+aiosqlite:////data/arbitron_payment.db
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ========== Invoice Expirer Worker ==========
+  worker-expirer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: arbitron-worker-expirer
+    restart: unless-stopped
+    command: ["python", "-m", "src.workers.invoice_expirer"]
+    env_file:
+      - .env
+    environment:
+      TZ: UTC
+      DATABASE_URL: sqlite+aiosqlite:////data/arbitron_payment.db
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  redis_data:
+
+networks:
+  default:
+    name: arbitron-network
