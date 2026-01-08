@@ -140,6 +140,7 @@ class InvoiceListItem(BaseModel):
 
 class TokenBalance(BaseModel):
     """Баланс токена."""
+
     token: str
     balance: str  # В формате строки для фронтенда
 
