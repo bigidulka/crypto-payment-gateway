@@ -147,7 +147,7 @@ class TokenBalance(BaseModel):
 class WalletBalanceItem(BaseModel):
     """Адрес с балансом (сгруппированный по адресу)."""
 
-    type: Literal["wallet_address", "deposit_address"]
+    type: Literal["wallet_address", "deposit_address", "persistent_address"]
     chain: str
     address: str
     tokens: list[TokenBalance] = Field(default_factory=list)

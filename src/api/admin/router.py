@@ -50,6 +50,8 @@ from src.db.models import (
     SweepState,
     SystemLog,
     SystemLogLevel,
+    UserWallet,
+    WalletAddress,
 )
 from src.services.system_logger import SystemLogger
 
@@ -722,6 +724,132 @@ async def check_all_balances(
                         "native_balance": "0",
                         "native_symbol": native_symbol,
                         "invoice_id": str(ps.invoice.id) if ps.invoice else None,
+                        "merchant_name": merchant_name,
+                    }
+
+    # === Теперь обрабатываем WalletAddress (persistent addresses) ===
+    stmt_wallet = (
+        select(WalletAddress)
+        .options(selectinload(WalletAddress.user_wallet).selectinload(UserWallet.merchant))
+        .where(WalletAddress.is_active == True)
+    )
+    result_wallet = await session.execute(stmt_wallet)
+    wallet_addresses = result_wallet.scalars().unique().all()
+
+    # Группируем по chain
+    wallet_chain_groups: dict[str, list[WalletAddress]] = {}
+    for wa in wallet_addresses:
+        key = (wa.address.lower(), wa.chain)
+        if key in seen_addresses:
+            continue
+        seen_addresses.add(key)
+
+        if wa.chain not in wallet_chain_groups:
+            wallet_chain_groups[wa.chain] = []
+        wallet_chain_groups[wa.chain].append(wa)
+
+    # Обрабатываем persistent адреса
+    for chain_name, addresses_list in wallet_chain_groups.items():
+        try:
+            adapter = get_evm_adapter(chain_name)
+            chain_config = get_chain_config(chain_name)
+            native_symbol = chain_config.native_symbol
+
+            addrs = [wa.address for wa in addresses_list]
+            token_contracts = [
+                chain_config.tokens["USDT"].contract_address,
+                chain_config.tokens["USDC"].contract_address,
+            ]
+
+            native_balances = await adapter.get_native_balances_batch(addrs)
+            token_balances = await adapter.get_balances_batch(addrs, token_contracts)
+
+            for wa in addresses_list:
+                addr = wa.address
+                addr_lower = addr.lower()
+                total_addresses_checked += 1
+
+                native_balance_ether = native_balances.get(addr_lower, Decimal(0))
+                addr_token_balances = token_balances.get(addr_lower, {})
+
+                tokens_list: list[TokenBalance] = []
+                has_any_balance = False
+
+                for token_symbol in ["USDT", "USDC"]:
+                    token_config = chain_config.tokens.get(token_symbol)
+                    if not token_config:
+                        continue
+
+                    balance = addr_token_balances.get(
+                        token_config.contract_address.lower(), Decimal(0)
+                    )
+
+                    tokens_list.append(TokenBalance(
+                        token=token_symbol,
+                        balance=str(balance),
+                    ))
+
+                    key = f"{chain_name}/{token_symbol}"
+                    total_balances[key] = total_balances.get(key, Decimal(0)) + balance
+
+                    if balance > 0:
+                        has_any_balance = True
+
+                if has_any_balance:
+                    addresses_with_balance += 1
+
+                # Получаем имя мерчанта и user_id
+                merchant_name = None
+                user_id = None
+                if wa.user_wallet:
+                    user_id = wa.user_wallet.external_user_id
+                    if wa.user_wallet.merchant:
+                        merchant_name = wa.user_wallet.merchant.name
+
+                if has_any_balance or not with_balance_only:
+                    wallet_key = (addr_lower, chain_name)
+                    grouped_wallets[wallet_key] = {
+                        "type": "persistent_address",
+                        "chain": chain_name,
+                        "address": addr,
+                        "tokens": tokens_list,
+                        "native_balance": str(native_balance_ether),
+                        "native_symbol": native_symbol,
+                        "user_id": user_id,
+                        "merchant_name": merchant_name,
+                    }
+
+        except Exception as e:
+            import logging
+            logging.error(f"Error fetching persistent balances for chain {chain_name}: {e}")
+
+            if not with_balance_only:
+                chain_config = get_chain_config(chain_name)
+                native_symbol = chain_config.native_symbol if chain_config else "ETH"
+
+                for wa in addresses_list:
+                    total_addresses_checked += 1
+                    addr = wa.address
+                    wallet_key = (addr.lower(), chain_name)
+
+                    merchant_name = None
+                    user_id = None
+                    if wa.user_wallet:
+                        user_id = wa.user_wallet.external_user_id
+                        if wa.user_wallet.merchant:
+                            merchant_name = wa.user_wallet.merchant.name
+
+                    grouped_wallets[wallet_key] = {
+                        "type": "persistent_address",
+                        "chain": chain_name,
+                        "address": addr,
+                        "tokens": [
+                            TokenBalance(token="USDT (RPC error)", balance="0"),
+                            TokenBalance(token="USDC (RPC error)", balance="0"),
+                        ],
+                        "native_balance": "0",
+                        "native_symbol": native_symbol,
+                        "user_id": user_id,
                         "merchant_name": merchant_name,
                     }
 
