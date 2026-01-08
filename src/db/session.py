@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -14,6 +15,20 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from src.core.config import get_settings
+
+
+def _set_sqlite_pragma(dbapi_conn, connection_record):
+    """Включить WAL mode и другие оптимизации для SQLite."""
+    cursor = dbapi_conn.cursor()
+    # WAL mode - позволяет параллельные чтения и одну запись
+    cursor.execute("PRAGMA journal_mode=WAL")
+    # Уменьшить частоту sync для лучшей производительности
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    # Увеличить кэш для меньшего количества дисковых операций
+    cursor.execute("PRAGMA cache_size=-64000")  # 64MB
+    # Хранить temp таблицы в памяти
+    cursor.execute("PRAGMA temp_store=MEMORY")
+    cursor.close()
 
 
 @lru_cache
@@ -28,7 +43,14 @@ def get_engine() -> AsyncEngine:
     }
 
     # SQLite не поддерживает pool_size и max_overflow
-    if not settings.database_url.startswith("sqlite"):
+    if settings.database_url.startswith("sqlite"):
+        # Включаем WAL mode для лучшей поддержки параллельных операций
+        # и увеличиваем timeout для ожидания разблокировки
+        engine_kwargs["connect_args"] = {
+            "timeout": 30,  # Ждать 30 секунд при блокировке
+            "check_same_thread": False,
+        }
+    else:
         engine_kwargs.update(
             {
                 "pool_size": 10,
@@ -45,7 +67,13 @@ def get_engine() -> AsyncEngine:
                 "command_timeout": 60,  # Query timeout
             }
 
-    return create_async_engine(settings.database_url, **engine_kwargs)
+    engine = create_async_engine(settings.database_url, **engine_kwargs)
+
+    # Регистрируем pragma handler для SQLite
+    if settings.database_url.startswith("sqlite"):
+        event.listen(engine.sync_engine, "connect", _set_sqlite_pragma)
+
+    return engine
 
 
 @lru_cache
