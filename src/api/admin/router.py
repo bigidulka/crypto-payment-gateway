@@ -661,10 +661,12 @@ async def check_all_balances(
                         token_config.contract_address.lower(), Decimal(0)
                     )
 
-                    tokens_list.append(TokenBalance(
-                        token=token_symbol,
-                        balance=str(balance),
-                    ))
+                    tokens_list.append(
+                        TokenBalance(
+                            token=token_symbol,
+                            balance=str(balance),
+                        )
+                    )
 
                     key = f"{chain_name}/{token_symbol}"
                     total_balances[key] = total_balances.get(key, Decimal(0)) + balance
@@ -697,17 +699,18 @@ async def check_all_balances(
         except Exception as e:
             # При ошибке добавляем с нулевыми балансами и логируем
             import logging
+
             logging.error(f"Error fetching balances for chain {chain_name}: {e}")
-            
+
             if not with_balance_only:
                 chain_config = get_chain_config(chain_name)
                 native_symbol = chain_config.native_symbol if chain_config else "ETH"
-                
+
                 for ps in sessions:
                     total_addresses_checked += 1
                     addr = ps.deposit_address.address
                     wallet_key = (addr.lower(), chain_name)
-                    
+
                     # Получаем имя мерчанта
                     merchant_name = None
                     if ps.invoice and ps.invoice.merchant:
@@ -730,7 +733,9 @@ async def check_all_balances(
     # === Теперь обрабатываем WalletAddress (persistent addresses) ===
     stmt_wallet = (
         select(WalletAddress)
-        .options(selectinload(WalletAddress.user_wallet).selectinload(UserWallet.merchant))
+        .options(
+            selectinload(WalletAddress.user_wallet).selectinload(UserWallet.merchant)
+        )
         .where(WalletAddress.is_active == True)
     )
     result_wallet = await session.execute(stmt_wallet)
@@ -784,10 +789,12 @@ async def check_all_balances(
                         token_config.contract_address.lower(), Decimal(0)
                     )
 
-                    tokens_list.append(TokenBalance(
-                        token=token_symbol,
-                        balance=str(balance),
-                    ))
+                    tokens_list.append(
+                        TokenBalance(
+                            token=token_symbol,
+                            balance=str(balance),
+                        )
+                    )
 
                     key = f"{chain_name}/{token_symbol}"
                     total_balances[key] = total_balances.get(key, Decimal(0)) + balance
@@ -821,7 +828,10 @@ async def check_all_balances(
 
         except Exception as e:
             import logging
-            logging.error(f"Error fetching persistent balances for chain {chain_name}: {e}")
+
+            logging.error(
+                f"Error fetching persistent balances for chain {chain_name}: {e}"
+            )
 
             if not with_balance_only:
                 chain_config = get_chain_config(chain_name)
@@ -1218,3 +1228,127 @@ async def check_all_balances(
         total_balances=total_balances,
         balances=balances,
     )
+
+
+# === Batch Sweep ===
+
+
+@router.post(
+    "/batch-sweep",
+    summary="Запустить batch sweep всех кошельков",
+)
+async def run_batch_sweep_endpoint(
+    chains: list[str] | None = Query(None, description="Список сетей (все если не указано)"),
+    dry_run: bool = Query(True, description="Только проверка без реальных транзакций"),
+    include_deposits: bool = Query(True, description="Включить deposit адреса"),
+    include_persistent: bool = Query(True, description="Включить persistent адреса"),
+):
+    """
+    Запустить batch sweep - вывод средств со всех кошельков на treasury.
+    
+    Оптимизации:
+    - Multicall3 для batch проверки балансов
+    - Параллельная обработка сетей
+    - Фильтрация dust балансов (< $0.50)
+    - Приоритизация по сумме
+    
+    ВНИМАНИЕ: По умолчанию dry_run=True для безопасности!
+    """
+    from src.workers.batch_sweeper import run_batch_sweep
+    
+    results = await run_batch_sweep(
+        chains=chains,
+        dry_run=dry_run,
+        include_deposits=include_deposits,
+        include_persistent=include_persistent,
+    )
+    
+    # Формируем ответ
+    summary = {
+        "dry_run": dry_run,
+        "total_swept": sum(r.swept_count for r in results.values()),
+        "total_failed": sum(r.failed_count for r in results.values()),
+        "total_amount_usd": float(sum(r.total_amount for r in results.values())),
+        "chains": {},
+    }
+    
+    for chain, result in results.items():
+        summary["chains"][chain] = {
+            "total_wallets": result.total_wallets,
+            "swept_count": result.swept_count,
+            "failed_count": result.failed_count,
+            "total_amount": float(result.total_amount),
+            "gas_spent_wei": result.gas_spent_wei,
+            "duration_sec": round(result.duration_sec, 2),
+        }
+    
+    return summary
+
+
+@router.get(
+    "/batch-sweep/preview",
+    summary="Превью batch sweep - показать что будет выведено",
+)
+async def batch_sweep_preview(
+    chains: list[str] | None = Query(None, description="Список сетей"),
+    include_deposits: bool = Query(True),
+    include_persistent: bool = Query(True),
+):
+    """
+    Показать превью batch sweep без выполнения.
+    
+    Возвращает список кошельков с балансами и оценку газа.
+    """
+    from src.workers.batch_sweeper import BatchSweeper
+    
+    sweeper = BatchSweeper()
+    
+    # Собираем балансы
+    wallets = await sweeper.collect_all_balances(
+        chains=chains,
+        include_deposits=include_deposits,
+        include_persistent=include_persistent,
+    )
+    
+    if not wallets:
+        return {
+            "wallets_count": 0,
+            "total_amount_usd": 0,
+            "by_chain": {},
+            "wallets": [],
+        }
+    
+    # Создаём план
+    plans = await sweeper.create_sweep_plan(wallets)
+    
+    # Группируем по сетям
+    by_chain: dict = {}
+    for p in plans:
+        chain = p.wallet.chain
+        if chain not in by_chain:
+            by_chain[chain] = {"count": 0, "amount": 0, "gas_needed": 0}
+        by_chain[chain]["count"] += 1
+        by_chain[chain]["amount"] += float(p.wallet.balance)
+        if p.needs_gas_funding:
+            by_chain[chain]["gas_needed"] += p.gas_shortfall_wei
+    
+    # Топ-20 кошельков
+    top_wallets = [
+        {
+            "address": p.wallet.address,
+            "chain": p.wallet.chain,
+            "token": p.wallet.token,
+            "balance": float(p.wallet.balance),
+            "type": p.wallet.wallet_type,
+            "needs_gas": p.needs_gas_funding,
+        }
+        for p in plans[:20]
+    ]
+    
+    return {
+        "wallets_count": len(plans),
+        "total_amount_usd": sum(float(p.wallet.balance) for p in plans),
+        "by_chain": by_chain,
+        "wallets": top_wallets,
+    }
+
