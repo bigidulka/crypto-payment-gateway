@@ -159,6 +159,7 @@ class WalletBalanceItem(BaseModel):
 
     # Для deposit_address
     invoice_id: str | None = None
+    merchant_name: str | None = None
 
 
 class CheckAllBalancesResponse(BaseModel):

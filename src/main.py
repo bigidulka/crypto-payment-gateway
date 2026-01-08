@@ -897,7 +897,7 @@ def _render_admin_panel() -> str:
                         <td class="balance ${parseFloat(usdt) > 0 ? 'balance-positive' : 'balance-zero'}">${parseFloat(usdt).toFixed(2)}</td>
                         <td class="balance ${parseFloat(usdc) > 0 ? 'balance-positive' : 'balance-zero'}">${parseFloat(usdc).toFixed(2)}</td>
                         <td class="mono">${parseFloat(w.native_balance).toFixed(4)} ${w.native_symbol}</td>
-                        <td>-</td>
+                        <td>${w.merchant_name || '-'}</td>
                     </tr>
                 `;
             });
