@@ -578,8 +578,10 @@ async def check_all_balances(
     """
     Проверить балансы всех deposit адресов.
     Использует multicall для оптимизации RPC запросов.
+    Возвращает данные сгруппированные по адресу.
     """
     from decimal import Decimal
+    from src.api.admin.schemas import TokenBalance
 
     # Получаем все deposit адреса
     stmt = (
@@ -594,7 +596,8 @@ async def check_all_balances(
     result = await session.execute(stmt)
     payment_sessions = result.scalars().unique().all()
 
-    balances_list: list[WalletBalanceItem] = []
+    # Словарь для группировки по (address, chain)
+    grouped_wallets: dict[tuple[str, str], dict] = {}
     total_balances: dict[str, Decimal] = {}
     addresses_with_balance = 0
     total_addresses_checked = 0
@@ -621,6 +624,7 @@ async def check_all_balances(
         try:
             adapter = get_evm_adapter(chain_name)
             chain_config = get_chain_config(chain_name)
+            native_symbol = chain_config.native_symbol
 
             addresses = [ps.deposit_address.address for ps in sessions]
             token_contracts = [
@@ -640,10 +644,12 @@ async def check_all_balances(
                 total_addresses_checked += 1
 
                 native_balance_ether = native_balances.get(addr_lower, Decimal(0))
-                native_balance_wei = int(native_balance_ether * 10**18)
                 addr_token_balances = token_balances.get(addr_lower, {})
 
-                # Проверяем токены
+                # Собираем токены для этого адреса
+                tokens_list: list[TokenBalance] = []
+                has_any_balance = False
+
                 for token_symbol in ["USDT", "USDC"]:
                     token_config = chain_config.tokens.get(token_symbol)
                     if not token_config:
@@ -653,26 +659,32 @@ async def check_all_balances(
                         token_config.contract_address.lower(), Decimal(0)
                     )
 
-                    if balance > 0 or not with_balance_only:
-                        balances_list.append(
-                            WalletBalanceItem(
-                                type="deposit_address",
-                                chain=chain_name,
-                                token=token_symbol,
-                                address=addr,
-                                balance=balance,
-                                native_balance_wei=native_balance_wei,
-                                invoice_id=(
-                                    str(ps.invoice.id) if ps.invoice else None
-                                ),
-                            )
-                        )
+                    tokens_list.append(TokenBalance(
+                        token=token_symbol,
+                        balance=str(balance),
+                    ))
 
-                        key = f"{chain_name}/{token_symbol}"
-                        total_balances[key] = total_balances.get(key, Decimal(0)) + balance
+                    key = f"{chain_name}/{token_symbol}"
+                    total_balances[key] = total_balances.get(key, Decimal(0)) + balance
 
-                        if balance > 0:
-                            addresses_with_balance += 1
+                    if balance > 0:
+                        has_any_balance = True
+
+                if has_any_balance:
+                    addresses_with_balance += 1
+
+                # Добавляем в результат если есть баланс или нужны все
+                if has_any_balance or not with_balance_only:
+                    wallet_key = (addr_lower, chain_name)
+                    grouped_wallets[wallet_key] = {
+                        "type": "deposit_address",
+                        "chain": chain_name,
+                        "address": addr,
+                        "tokens": tokens_list,
+                        "native_balance": str(native_balance_ether),
+                        "native_symbol": native_symbol,
+                        "invoice_id": str(ps.invoice.id) if ps.invoice else None,
+                    }
 
         except Exception as e:
             # При ошибке добавляем с нулевыми балансами и логируем
@@ -680,27 +692,40 @@ async def check_all_balances(
             logging.error(f"Error fetching balances for chain {chain_name}: {e}")
             
             if not with_balance_only:
+                chain_config = get_chain_config(chain_name)
+                native_symbol = chain_config.native_symbol if chain_config else "ETH"
+                
                 for ps in sessions:
                     total_addresses_checked += 1
-                    # Добавляем запись для каждого токена с пометкой об ошибке
-                    for token_symbol in ["USDT", "USDC"]:
-                        balances_list.append(
-                            WalletBalanceItem(
-                                type="deposit_address",
-                                chain=chain_name,
-                                token=f"{token_symbol} (RPC error)",
-                                address=ps.deposit_address.address,
-                                balance=Decimal(0),
-                                native_balance_wei=0,
-                                invoice_id=str(ps.invoice.id) if ps.invoice else None,
-                            )
-                        )
+                    addr = ps.deposit_address.address
+                    wallet_key = (addr.lower(), chain_name)
+                    
+                    grouped_wallets[wallet_key] = {
+                        "type": "deposit_address",
+                        "chain": chain_name,
+                        "address": addr,
+                        "tokens": [
+                            TokenBalance(token="USDT (RPC error)", balance="0"),
+                            TokenBalance(token="USDC (RPC error)", balance="0"),
+                        ],
+                        "native_balance": "0",
+                        "native_symbol": native_symbol,
+                        "invoice_id": str(ps.invoice.id) if ps.invoice else None,
+                    }
+
+    # Преобразуем в список WalletBalanceItem
+    items_list: list[WalletBalanceItem] = []
+    for wallet_data in grouped_wallets.values():
+        items_list.append(WalletBalanceItem(**wallet_data))
+
+    # Преобразуем total_balances в строки
+    total_balances_str = {k: str(v) for k, v in total_balances.items()}
 
     return CheckAllBalancesResponse(
         total_addresses_checked=total_addresses_checked,
         addresses_with_balance=addresses_with_balance,
-        total_balances=total_balances,
-        balances=balances_list,
+        total_balances=total_balances_str,
+        items=items_list,
     )
 
 

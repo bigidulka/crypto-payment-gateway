@@ -138,15 +138,21 @@ class InvoiceListItem(BaseModel):
     sweep_state: str | None = None
 
 
+class TokenBalance(BaseModel):
+    """Баланс токена."""
+    token: str
+    balance: str  # В формате строки для фронтенда
+
+
 class WalletBalanceItem(BaseModel):
-    """Адрес с балансом."""
+    """Адрес с балансом (сгруппированный по адресу)."""
 
     type: Literal["wallet_address", "deposit_address"]
     chain: str
-    token: str
     address: str
-    balance: Decimal
-    native_balance_wei: int
+    tokens: list[TokenBalance] = Field(default_factory=list)
+    native_balance: str  # В формате ETH (не wei) как строка
+    native_symbol: str
 
     # Для wallet_address
     user_id: str | None = None
@@ -160,10 +166,10 @@ class CheckAllBalancesResponse(BaseModel):
 
     total_addresses_checked: int
     addresses_with_balance: int
-    total_balances: dict[str, Decimal] = Field(
+    total_balances: dict[str, str] = Field(
         default_factory=dict
-    )  # "CHAIN/TOKEN" -> balance
-    balances: list[WalletBalanceItem] = Field(default_factory=list)
+    )  # "CHAIN/TOKEN" -> balance (строка)
+    items: list[WalletBalanceItem] = Field(default_factory=list)
 
 
 class InvoiceListResponse(BaseModel):
