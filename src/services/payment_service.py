@@ -12,7 +12,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.blockchain.chains import get_chain_config, get_token_contract
+from src.blockchain.chains import get_chain_config, get_token_contract, ChainType
 from src.core.config import get_settings
 from src.core.exceptions import (
     InvoiceExpiredError,
@@ -42,14 +42,55 @@ class PaymentService:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
         self.settings = get_settings()
-        self._hd_wallet: HDWallet | None = None
+        self._hd_wallets: dict[str, Any] = {}  # chain_group -> wallet
+
+    def _get_hd_wallet(self, chain_group: str = "evm") -> Any:
+        """
+        Lazy-загрузка HD кошелька для chain_group.
+
+        Args:
+            chain_group: 'evm' | 'solana' | 'ton'
+
+        Returns:
+            HD wallet для данной группы сетей
+        """
+        if chain_group not in self._hd_wallets:
+            if chain_group == "evm":
+                self._hd_wallets[chain_group] = HDWallet(
+                    self.settings.hd_wallet_seed.get_secret_value()
+                )
+            elif chain_group == "solana":
+                from src.crypto.solana_wallet import SolanaHDWallet
+                seed = self.settings.solana_wallet_seed.get_secret_value()
+                if not seed:
+                    seed = self.settings.hd_wallet_seed.get_secret_value()
+                self._hd_wallets[chain_group] = SolanaHDWallet(seed)
+            elif chain_group == "ton":
+                from src.crypto.ton_wallet import TonHDWallet
+                seed = self.settings.ton_wallet_seed.get_secret_value()
+                if not seed:
+                    seed = self.settings.hd_wallet_seed.get_secret_value()
+                self._hd_wallets[chain_group] = TonHDWallet(seed)
+            else:
+                raise ValueError(f"Unknown chain_group: {chain_group}")
+        return self._hd_wallets[chain_group]
 
     @property
     def hd_wallet(self) -> HDWallet:
-        """Lazy-загрузка HD кошелька."""
-        if self._hd_wallet is None:
-            self._hd_wallet = HDWallet(self.settings.hd_wallet_seed.get_secret_value())
-        return self._hd_wallet
+        """Backward compatibility: EVM HD кошелёк."""
+        return self._get_hd_wallet("evm")
+
+    def _get_chain_group(self, chain: str) -> str:
+        """Определить chain_group по имени сети."""
+        config = get_chain_config(chain)
+        if config.chain_type == ChainType.EVM:
+            return "evm"
+        elif config.chain_type == ChainType.SOLANA:
+            return "solana"
+        elif config.chain_type == ChainType.TON:
+            return "ton"
+        else:
+            return "evm"  # fallback
 
     async def select_payment_option(
         self,
@@ -110,8 +151,11 @@ class PaymentService:
         if existing:
             return existing
 
-        # Получаем или создаём deposit address
-        deposit_address = await self._get_or_create_deposit_address()
+        # Определяем chain_group для выбранной сети
+        chain_group = self._get_chain_group(chain)
+
+        # Получаем или создаём deposit address для этой группы
+        deposit_address = await self._get_or_create_deposit_address(chain_group)
 
         # Создаём payment session
         session = PaymentSession(
@@ -176,6 +220,19 @@ class PaymentService:
             payment_session.chain, payment_session.token
         )
 
+        # Определяем chain_group для нормализации адресов
+        chain_group = self._get_chain_group(payment_session.chain)
+
+        # Нормализация адресов (EVM = lowercase, non-EVM = as-is)
+        if chain_group == "evm":
+            normalized_from = from_address.lower()
+            normalized_to = payment_session.deposit_address.address.lower()
+            normalized_token = token_contract.lower()
+        else:
+            normalized_from = from_address
+            normalized_to = payment_session.deposit_address.address
+            normalized_token = token_contract
+
         # Создаём запись
         onchain_tx = OnchainTx(
             id=uuid.uuid4(),
@@ -183,9 +240,9 @@ class PaymentService:
             tx_hash=tx_hash,
             block_number=block_number,
             log_index=log_index,
-            from_address=from_address.lower(),
-            to_address=payment_session.deposit_address.address.lower(),
-            token_contract=token_contract.lower(),
+            from_address=normalized_from,
+            to_address=normalized_to,
+            token_contract=normalized_token,
             amount=amount,
             payment_session_id=payment_session.id,
             status=TxStatus.PENDING,
@@ -283,17 +340,22 @@ class PaymentService:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
-    async def _get_or_create_deposit_address(self) -> DepositAddress:
+    async def _get_or_create_deposit_address(
+        self, chain_group: str = "evm"
+    ) -> DepositAddress:
         """
         Получить свободный или создать новый deposit address.
         Использует SELECT FOR UPDATE для предотвращения race condition.
+
+        Args:
+            chain_group: 'evm' | 'solana' | 'ton'
         """
         # Сначала пробуем найти неиспользуемый адрес с блокировкой
         stmt = (
             select(DepositAddress)
             .where(
                 and_(
-                    DepositAddress.chain_group == "evm",
+                    DepositAddress.chain_group == chain_group,
                     DepositAddress.is_used == False,  # noqa: E712
                 )
             )
@@ -308,14 +370,19 @@ class PaymentService:
             return address
 
         # Создаём новый адрес с блокировкой на max index
-        return await self._create_new_deposit_address()
+        return await self._create_new_deposit_address(chain_group)
 
-    async def _create_new_deposit_address(self) -> DepositAddress:
+    async def _create_new_deposit_address(
+        self, chain_group: str = "evm"
+    ) -> DepositAddress:
         """
         Создать новый deposit address с защитой от race condition.
 
         Использует Redis INCR для атомарного получения следующего индекса.
         Это гарантирует уникальность индекса даже при параллельных запросах.
+
+        Args:
+            chain_group: 'evm' | 'solana' | 'ton'
         """
         from src.db.redis import get_redis
         from src.db.session import get_session_factory
@@ -326,15 +393,26 @@ class PaymentService:
         session_factory = get_session_factory()
 
         # Атомарно получаем следующий индекс через Redis INCR
-        # Если ключа нет, он создаётся со значением 0 и сразу инкрементируется до 1
-        next_index = await redis_client.incr("deposit_address:next_index")
+        # Используем отдельный ключ для каждой группы сетей
+        redis_key = f"deposit_address:{chain_group}:next_index"
+        next_index = await redis_client.incr(redis_key)
         # Переводим в 0-based (INCR начинает с 1)
         next_index = next_index - 1
 
-        logger.info(f"Creating deposit address at index {next_index} (via Redis)")
+        logger.info(
+            f"Creating {chain_group} deposit address at index {next_index} (via Redis)"
+        )
 
-        # Деривируем ключ
-        derived = self.hd_wallet.derive_key(next_index)
+        # Деривируем ключ с помощью соответствующего HD wallet
+        hd_wallet = self._get_hd_wallet(chain_group)
+        derived = hd_wallet.derive_key(next_index)
+
+        # Получаем адрес (формат зависит от chain_group)
+        if chain_group == "evm":
+            address = derived.address.lower()
+        else:
+            # Solana/TON — адреса case-sensitive
+            address = derived.address
 
         # Шифруем приватный ключ
         encrypted_privkey = encrypt_private_key(
@@ -345,19 +423,21 @@ class PaymentService:
         # Создаём запись в изолированной сессии с немедленным commit
         async with session_factory() as isolated_session:
             address_id = uuid.uuid4()
-            address = DepositAddress(
+            deposit_address = DepositAddress(
                 id=address_id,
-                address=derived.address.lower(),
+                address=address,
                 encrypted_privkey=encrypted_privkey,
-                chain_group="evm",
+                chain_group=chain_group,
                 derivation_path=derived.derivation_path,
                 derivation_index=next_index,
                 is_used=False,
             )
-            isolated_session.add(address)
+            isolated_session.add(deposit_address)
             await isolated_session.commit()
 
-        logger.info(f"Created deposit address {derived.address} at index {next_index}")
+        logger.info(
+            f"Created {chain_group} deposit address {address} at index {next_index}"
+        )
 
         # Загружаем созданный адрес в основную сессию
         stmt = select(DepositAddress).where(DepositAddress.id == address_id)

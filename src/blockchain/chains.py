@@ -1,15 +1,31 @@
 """
 Конфигурация блокчейн сетей и токенов.
+
+Поддерживаемые типы сетей:
+- EVM: Ethereum, Base, Arbitrum, BSC, Polygon, Avalanche, Optimism
+- Solana: Solana Mainnet
+- TON: The Open Network
 """
 
 from dataclasses import dataclass, field
 from decimal import Decimal
+from enum import Enum
 from functools import lru_cache
 from typing import Literal
 
 # Типы для сетей и токенов
-ChainName = Literal["base", "arbitrum", "bsc", "polygon", "avax", "optimism"]
+ChainName = Literal[
+    "base", "arbitrum", "bsc", "polygon", "avax", "optimism", "solana", "ton"
+]
 TokenSymbol = Literal["USDT", "USDC"]
+
+
+class ChainType(str, Enum):
+    """Тип блокчейн сети."""
+
+    EVM = "evm"
+    SOLANA = "solana"
+    TON = "ton"
 
 
 @dataclass(frozen=True)
@@ -17,7 +33,7 @@ class TokenConfig:
     """Конфигурация токена."""
 
     symbol: str
-    contract_address: str
+    contract_address: str  # EVM: 0x..., Solana: mint address, TON: jetton master
     decimals: int = 18
     variant: str = "native"  # native | bridged | wrapped
     bridge: str | None = None
@@ -28,14 +44,17 @@ class ChainConfig:
     """Конфигурация блокчейн сети."""
 
     name: str
-    chain_id: int
+    chain_id: int  # EVM chain_id, для non-EVM используем условные значения
+    chain_type: ChainType  # Тип сети: evm | solana | ton
     rpc_url: str  # Будет переопределён из env
     confirmations: int  # Требуемое количество подтверждений
     reorg_buffer: int  # Буфер для защиты от реорганизаций
-    scan_window: int  # Размер окна сканирования блоков
+    scan_window: int  # Размер окна сканирования блоков/слотов
     block_time_sec: float  # Примерное время блока в секундах
-    native_symbol: str  # Нативный токен (ETH/BNB)
+    native_symbol: str  # Нативный токен (ETH/BNB/SOL/TON)
+    native_decimals: int  # Decimals нативного токена
     explorer_url: str  # URL блок-эксплорера
+    address_length: int  # Длина адреса в символах
     tokens: dict[str, TokenConfig] = field(default_factory=dict)
     treasury_address: str = ""  # Будет переопределён из env
 
@@ -45,27 +64,42 @@ class ChainConfig:
 
     def get_explorer_tx_url(self, tx_hash: str) -> str:
         """Получить URL транзакции в эксплорере."""
+        if self.chain_type == ChainType.SOLANA:
+            return f"{self.explorer_url}/tx/{tx_hash}"
+        if self.chain_type == ChainType.TON:
+            return f"{self.explorer_url}/transaction/{tx_hash}"
         return f"{self.explorer_url}/tx/{tx_hash}"
 
     def get_explorer_address_url(self, address: str) -> str:
         """Получить URL адреса в эксплорере."""
+        if self.chain_type == ChainType.TON:
+            return f"{self.explorer_url}/address/{address}"
         return f"{self.explorer_url}/address/{address}"
+
+    @property
+    def is_evm(self) -> bool:
+        """Проверить, является ли сеть EVM-совместимой."""
+        return self.chain_type == ChainType.EVM
 
 
 # Дефолтные конфигурации сетей
 # RPC URL и treasury будут переопределены из настроек
 
 CHAINS_CONFIG: dict[str, ChainConfig] = {
+    # ==================== EVM CHAINS ====================
     "base": ChainConfig(
         name="Base",
         chain_id=8453,
+        chain_type=ChainType.EVM,
         rpc_url="https://mainnet.base.org",
         confirmations=12,
         reorg_buffer=20,
         scan_window=2000,
         block_time_sec=2.0,
         native_symbol="ETH",
+        native_decimals=18,
         explorer_url="https://basescan.org",
+        address_length=42,
         tokens={
             "USDT": TokenConfig(
                 symbol="USDT",
@@ -83,13 +117,16 @@ CHAINS_CONFIG: dict[str, ChainConfig] = {
     "arbitrum": ChainConfig(
         name="Arbitrum One",
         chain_id=42161,
+        chain_type=ChainType.EVM,
         rpc_url="https://arb1.arbitrum.io/rpc",
         confirmations=12,
         reorg_buffer=50,
         scan_window=2000,
         block_time_sec=0.25,
         native_symbol="ETH",
+        native_decimals=18,
         explorer_url="https://arbiscan.io",
+        address_length=42,
         tokens={
             "USDT": TokenConfig(
                 symbol="USDT",
@@ -106,13 +143,16 @@ CHAINS_CONFIG: dict[str, ChainConfig] = {
     "bsc": ChainConfig(
         name="BNB Smart Chain",
         chain_id=56,
+        chain_type=ChainType.EVM,
         rpc_url="https://bsc-dataseed.binance.org",
         confirmations=15,
         reorg_buffer=30,
         scan_window=2000,
         block_time_sec=3.0,
         native_symbol="BNB",
+        native_decimals=18,
         explorer_url="https://bscscan.com",
+        address_length=42,
         tokens={
             "USDT": TokenConfig(
                 symbol="USDT",
@@ -131,13 +171,16 @@ CHAINS_CONFIG: dict[str, ChainConfig] = {
     "polygon": ChainConfig(
         name="Polygon PoS",
         chain_id=137,
+        chain_type=ChainType.EVM,
         rpc_url="https://polygon-rpc.com",
         confirmations=12,
         reorg_buffer=20,
         scan_window=400,  # Polygon RPC ограничивает до 500 блоков
         block_time_sec=2.1,
         native_symbol="MATIC",
+        native_decimals=18,
         explorer_url="https://polygonscan.com",
+        address_length=42,
         tokens={
             "USDT": TokenConfig(
                 symbol="USDT",
@@ -154,13 +197,16 @@ CHAINS_CONFIG: dict[str, ChainConfig] = {
     "avax": ChainConfig(
         name="Avalanche C-Chain",
         chain_id=43114,
+        chain_type=ChainType.EVM,
         rpc_url="https://api.avax.network/ext/bc/C/rpc",
         confirmations=12,
         reorg_buffer=30,
         scan_window=2000,
         block_time_sec=2.0,
         native_symbol="AVAX",
+        native_decimals=18,
         explorer_url="https://snowtrace.io",
+        address_length=42,
         tokens={
             "USDT": TokenConfig(
                 symbol="USDT",
@@ -179,13 +225,16 @@ CHAINS_CONFIG: dict[str, ChainConfig] = {
     "optimism": ChainConfig(
         name="Optimism",
         chain_id=10,
+        chain_type=ChainType.EVM,
         rpc_url="https://mainnet.optimism.io",
         confirmations=12,
         reorg_buffer=20,
         scan_window=2000,
         block_time_sec=2.0,
         native_symbol="ETH",
+        native_decimals=18,
         explorer_url="https://optimistic.etherscan.io",
+        address_length=42,
         tokens={
             "USDT": TokenConfig(
                 symbol="USDT",
@@ -199,6 +248,58 @@ CHAINS_CONFIG: dict[str, ChainConfig] = {
                 contract_address="0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
                 decimals=6,
             ),
+        },
+    ),
+    # ==================== NON-EVM CHAINS ====================
+    "solana": ChainConfig(
+        name="Solana",
+        chain_id=101,  # Условный ID для Solana Mainnet
+        chain_type=ChainType.SOLANA,
+        rpc_url="https://api.mainnet-beta.solana.com",
+        confirmations=32,  # ~32 слота для finality
+        reorg_buffer=10,
+        scan_window=1000,  # Слоты
+        block_time_sec=0.4,  # ~400ms per slot
+        native_symbol="SOL",
+        native_decimals=9,
+        explorer_url="https://solscan.io",
+        address_length=44,  # Base58 encoded (32-44 chars)
+        tokens={
+            "USDT": TokenConfig(
+                symbol="USDT",
+                # USDT SPL Token Mint Address
+                contract_address="Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+                decimals=6,
+            ),
+            "USDC": TokenConfig(
+                symbol="USDC",
+                # USDC SPL Token Mint Address
+                contract_address="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                decimals=6,
+            ),
+        },
+    ),
+    "ton": ChainConfig(
+        name="The Open Network",
+        chain_id=0,  # TON не использует chain_id
+        chain_type=ChainType.TON,
+        rpc_url="https://toncenter.com/api/v2",  # TON Center HTTP API
+        confirmations=12,  # ~12 блоков для надёжности
+        reorg_buffer=5,
+        scan_window=100,  # Блоки/seqno
+        block_time_sec=5.0,  # ~5 секунд per block
+        native_symbol="TON",
+        native_decimals=9,
+        explorer_url="https://tonviewer.com",
+        address_length=48,  # User-friendly format
+        tokens={
+            "USDT": TokenConfig(
+                symbol="USDT",
+                # USDT Jetton Master Address (official Tether on TON)
+                contract_address="EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs",
+                decimals=6,
+            ),
+            # TON пока не имеет официального USDC
         },
     ),
 }
@@ -215,6 +316,7 @@ def get_chain_config(chain: str) -> ChainConfig:
         "arb": "arbitrum",
         "bnb": "bsc",
         "opt": "optimism",
+        "sol": "solana",
     }.get(chain.lower(), chain.lower())
     config = CHAINS_CONFIG.get(normalized)
     if not config:
@@ -228,6 +330,15 @@ def get_all_chains() -> list[str]:
     """Получить список всех поддерживаемых сетей."""
     return list(CHAINS_CONFIG.keys())
 
+
+def get_evm_chains() -> list[str]:
+    """Получить список всех EVM сетей."""
+    return [name for name, cfg in CHAINS_CONFIG.items() if cfg.chain_type == ChainType.EVM]
+
+
+def get_non_evm_chains() -> list[str]:
+    """Получить список всех non-EVM сетей."""
+    return [name for name, cfg in CHAINS_CONFIG.items() if cfg.chain_type != ChainType.EVM]
 
 def get_all_tokens() -> list[str]:
     """Получить список всех поддерживаемых токенов."""
