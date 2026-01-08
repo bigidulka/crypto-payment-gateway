@@ -81,9 +81,13 @@ async def get_current_merchant(
             detail="Merchant account is inactive",
         )
 
-    # Обновляем last_used_at
-    api_key_record.last_used_at = datetime.now(timezone.utc)
-    await session.commit()
+    # Обновляем last_used_at (без commit - будет в конце запроса)
+    # Используем try/except чтобы не блокировать запрос при ошибке SQLite
+    try:
+        api_key_record.last_used_at = datetime.now(timezone.utc)
+        # НЕ делаем commit здесь - сессия закроется в конце запроса
+    except Exception:
+        pass  # last_used_at не критично
 
     return merchant
 
