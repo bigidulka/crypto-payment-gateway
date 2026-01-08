@@ -21,7 +21,7 @@ from decimal import Decimal
 from sqlalchemy import and_, select, update
 from sqlalchemy.orm import selectinload
 
-from src.blockchain.chains import get_all_chains, get_chain_config
+from src.blockchain.chains import get_all_chains, get_chain_config, get_evm_chains
 from src.blockchain.evm_adapter import get_evm_adapter, close_all_adapters
 from src.blockchain.resilient_fetcher import (
     ResilientLogFetcher,
@@ -29,6 +29,7 @@ from src.blockchain.resilient_fetcher import (
     init_resilient_fetchers,
     close_resilient_fetchers,
 )
+from src.blockchain.rpc_manager import RpcManager, RpcEndpoint, RpcManagerConfig
 from src.core.config import get_settings
 from src.db.models import (
     Deposit,
@@ -433,7 +434,7 @@ async def create_deposit_webhook(session, deposit: Deposit) -> None:
 
 
 async def _init_resilient_fetchers() -> None:
-    """Инициализировать ResilientLogFetcher для всех сетей."""
+    """Инициализировать ResilientLogFetcher и RpcManager для всех сетей."""
     settings = get_settings()
 
     rpc_config: dict[str, list[str]] = {}
@@ -449,6 +450,25 @@ async def _init_resilient_fetchers() -> None:
     if rpc_config:
         await init_resilient_fetchers(rpc_config)
         logger.info(f"ResilientLogFetcher initialized for {len(rpc_config)} chains")
+
+    # Инициализируем RpcManager для EVM адаптеров (для get_latest_block и др.)
+    for chain in get_evm_chains():
+        urls = settings.get_rpc_urls(chain)
+        if urls and len(urls) > 1:
+            # Создаём RpcManager с multiple endpoints
+            endpoints = [
+                RpcEndpoint(url=url, priority=i + 1)
+                for i, url in enumerate(urls)
+            ]
+            rpc_manager = RpcManager(
+                chain=chain,
+                endpoints=endpoints,
+                config=RpcManagerConfig(max_retries=3),
+            )
+            # Подключаем к адаптеру
+            adapter = get_evm_adapter(chain)
+            adapter.set_rpc_manager(rpc_manager)
+            logger.info(f"[{chain}] RpcManager attached with {len(urls)} endpoints")
 
 
 async def run_persistent_poller() -> None:

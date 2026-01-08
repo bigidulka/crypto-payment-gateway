@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     avax_rpc_url: str = "https://api.avax.network/ext/bc/C/rpc"
     optimism_rpc_url: str = "https://mainnet.optimism.io"
 
+    # === Non-EVM RPC ===
+    solana_rpc_url: str = "https://api.mainnet-beta.solana.com"
+    ton_rpc_url: str = "https://toncenter.com/api/v2"
+    ton_api_key: str = ""  # TON Center API key (опционально)
+
     # Additional RPC endpoints (comma-separated, для failover и ротации)
     # Пример: "https://rpc1.example.com,https://rpc2.example.com"
     base_rpc_urls: str = ""
@@ -60,16 +65,26 @@ class Settings(BaseSettings):
     polygon_rpc_urls: str = ""
     avax_rpc_urls: str = ""
     optimism_rpc_urls: str = ""
+    solana_rpc_urls: str = ""
+    ton_rpc_urls: str = ""
 
     # RPC rotation strategy: failover, round_robin, latency, weighted
     rpc_rotation_strategy: str = "failover"
 
     # === Treasury & Funding ===
-    treasury_address: str = ""  # Единый treasury адрес
+    treasury_address: str = ""  # Единый treasury адрес (EVM)
     base_treasury_address: str = ""  # Treasury per chain (fallback)
     arb_treasury_address: str = ""
     bsc_treasury_address: str = ""
+    solana_treasury_address: str = ""  # Solana treasury
+    ton_treasury_address: str = ""  # TON treasury
     funder_private_key: SecretStr = Field(default="")  # Для gas funding при sweep
+
+    # === HD Wallet Seeds (per chain type) ===
+    # Solana использует отдельный seed (BIP44/501')
+    solana_wallet_seed: SecretStr = Field(default="")
+    # TON использует отдельный seed (BIP44/607')
+    ton_wallet_seed: SecretStr = Field(default="")
 
     # === Hosted ===
     hosted_base_url: str = "http://localhost:8000"
@@ -113,6 +128,15 @@ class Settings(BaseSettings):
 
     def get_treasury_address(self, chain: str) -> str:
         """Получить treasury адрес для сети."""
+        chain = chain.lower()
+
+        # Non-EVM сети имеют свои treasury
+        if chain == "solana":
+            return self.solana_treasury_address or self.treasury_address
+        if chain == "ton":
+            return self.ton_treasury_address or self.treasury_address
+
+        # EVM treasury
         if self.treasury_address:
             return self.treasury_address
 
@@ -121,7 +145,7 @@ class Settings(BaseSettings):
             "arbitrum": self.arb_treasury_address,
             "bsc": self.bsc_treasury_address,
         }
-        return per_chain.get(chain.lower(), self.treasury_address)
+        return per_chain.get(chain, self.treasury_address)
 
     def get_rpc_urls(self, chain: str) -> list[str]:
         """
@@ -140,6 +164,8 @@ class Settings(BaseSettings):
             "polygon": self.polygon_rpc_url,
             "avax": self.avax_rpc_url,
             "optimism": self.optimism_rpc_url,
+            "solana": self.solana_rpc_url,
+            "ton": self.ton_rpc_url,
         }
 
         # Additional RPCs (comma-separated)
@@ -150,6 +176,8 @@ class Settings(BaseSettings):
             "polygon": self.polygon_rpc_urls,
             "avax": self.avax_rpc_urls,
             "optimism": self.optimism_rpc_urls,
+            "solana": self.solana_rpc_urls,
+            "ton": self.ton_rpc_urls,
         }
 
         urls = []

@@ -1238,31 +1238,33 @@ async def check_all_balances(
     summary="Запустить batch sweep всех кошельков",
 )
 async def run_batch_sweep_endpoint(
-    chains: list[str] | None = Query(None, description="Список сетей (все если не указано)"),
+    chains: list[str] | None = Query(
+        None, description="Список сетей (все если не указано)"
+    ),
     dry_run: bool = Query(True, description="Только проверка без реальных транзакций"),
     include_deposits: bool = Query(True, description="Включить deposit адреса"),
     include_persistent: bool = Query(True, description="Включить persistent адреса"),
 ):
     """
     Запустить batch sweep - вывод средств со всех кошельков на treasury.
-    
+
     Оптимизации:
     - Multicall3 для batch проверки балансов
     - Параллельная обработка сетей
     - Фильтрация dust балансов (< $0.50)
     - Приоритизация по сумме
-    
+
     ВНИМАНИЕ: По умолчанию dry_run=True для безопасности!
     """
     from src.workers.batch_sweeper import run_batch_sweep
-    
+
     results = await run_batch_sweep(
         chains=chains,
         dry_run=dry_run,
         include_deposits=include_deposits,
         include_persistent=include_persistent,
     )
-    
+
     # Формируем ответ
     summary = {
         "dry_run": dry_run,
@@ -1271,7 +1273,7 @@ async def run_batch_sweep_endpoint(
         "total_amount_usd": float(sum(r.total_amount for r in results.values())),
         "chains": {},
     }
-    
+
     for chain, result in results.items():
         summary["chains"][chain] = {
             "total_wallets": result.total_wallets,
@@ -1281,7 +1283,7 @@ async def run_batch_sweep_endpoint(
             "gas_spent_wei": result.gas_spent_wei,
             "duration_sec": round(result.duration_sec, 2),
         }
-    
+
     return summary
 
 
@@ -1296,20 +1298,20 @@ async def batch_sweep_preview(
 ):
     """
     Показать превью batch sweep без выполнения.
-    
+
     Возвращает список кошельков с балансами и оценку газа.
     """
     from src.workers.batch_sweeper import BatchSweeper
-    
+
     sweeper = BatchSweeper()
-    
+
     # Собираем балансы
     wallets = await sweeper.collect_all_balances(
         chains=chains,
         include_deposits=include_deposits,
         include_persistent=include_persistent,
     )
-    
+
     if not wallets:
         return {
             "wallets_count": 0,
@@ -1317,10 +1319,10 @@ async def batch_sweep_preview(
             "by_chain": {},
             "wallets": [],
         }
-    
+
     # Создаём план
     plans = await sweeper.create_sweep_plan(wallets)
-    
+
     # Группируем по сетям
     by_chain: dict = {}
     for p in plans:
@@ -1331,7 +1333,7 @@ async def batch_sweep_preview(
         by_chain[chain]["amount"] += float(p.wallet.balance)
         if p.needs_gas_funding:
             by_chain[chain]["gas_needed"] += p.gas_shortfall_wei
-    
+
     # Топ-20 кошельков
     top_wallets = [
         {
@@ -1344,11 +1346,10 @@ async def batch_sweep_preview(
         }
         for p in plans[:20]
     ]
-    
+
     return {
         "wallets_count": len(plans),
         "total_amount_usd": sum(float(p.wallet.balance) for p in plans),
         "by_chain": by_chain,
         "wallets": top_wallets,
     }
-

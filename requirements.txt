@@ -26,6 +26,10 @@ hdwallets>=0.1.2
 
 # Cryptography
 cryptography>=44.0.0
+pynacl>=1.5.0
+
+# Non-EVM
+base58>=2.1.0
 
 # HTTP client
 httpx>=0.28.0

@@ -44,13 +44,16 @@ class DepositAddress(Base, UUIDMixin):
 
     __tablename__ = "deposit_addresses"
 
-    # Адрес кошелька (один и тот же для всех EVM сетей)
-    address: Mapped[str] = mapped_column(String(42), unique=True, nullable=False)
+    # Адрес кошелька
+    # - EVM: 42 символа (0x + 40 hex)
+    # - Solana: 32-44 символа (base58)
+    # - TON: 48 символов (user-friendly) или 66 (raw)
+    address: Mapped[str] = mapped_column(String(70), unique=True, nullable=False)
 
     # Зашифрованный приватный ключ (AES-256-GCM)
     encrypted_privkey: Mapped[bytes] = mapped_column(UniversalBytes, nullable=False)
 
-    # Группа сетей (для будущего расширения на non-EVM)
+    # Группа сетей: 'evm' | 'solana' | 'ton'
     chain_group: Mapped[str] = mapped_column(String(20), default="evm", nullable=False)
 
     # HD wallet derivation info
