@@ -583,12 +583,12 @@ async def check_all_balances(
     from decimal import Decimal
     from src.api.admin.schemas import TokenBalance
 
-    # Получаем все deposit адреса
+    # Получаем все deposit адреса с мерчантом
     stmt = (
         select(PaymentSession)
         .options(
             selectinload(PaymentSession.deposit_address),
-            selectinload(PaymentSession.invoice),
+            selectinload(PaymentSession.invoice).selectinload(Invoice.merchant),
         )
         .where(PaymentSession.deposit_address_id.isnot(None))
     )
@@ -673,6 +673,11 @@ async def check_all_balances(
                 if has_any_balance:
                     addresses_with_balance += 1
 
+                # Получаем имя мерчанта
+                merchant_name = None
+                if ps.invoice and ps.invoice.merchant:
+                    merchant_name = ps.invoice.merchant.name
+
                 # Добавляем в результат если есть баланс или нужны все
                 if has_any_balance or not with_balance_only:
                     wallet_key = (addr_lower, chain_name)
@@ -684,6 +689,7 @@ async def check_all_balances(
                         "native_balance": str(native_balance_ether),
                         "native_symbol": native_symbol,
                         "invoice_id": str(ps.invoice.id) if ps.invoice else None,
+                        "merchant_name": merchant_name,
                     }
 
         except Exception as e:
@@ -700,6 +706,11 @@ async def check_all_balances(
                     addr = ps.deposit_address.address
                     wallet_key = (addr.lower(), chain_name)
                     
+                    # Получаем имя мерчанта
+                    merchant_name = None
+                    if ps.invoice and ps.invoice.merchant:
+                        merchant_name = ps.invoice.merchant.name
+
                     grouped_wallets[wallet_key] = {
                         "type": "deposit_address",
                         "chain": chain_name,
@@ -711,6 +722,7 @@ async def check_all_balances(
                         "native_balance": "0",
                         "native_symbol": native_symbol,
                         "invoice_id": str(ps.invoice.id) if ps.invoice else None,
+                        "merchant_name": merchant_name,
                     }
 
     # Преобразуем в список WalletBalanceItem
