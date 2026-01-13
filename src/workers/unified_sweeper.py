@@ -259,24 +259,45 @@ class UnifiedBatchSweeper:
         # === State Machine ===
         
         if job.state == SweepState.PENDING_GAS:
-            # Проверяем нужен ли газ
-            native_wei = int(native_balance * 10**18)
+            # Получаем актуальный баланс токенов для точной оценки газа
+            try:
+                actual_balance = await adapter.get_erc20_balance_raw(
+                    job.from_address, job.token_contract
+                )
+                if actual_balance <= 0:
+                    # Баланс уже 0, отмечаем как выполненный
+                    job.state = SweepState.COMPLETED
+                    job.completed_at = datetime.now(timezone.utc)
+                    logger.info(f"[{job.chain}] Job {job.id}: no token balance, marking complete")
+                    return SweepResult(job_id=str(job.id), success=True)
+            except Exception as e:
+                logger.warning(f"[{job.chain}] Job {job.id}: failed to get token balance: {e}")
+                actual_balance = int(Decimal(job.amount_raw)) if job.amount_raw else 1000000
             
-            # Оцениваем реальную стоимость sweep
-            amount_raw_int = int(Decimal(job.amount_raw)) if job.amount_raw else 1000000
-            estimated_cost = await adapter.estimate_erc20_transfer_cost(
+            # Получаем свежий native баланс (не из batch запроса)
+            try:
+                native_wei = await adapter.get_native_balance_wei(job.from_address)
+            except Exception:
+                native_wei = int(native_balance * 10**18)
+            
+            # Оцениваем точную стоимость sweep с учётом всех буферов
+            estimated_cost = await adapter.estimate_sweep_gas_cost(
                 token_contract=job.token_contract,
                 from_address=job.from_address,
                 to_address=job.to_address,
-                amount=amount_raw_int,
+                amount=actual_balance,
+                include_safety_buffer=True,
             )
             
             # Fallback на max_gas_cost если estimate не удался
             if estimated_cost is None:
                 required_gas_wei = config.max_gas_cost_wei
-                logger.warning(f"[{job.chain}] Job {job.id}: using fallback max_gas_cost")
+                logger.warning(f"[{job.chain}] Job {job.id}: using fallback max_gas_cost={required_gas_wei}")
             else:
                 required_gas_wei = estimated_cost
+            
+            # Сохраняем оценку для отладки
+            job.estimated_gas_wei = str(required_gas_wei)
             
             logger.debug(
                 f"[{job.chain}] Job {job.id}: native_wei={native_wei}, required={required_gas_wei}, "
@@ -287,30 +308,40 @@ class UnifiedBatchSweeper:
                 # Газа достаточно, переходим к sweep
                 job.needs_gas_funding = False
                 job.state = SweepState.SWEEPING
-                logger.info(f"[{job.chain}] Job {job.id}: enough gas ({native_wei} >= {required_gas_wei}), skipping funding")
+                logger.info(
+                    f"[{job.chain}] Job {job.id}: enough gas "
+                    f"({Decimal(native_wei)/Decimal(10**18):.6f} >= {Decimal(required_gas_wei)/Decimal(10**18):.6f}), "
+                    f"proceeding to sweep"
+                )
             else:
-                # Нужно отправить газ - только недостающую сумму
+                # Нужно отправить газ - недостающую сумму + небольшой запас
                 gas_shortfall = required_gas_wei - native_wei
+                # Добавляем 5% к shortfall на случай изменения gas price
+                gas_to_send = int(gas_shortfall * 1.05)
                 
                 try:
                     tx_hash = await adapter.send_native_transfer(
                         self.funder_key,
                         job.from_address,
-                        gas_shortfall,
+                        gas_to_send,
                     )
+                    
+                    if tx_hash is None:
+                        raise Exception("send_native_transfer returned None")
+                    
                     job.gas_tx_hash = tx_hash
                     job.state = SweepState.FUNDING
-                    job.estimated_gas_wei = str(required_gas_wei)
+                    job.needs_gas_funding = True
                     
                     # Логируем в человекочитаемом формате
-                    gas_human = Decimal(gas_shortfall) / Decimal(10**18)
+                    gas_human = Decimal(gas_to_send) / Decimal(10**18)
                     logger.info(
                         f"[{job.chain}] Job {job.id}: gas sent ({gas_human:.6f} {config.native_symbol}), "
                         f"tx={tx_hash[:16]}..."
                     )
                     
-                    # Ждём немного для подтверждения газа
-                    await asyncio.sleep(2)
+                    # Ждём подтверждения газа
+                    await asyncio.sleep(3)
                     
                 except Exception as e:
                     await self._mark_job_failed(job, f"Gas funding failed: {e}")
@@ -326,12 +357,45 @@ class UnifiedBatchSweeper:
                 try:
                     receipt = await adapter.get_transaction_receipt(job.gas_tx_hash)
                     if receipt and receipt.get("status") == 1:
+                        # Газ подтверждён, но перед sweep ещё раз проверяем баланс
+                        # Это защита от случаев когда gas price изменился
+                        native_wei = await adapter.get_native_balance_wei(job.from_address)
+                        
+                        # Пересчитываем требуемый газ
+                        actual_balance = await adapter.get_erc20_balance_raw(
+                            job.from_address, job.token_contract
+                        )
+                        
+                        if actual_balance <= 0:
+                            job.state = SweepState.COMPLETED
+                            job.completed_at = datetime.now(timezone.utc)
+                            logger.info(f"[{job.chain}] Job {job.id}: token balance 0 after funding")
+                            return SweepResult(job_id=str(job.id), success=True)
+                        
+                        required_now = await adapter.estimate_sweep_gas_cost(
+                            token_contract=job.token_contract,
+                            from_address=job.from_address,
+                            to_address=job.to_address,
+                            amount=actual_balance,
+                            include_safety_buffer=True,
+                        )
+                        
+                        if required_now and native_wei < required_now:
+                            # Газа всё ещё не хватает (gas price вырос?)
+                            logger.warning(
+                                f"[{job.chain}] Job {job.id}: gas confirmed but still insufficient "
+                                f"({native_wei} < {required_now}), returning to PENDING_GAS"
+                            )
+                            job.state = SweepState.PENDING_GAS
+                            return SweepResult(job_id=str(job.id), success=False, error="Gas price increased")
+                        
                         job.state = SweepState.SWEEPING
-                        logger.debug(f"[{job.chain}] Job {job.id}: gas confirmed")
+                        logger.debug(f"[{job.chain}] Job {job.id}: gas confirmed, balance sufficient")
                     else:
                         # Ещё не подтверждён, пропускаем
                         return SweepResult(job_id=str(job.id), success=False, error="Gas pending")
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"[{job.chain}] Job {job.id}: gas check error: {e}")
                     # Retry позже
                     return SweepResult(job_id=str(job.id), success=False, error="Gas check failed")
         
@@ -341,7 +405,6 @@ class UnifiedBatchSweeper:
                 # Расшифровываем приватный ключ
                 encrypted_data = job.encrypted_private_key
                 if isinstance(encrypted_data, str):
-                    # Может быть hex string или bytes
                     try:
                         encrypted_data = bytes.fromhex(encrypted_data)
                     except ValueError:
@@ -355,11 +418,33 @@ class UnifiedBatchSweeper:
                 )
                 
                 if actual_balance <= 0:
-                    # Баланс уже 0, возможно уже swept
                     job.state = SweepState.COMPLETED
                     job.completed_at = datetime.now(timezone.utc)
                     logger.warning(f"[{job.chain}] Job {job.id}: balance already 0")
                     return SweepResult(job_id=str(job.id), success=True)
+                
+                # Финальная проверка газа перед отправкой
+                native_wei = await adapter.get_native_balance_wei(job.from_address)
+                required_gas = await adapter.estimate_sweep_gas_cost(
+                    token_contract=job.token_contract,
+                    from_address=job.from_address,
+                    to_address=job.to_address,
+                    amount=actual_balance,
+                    include_safety_buffer=False,  # Уже на этапе отправки, буфер не нужен
+                )
+                
+                if required_gas and native_wei < required_gas:
+                    # Газа не хватает - возвращаем в PENDING_GAS
+                    logger.warning(
+                        f"[{job.chain}] Job {job.id}: pre-sweep check failed, "
+                        f"native={native_wei}, required={required_gas}"
+                    )
+                    job.state = SweepState.PENDING_GAS
+                    return SweepResult(
+                        job_id=str(job.id),
+                        success=False,
+                        error="Insufficient gas at sweep time",
+                    )
                 
                 # Отправляем sweep транзакцию
                 tx_hash = await adapter.send_erc20_transfer(
@@ -390,10 +475,10 @@ class UnifiedBatchSweeper:
                         tx_hash=tx_hash,
                     )
                 else:
-                    # Если sweep вернул None - скорее всего insufficient funds
-                    # Возвращаем в PENDING_GAS для дозаправки
+                    # Sweep вернул None - insufficient funds или другая ошибка
                     job.state = SweepState.PENDING_GAS
-                    logger.warning(f"[{job.chain}] Job {job.id}: sweep failed, reverting to PENDING_GAS for refunding")
+                    job.attempts += 1
+                    logger.warning(f"[{job.chain}] Job {job.id}: sweep returned None, reverting to PENDING_GAS")
                     return SweepResult(
                         job_id=str(job.id),
                         success=False,
@@ -403,8 +488,9 @@ class UnifiedBatchSweeper:
             except Exception as e:
                 error_str = str(e).lower()
                 # Если ошибка связана с газом - возвращаем в PENDING_GAS
-                if "insufficient" in error_str or "gas" in error_str:
+                if "insufficient" in error_str or "gas" in error_str or "fund" in error_str:
                     job.state = SweepState.PENDING_GAS
+                    job.attempts += 1
                     logger.warning(f"[{job.chain}] Job {job.id}: {e}, reverting to PENDING_GAS")
                     return SweepResult(job_id=str(job.id), success=False, error=str(e))
                 
