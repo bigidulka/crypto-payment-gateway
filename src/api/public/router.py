@@ -7,7 +7,7 @@ Public API Router - эндпоинты без авторизации.
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from src.blockchain.chains import CHAINS_CONFIG
+from src.blockchain.chains import get_all_chains, get_chain_config, is_chain_supported
 
 router = APIRouter(prefix="/public", tags=["Public"])
 
@@ -87,7 +87,8 @@ async def get_supported_chains() -> SupportedChainsResponse:
     chains = {}
     total_tokens = 0
 
-    for chain_key, config in CHAINS_CONFIG.items():
+    for chain_key in get_all_chains():
+        config = get_chain_config(chain_key)
         tokens = []
         for token_config in config.tokens.values():
             tokens.append(
@@ -123,7 +124,7 @@ async def get_supported_chains() -> SupportedChainsResponse:
     summary="Список всех токенов",
     description="Возвращает плоский список всех токенов со всех сетей",
 )
-async def get_all_tokens() -> TokenListResponse:
+async def get_all_tokens_list() -> TokenListResponse:
     """
     Получить плоский список всех токенов.
 
@@ -132,7 +133,8 @@ async def get_all_tokens() -> TokenListResponse:
     """
     tokens = []
 
-    for chain_key, config in CHAINS_CONFIG.items():
+    for chain_key in get_all_chains():
+        config = get_chain_config(chain_key)
         for token_config in config.tokens.values():
             tokens.append(
                 TokenListItem(
@@ -158,7 +160,7 @@ async def get_all_tokens() -> TokenListResponse:
     summary="Информация о сети",
     description="Возвращает информацию о конкретной сети",
 )
-async def get_chain_info(chain: str) -> ChainInfo:
+async def get_chain_info_by_name(chain: str) -> ChainInfo:
     """
     Получить информацию о конкретной сети.
 
@@ -168,13 +170,13 @@ async def get_chain_info(chain: str) -> ChainInfo:
     from fastapi import HTTPException
 
     chain = chain.lower()
-    if chain not in CHAINS_CONFIG:
+    if not is_chain_supported(chain):
         raise HTTPException(
             status_code=404,
-            detail=f"Chain '{chain}' not supported. Available: {list(CHAINS_CONFIG.keys())}",
+            detail=f"Chain '{chain}' not supported. Available: {get_all_chains()}",
         )
 
-    config = CHAINS_CONFIG[chain]
+    config = get_chain_config(chain)
     tokens = [
         TokenInfo(
             symbol=t.symbol,
@@ -206,5 +208,5 @@ async def health_check() -> dict:
     return {
         "status": "ok",
         "service": "arbitron-payment",
-        "chains_available": len(CHAINS_CONFIG),
+        "chains_available": len(get_all_chains()),
     }

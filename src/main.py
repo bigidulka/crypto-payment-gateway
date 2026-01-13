@@ -631,8 +631,8 @@ def _render_admin_panel() -> str:
                     <input type="text" id="username" value="admin" required autofocus>
                 </div>
                 <div class="form-group">
-                    <label for="password">Пароль</label>
-                    <input type="password" id="password" value="admin" required>
+                    <label for="password">Секретный ключ (ADMIN_SECRET_KEY)</label>
+                    <input type="password" id="password" placeholder="Введите ADMIN_SECRET_KEY из .env" required>
                 </div>
                 <button type="submit" class="btn">Войти</button>
             </form>
@@ -804,10 +804,30 @@ def _render_admin_panel() -> str:
             location.reload();
         }
 
-        // API Helper
-        async function api(endpoint) {
-            const response = await fetch(endpoint);
-            if (!response.ok) throw new Error('API Error');
+        // API Helper - передаёт Bearer token в заголовках
+        async function api(endpoint, options = {}) {
+            const headers = {
+                'Content-Type': 'application/json',
+                ...options.headers
+            };
+            
+            // Добавляем Authorization header если есть токен
+            if (authToken) {
+                headers['Authorization'] = 'Bearer ' + authToken;
+            }
+            
+            const response = await fetch(endpoint, {
+                ...options,
+                headers
+            });
+            
+            // Если 401 - токен истёк, выходим
+            if (response.status === 401) {
+                logout();
+                throw new Error('Session expired');
+            }
+            
+            if (!response.ok) throw new Error('API Error: ' + response.status);
             return response.json();
         }
 

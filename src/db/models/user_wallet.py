@@ -8,7 +8,6 @@
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
-from enum import Enum
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
@@ -26,18 +25,10 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.db.models.base import Base
+from src.db.models.enums import DepositStatus, enum_values
 
 if TYPE_CHECKING:
     from src.db.models.merchant import Merchant
-
-
-class DepositStatus(str, Enum):
-    """Статус депозита."""
-
-    PENDING = "pending"  # Обнаружен, ждём подтверждений
-    CONFIRMING = "confirming"  # Набираем подтверждения
-    CONFIRMED = "confirmed"  # Подтверждён, зачислен на баланс
-    SWEPT = "swept"  # Средства переведены в treasury
 
 
 class UserWallet(Base):
@@ -291,7 +282,7 @@ class Deposit(Base):
 
     # Статус
     status: Mapped[DepositStatus] = mapped_column(
-        SqlEnum(DepositStatus, name="deposit_status"),
+        SqlEnum(DepositStatus, name="deposit_status", values_callable=enum_values(DepositStatus)),
         default=DepositStatus.PENDING,
         nullable=False,
         index=True,
@@ -343,6 +334,8 @@ class Deposit(Base):
     wallet_address: Mapped["WalletAddress"] = relationship(
         back_populates="deposits",
     )
+
+    # Sweep job теперь в UnifiedSweepJob (source='persistent', source_id=deposit.id)
 
     __table_args__ = (
         # Уникальность транзакции

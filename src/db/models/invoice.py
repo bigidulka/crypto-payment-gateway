@@ -36,15 +36,7 @@ if TYPE_CHECKING:
     from src.db.models.merchant import Merchant
     from src.db.models.payment import PaymentSession
 
-
-class InvoiceStatus(str, enum.Enum):
-    """Статусы инвойса."""
-
-    CREATED = "CREATED"  # Создан, ожидает выбора сети
-    AWAITING_PAYMENT = "AWAITING_PAYMENT"  # Сеть выбрана, ожидает оплаты
-    SEEN_ONCHAIN = "SEEN_ONCHAIN"  # Транзакция найдена, но ещё не подтверждена
-    CONFIRMED = "CONFIRMED"  # Платёж подтверждён
-    EXPIRED = "EXPIRED"  # Время истекло
+from src.db.models.enums import InvoiceStatus, enum_values
 
 
 class Invoice(Base, UUIDMixin, TimestampMixin):
@@ -86,7 +78,7 @@ class Invoice(Base, UUIDMixin, TimestampMixin):
 
     # Статус
     status: Mapped[InvoiceStatus] = mapped_column(
-        Enum(InvoiceStatus, name="invoice_status"),
+        Enum(InvoiceStatus, name="invoice_status", values_callable=enum_values(InvoiceStatus)),
         default=InvoiceStatus.CREATED,
         nullable=False,
         index=True,

@@ -36,6 +36,9 @@ from src.db.models import (
     DepositStatus,
     OutboxStatus,
     OutboxWebhook,
+    SweepState,
+    SweepSource,
+    UnifiedSweepJob,
     UserWallet,
     WalletAddress,
     Webhook,
@@ -49,6 +52,111 @@ from src.services.user_wallet_service import (
 logger = logging.getLogger(__name__)
 
 
+# === Sweep Task Creation ===
+
+# Минимальная сумма для sweep (в USD)
+# Депозиты меньше этой суммы не выводятся, чтобы не тратить газ впустую
+MIN_SWEEP_AMOUNT_USD = Decimal("0.50")
+
+
+async def create_unified_sweep_job(session, deposit: Deposit) -> UnifiedSweepJob | None:
+    """
+    Создать UnifiedSweepJob для подтверждённого депозита.
+    
+    Args:
+        session: SQLAlchemy сессия
+        deposit: Подтверждённый депозит
+        
+    Returns:
+        UnifiedSweepJob или None если не создан
+    """
+    try:
+        # Проверяем минимальную сумму для sweep
+        if deposit.amount < MIN_SWEEP_AMOUNT_USD:
+            logger.debug(
+                f"[{deposit.chain}] Deposit {deposit.id} below sweep threshold: "
+                f"{deposit.amount} {deposit.asset} < ${MIN_SWEEP_AMOUNT_USD}"
+            )
+            return None
+        
+        # Проверяем, не создана ли уже задача (по source + source_id)
+        stmt = select(UnifiedSweepJob).where(
+            and_(
+                UnifiedSweepJob.source == SweepSource.PERSISTENT,
+                UnifiedSweepJob.source_id == deposit.id,
+            )
+        )
+        result = await session.execute(stmt)
+        existing = result.scalar_one_or_none()
+        
+        if existing:
+            logger.debug(f"[{deposit.chain}] Sweep job already exists for deposit {deposit.id}")
+            return existing
+        
+        # Получаем wallet_address для encrypted_private_key и treasury
+        wallet_address = deposit.wallet_address
+        if not wallet_address:
+            logger.error(f"[{deposit.chain}] No wallet_address for deposit {deposit.id}")
+            return None
+        
+        # Получаем настройки
+        from src.core.config import get_settings
+        settings = get_settings()
+        
+        # Получаем treasury адрес для этой сети
+        treasury_address = settings.get_treasury_address(deposit.chain)
+        if not treasury_address:
+            logger.error(f"[{deposit.chain}] No treasury address configured")
+            return None
+        
+        # Рассчитываем приоритет
+        if deposit.amount >= 1000:
+            priority = 100
+        elif deposit.amount >= 100:
+            priority = 50
+        else:
+            priority = 10
+        
+        # Получаем конфиг сети для decimals
+        config = get_chain_config(deposit.chain)
+        token_config = config.tokens.get(deposit.asset)
+        decimals = token_config.decimals if token_config else 18
+        
+        # Конвертируем amount в raw
+        amount_raw = str(int(deposit.amount * Decimal(10 ** decimals)))
+        
+        # Создаём UnifiedSweepJob
+        sweep_job = UnifiedSweepJob(
+            id=uuid.uuid4(),
+            source=SweepSource.PERSISTENT,
+            source_id=deposit.id,
+            chain=deposit.chain,
+            token=deposit.asset,
+            token_contract=deposit.token_contract,
+            from_address=wallet_address.address,
+            to_address=treasury_address,
+            amount=deposit.amount,
+            amount_raw=amount_raw,
+            encrypted_private_key=wallet_address.encrypted_private_key,
+            state=SweepState.PENDING_GAS,
+            priority=priority,
+            attempts=0,
+            max_attempts=10,
+        )
+        session.add(sweep_job)
+        
+        logger.info(
+            f"[{deposit.chain}] Created unified sweep job {sweep_job.id} for deposit {deposit.id}: "
+            f"{deposit.amount} {deposit.asset}"
+        )
+        
+        return sweep_job
+        
+    except Exception as e:
+        logger.error(f"Failed to create sweep job for deposit {deposit.id}: {e}")
+        return None
+
+
 # === Transfer Log Parsing ===
 
 from dataclasses import dataclass
@@ -57,6 +165,7 @@ from dataclasses import dataclass
 @dataclass
 class TransferLog:
     """Распарсенный Transfer event."""
+
 
     tx_hash: str
     log_index: int
@@ -76,12 +185,15 @@ def _parse_transfer_log(chain: str, log: dict) -> TransferLog | None:
     if len(topics) < 3:
         return None
 
-    # Transaction hash
+    # Transaction hash - always normalize to 0x prefix
     tx_hash = log.get("transactionHash", "")
     if isinstance(tx_hash, bytes):
-        tx_hash = tx_hash.hex()
+        tx_hash = "0x" + tx_hash.hex()
     elif hasattr(tx_hash, "hex"):
-        tx_hash = tx_hash.hex()
+        tx_hash = "0x" + tx_hash.hex()
+    # Ensure 0x prefix
+    if tx_hash and not tx_hash.startswith("0x"):
+        tx_hash = "0x" + tx_hash
 
     # Parse topics
     topic1 = topics[1]
@@ -374,6 +486,9 @@ async def update_deposit_confirmations(chain: str) -> int:
 
                     # Создаём webhook для мерчанта
                     await create_deposit_webhook(session, deposit)
+                    
+                    # Создаём UnifiedSweepJob для sweep
+                    await create_unified_sweep_job(session, deposit)
 
             except Exception as e:
                 logger.error(

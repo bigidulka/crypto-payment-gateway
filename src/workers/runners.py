@@ -74,12 +74,12 @@ class Sweeper:
         """Один цикл sweep"""
         try:
             async with self.session_maker() as session:
-                # Проверяем sweep jobs
-                from src.db.models.sweep import SweepJob, SweepState
+                # Проверяем unified sweep jobs
+                from src.db.models import UnifiedSweepJob, SweepState
 
                 result = await session.execute(
-                    select(SweepJob).where(
-                        SweepJob.state.in_(
+                    select(UnifiedSweepJob).where(
+                        UnifiedSweepJob.state.in_(
                             [
                                 SweepState.PENDING_GAS,
                                 SweepState.FUNDING,

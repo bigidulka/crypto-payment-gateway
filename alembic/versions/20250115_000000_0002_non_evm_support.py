@@ -12,8 +12,8 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = "20250115_000000_0002_non_evm_support"
-down_revision: Union[str, None] = "20251225_000000_0001_initial_migration"
+revision: str = "0002_non_evm"
+down_revision: Union[str, None] = "20251225_000000_0001"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

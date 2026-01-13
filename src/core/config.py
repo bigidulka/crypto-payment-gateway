@@ -39,37 +39,17 @@ class Settings(BaseSettings):
     # 32-byte ключ в base64 для AES-256-GCM шифрования приватных ключей
     encryption_key: SecretStr = Field(..., min_length=32)
 
+    # Секретный ключ для доступа к админ-панели (минимум 32 символа)
+    admin_secret_key: SecretStr = Field(default="", min_length=0)
+
     # BIP39 мнемоника для HD кошелька (12 или 24 слова)
     hd_wallet_seed: SecretStr = Field(default="", min_length=0)  # Опциональный
     hd_master_seed: SecretStr = Field(default="", min_length=0)  # Hex seed
 
-    # === Blockchain RPC ===
-    # Primary RPC (обязательный)
-    base_rpc_url: str = "https://mainnet.base.org"
-    arb_rpc_url: str = "https://arb1.arbitrum.io/rpc"
-    bsc_rpc_url: str = "https://bsc-dataseed.binance.org"
-    polygon_rpc_url: str = "https://polygon-rpc.com"
-    avax_rpc_url: str = "https://api.avax.network/ext/bc/C/rpc"
-    optimism_rpc_url: str = "https://mainnet.optimism.io"
-
-    # === Non-EVM RPC ===
+    # === Non-EVM RPC (пока остаются в env, не мигрировали в TOML) ===
     solana_rpc_url: str = "https://api.mainnet-beta.solana.com"
     ton_rpc_url: str = "https://toncenter.com/api/v2"
     ton_api_key: str = ""  # TON Center API key (опционально)
-
-    # Additional RPC endpoints (comma-separated, для failover и ротации)
-    # Пример: "https://rpc1.example.com,https://rpc2.example.com"
-    base_rpc_urls: str = ""
-    arb_rpc_urls: str = ""
-    bsc_rpc_urls: str = ""
-    polygon_rpc_urls: str = ""
-    avax_rpc_urls: str = ""
-    optimism_rpc_urls: str = ""
-    solana_rpc_urls: str = ""
-    ton_rpc_urls: str = ""
-
-    # RPC rotation strategy: failover, round_robin, latency, weighted
-    rpc_rotation_strategy: str = "failover"
 
     # === Treasury & Funding ===
     treasury_address: str = ""  # Единый treasury адрес (EVM)
@@ -149,51 +129,14 @@ class Settings(BaseSettings):
 
     def get_rpc_urls(self, chain: str) -> list[str]:
         """
-        Получить все RPC URLs для сети (primary + additional).
+        Получить все RPC URLs для сети из chains.toml.
 
         Returns:
             Список RPC URLs в порядке приоритета
         """
-        chain = chain.lower()
+        from src.blockchain.chains import get_rpc_urls as get_chain_rpc_urls
 
-        # Primary RPC
-        primary_map = {
-            "base": self.base_rpc_url,
-            "arbitrum": self.arb_rpc_url,
-            "bsc": self.bsc_rpc_url,
-            "polygon": self.polygon_rpc_url,
-            "avax": self.avax_rpc_url,
-            "optimism": self.optimism_rpc_url,
-            "solana": self.solana_rpc_url,
-            "ton": self.ton_rpc_url,
-        }
-
-        # Additional RPCs (comma-separated)
-        additional_map = {
-            "base": self.base_rpc_urls,
-            "arbitrum": self.arb_rpc_urls,
-            "bsc": self.bsc_rpc_urls,
-            "polygon": self.polygon_rpc_urls,
-            "avax": self.avax_rpc_urls,
-            "optimism": self.optimism_rpc_urls,
-            "solana": self.solana_rpc_urls,
-            "ton": self.ton_rpc_urls,
-        }
-
-        urls = []
-
-        # Primary first
-        if primary := primary_map.get(chain):
-            urls.append(primary)
-
-        # Additional RPCs
-        if additional := additional_map.get(chain):
-            for url in additional.split(","):
-                url = url.strip()
-                if url and url not in urls:
-                    urls.append(url)
-
-        return urls
+        return get_chain_rpc_urls(chain)
 
 
 @lru_cache

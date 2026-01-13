@@ -9,7 +9,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import selectinload
 
 from src.api.deps import IdempotencyKeyDep, MerchantDep, SessionDep
@@ -32,7 +32,7 @@ from src.api.merchant.schemas import (
     WebhookListResponse,
     WebhookResponse,
 )
-from src.blockchain.chains import CHAINS_CONFIG, get_chain_config
+from src.blockchain.chains import get_chain_config, get_all_chains, is_chain_supported
 from src.blockchain.evm_adapter import get_evm_adapter
 from src.db.models import (
     ApiKey,
@@ -41,7 +41,8 @@ from src.db.models import (
     InvoiceStatus,
     Merchant,
     PaymentSession,
-    SweepJob,
+    UnifiedSweepJob,
+    SweepSource,
     SweepState,
 )
 from src.services.invoice_service import InvoiceService
@@ -351,21 +352,15 @@ async def list_sweep_jobs(
     state_filter: Optional[str] = Query(None, alias="state"),
     limit: int = Query(50, ge=1, le=100),
 ) -> SweepJobListResponse:
-    """Получить список задач на вывод (sweep jobs)."""
+    """Получить список задач на вывод (sweep jobs) из UnifiedSweepJob."""
+    from sqlalchemy import and_
 
-    # Строим запрос с join через payment_session -> invoice
+    # Строим запрос для UnifiedSweepJob, фильтруя по source='invoice'
+    # и проверяя что source_id связан с invoice мерчанта
     stmt = (
-        select(SweepJob)
-        .options(
-            selectinload(SweepJob.payment_session).selectinload(PaymentSession.invoice),
-            selectinload(SweepJob.payment_session).selectinload(
-                PaymentSession.deposit_address
-            ),
-        )
-        .join(SweepJob.payment_session)
-        .join(PaymentSession.invoice)
-        .where(Invoice.merchant_id == merchant.id)
-        .order_by(SweepJob.created_at.desc())
+        select(UnifiedSweepJob)
+        .where(UnifiedSweepJob.source == SweepSource.INVOICE)
+        .order_by(UnifiedSweepJob.created_at.desc())
         .limit(limit)
     )
 
@@ -373,7 +368,7 @@ async def list_sweep_jobs(
     if state_filter:
         try:
             state = SweepState(state_filter.lower())
-            stmt = stmt.where(SweepJob.state == state)
+            stmt = stmt.where(UnifiedSweepJob.state == state)
         except ValueError:
             pass
 
@@ -382,19 +377,31 @@ async def list_sweep_jobs(
 
     items = []
     for sweep in sweep_jobs:
-        ps = sweep.payment_session
-        invoice = ps.invoice
-        deposit = ps.deposit_address
+        # Получаем связанную payment_session
+        ps_stmt = select(PaymentSession).where(PaymentSession.id == sweep.source_id)
+        ps_result = await session.execute(ps_stmt)
+        ps = ps_result.scalar_one_or_none()
+        
+        if not ps:
+            continue
+            
+        # Получаем invoice
+        inv_stmt = select(Invoice).where(Invoice.id == ps.invoice_id)
+        inv_result = await session.execute(inv_stmt)
+        invoice = inv_result.scalar_one_or_none()
+        
+        if not invoice or invoice.merchant_id != merchant.id:
+            continue
 
         items.append(
             SweepJobResponse(
                 id=sweep.id,
                 invoice_id=invoice.id,
                 invoice_public_id=invoice.public_id,
-                chain=ps.chain,
-                token=ps.token,
-                deposit_address=deposit.address,
-                amount=invoice.amount,
+                chain=sweep.chain,
+                token=sweep.token,
+                deposit_address=sweep.from_address,
+                amount=sweep.amount,
                 state=sweep.state.value,
                 gas_tx_hash=sweep.gas_tx_hash,
                 sweep_tx_hash=sweep.sweep_tx_hash,
@@ -639,9 +646,12 @@ async def manual_sweep(
             message=f"Failed to check balance: {str(e)}",
         )
 
-    # Проверяем существующий sweep job
-    existing_stmt = select(SweepJob).where(
-        SweepJob.payment_session_id == payment_session.id
+    # Проверяем существующий sweep job в unified_sweep_jobs
+    existing_stmt = select(UnifiedSweepJob).where(
+        and_(
+            UnifiedSweepJob.source == SweepSource.INVOICE,
+            UnifiedSweepJob.source_id == payment_session.id,
+        )
     )
     existing_result = await session.execute(existing_stmt)
     existing_job = existing_result.scalar_one_or_none()
@@ -677,12 +687,29 @@ async def manual_sweep(
             balance=balance,
         )
 
-    # Создаём новый sweep job
-    sweep_job = SweepJob(
-        payment_session_id=payment_session.id,
+    # Создаём новый UnifiedSweepJob
+    config = get_chain_config(request.chain)
+    token_config = config.tokens.get(request.token)
+    decimals = token_config.decimals if token_config else 6
+    
+    from src.core.config import get_settings
+    settings = get_settings()
+    
+    sweep_job = UnifiedSweepJob(
+        source=SweepSource.INVOICE,
+        source_id=payment_session.id,
+        chain=request.chain,
+        token=request.token,
+        token_contract=token_config.contract_address if token_config else "",
+        from_address=deposit.address,
+        to_address=settings.get_treasury_address(request.chain),
+        encrypted_private_key=deposit.encrypted_privkey.hex() if isinstance(deposit.encrypted_privkey, bytes) else deposit.encrypted_privkey,
+        amount=balance,
+        amount_raw=str(int(balance * (10 ** decimals))),
         state=SweepState.PENDING_GAS,
         attempts=0,
         max_attempts=5,
+        priority=50 if balance >= 100 else 10,
     )
     session.add(sweep_job)
     await session.commit()

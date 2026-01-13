@@ -21,6 +21,13 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     # === ENUMS ===
+    # Создаём enum типы напрямую через execute
+    op.execute("CREATE TYPE invoice_status AS ENUM ('CREATED', 'AWAITING_PAYMENT', 'SEEN_ONCHAIN', 'CONFIRMED', 'EXPIRED')")
+    op.execute("CREATE TYPE tx_status AS ENUM ('pending', 'confirming', 'confirmed')")
+    op.execute("CREATE TYPE sweep_state AS ENUM ('pending_gas', 'funding', 'sweeping', 'completed', 'failed')")
+    op.execute("CREATE TYPE outbox_status AS ENUM ('pending', 'sent', 'failed')")
+
+    # Создаём объекты для использования в столбцах (без автосоздания типа)
     invoice_status_enum = postgresql.ENUM(
         "CREATED",
         "AWAITING_PAYMENT",
@@ -28,23 +35,20 @@ def upgrade() -> None:
         "CONFIRMED",
         "EXPIRED",
         name="invoice_status",
+        create_type=False,
     )
-    invoice_status_enum.create(op.get_bind(), checkfirst=True)
 
     tx_status_enum = postgresql.ENUM(
-        "pending", "confirming", "confirmed", name="tx_status"
+        "pending", "confirming", "confirmed", name="tx_status", create_type=False
     )
-    tx_status_enum.create(op.get_bind(), checkfirst=True)
 
     sweep_state_enum = postgresql.ENUM(
-        "pending_gas", "funding", "sweeping", "completed", "failed", name="sweep_state"
+        "pending_gas", "funding", "sweeping", "completed", "failed", name="sweep_state", create_type=False
     )
-    sweep_state_enum.create(op.get_bind(), checkfirst=True)
 
     outbox_status_enum = postgresql.ENUM(
-        "pending", "sent", "failed", name="outbox_status"
+        "pending", "sent", "failed", name="outbox_status", create_type=False
     )
-    outbox_status_enum.create(op.get_bind(), checkfirst=True)
 
     # === MERCHANTS ===
     op.create_table(
@@ -79,7 +83,7 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("key_hash", sa.String(64), nullable=False, unique=True),
-        sa.Column("key_prefix", sa.String(8), nullable=False),
+        sa.Column("key_prefix", sa.String(16), nullable=False),
         sa.Column("name", sa.String(100), nullable=False, default="Default"),
         sa.Column("is_active", sa.Boolean(), nullable=False, default=True),
         sa.Column("last_used_at", sa.DateTime(timezone=True), nullable=True),
@@ -136,7 +140,7 @@ def upgrade() -> None:
         sa.Column("status", invoice_status_enum, nullable=False, default="CREATED"),
         sa.Column("ttl_minutes", sa.Integer(), nullable=False, default=60),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("metadata", postgresql.JSONB(), nullable=True),
+        sa.Column("extra_data", postgresql.JSONB(), nullable=True),
         sa.Column("idempotency_key", sa.String(64), nullable=True),
         sa.Column(
             "created_at",

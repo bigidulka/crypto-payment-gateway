@@ -24,7 +24,7 @@ from typing import Any
 from web3 import AsyncWeb3
 from web3.exceptions import Web3RPCError
 
-from src.blockchain.chains import TRANSFER_EVENT_SIGNATURE, get_chain_config
+from src.blockchain.chains import get_chain_config, get_transfer_event_signature
 
 logger = logging.getLogger(__name__)
 
@@ -219,7 +219,7 @@ class ResilientLogFetcher:
                     "fromBlock": test_block,
                     "toBlock": test_block + 10,
                     "topics": [
-                        TRANSFER_EVENT_SIGNATURE,
+                        get_transfer_event_signature(),
                         None,
                         padded,  # OR список
                     ],
@@ -276,7 +276,7 @@ class ResilientLogFetcher:
                         "toBlock": to_block,
                         "address": token_contracts,
                         "topics": [
-                            TRANSFER_EVENT_SIGNATURE,
+                            get_transfer_event_signature(),
                             None,  # from - любой
                             padded_addresses,  # to - OR список
                         ],
@@ -316,7 +316,7 @@ class ResilientLogFetcher:
                     "toBlock": to_block,
                     "address": token_contracts,
                     "topics": [
-                        TRANSFER_EVENT_SIGNATURE,
+                        get_transfer_event_signature(),
                         None,
                         padded,
                     ],

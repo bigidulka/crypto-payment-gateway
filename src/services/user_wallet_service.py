@@ -273,6 +273,10 @@ class UserWalletService:
             )
             return None
 
+        # Normalize tx_hash to always have 0x prefix
+        if tx_hash and not tx_hash.startswith("0x"):
+            tx_hash = "0x" + tx_hash
+
         # Проверяем, не записан ли уже этот депозит
         stmt = select(Deposit).where(
             and_(
