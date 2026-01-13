@@ -450,10 +450,63 @@ class EvmAdapter:
             self.w3.to_checksum_address(address)
         ).call()
 
+    async def _multicall_aggregate(
+        self,
+        calls: list[tuple[str, bytes]],
+        *,
+        abi: list[dict[str, Any]] | None = None,
+        chunk_size: int | None = None,
+        concurrency: int = 4,
+    ) -> list[bytes]:
+        """Выполнить Multicall aggregate с поддержкой батчинга и RPC пула."""
+        if not calls:
+            return []
+
+        multicall_address = get_multicall3_address()
+        multicall_abi = abi or self.MULTICALL3_ABI
+
+        async def run_chunk(chunk: list[tuple[str, bytes]]) -> list[bytes]:
+            async def do_call(w3: AsyncWeb3):
+                multicall = w3.eth.contract(
+                    address=w3.to_checksum_address(multicall_address),
+                    abi=multicall_abi,
+                )
+                return await multicall.functions.aggregate(chunk).call()
+
+            if self._rpc_manager and self._use_rpc_manager:
+                _, return_data = await self._rpc_manager.execute(do_call)
+            else:
+                multicall = self.w3.eth.contract(
+                    address=self.w3.to_checksum_address(multicall_address),
+                    abi=multicall_abi,
+                )
+                _, return_data = await multicall.functions.aggregate(chunk).call()
+
+            return list(return_data)
+
+        if not chunk_size or len(calls) <= chunk_size:
+            return await run_chunk(calls)
+
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def run_with_limit(chunk: list[tuple[str, bytes]]) -> list[bytes]:
+            async with semaphore:
+                return await run_chunk(chunk)
+
+        chunks = [calls[i : i + chunk_size] for i in range(0, len(calls), chunk_size)]
+        results = await asyncio.gather(*[run_with_limit(chunk) for chunk in chunks])
+        flattened: list[bytes] = []
+        for data in results:
+            flattened.extend(data)
+        return flattened
+
     async def get_balances_batch(
         self,
         addresses: list[str],
         token_contracts: list[str],
+        *,
+        chunk_size: int | None = None,
+        concurrency: int = 4,
     ) -> dict[str, dict[str, Decimal]]:
         """
         Получить балансы нескольких адресов для нескольких токенов за ОДИН RPC вызов.
@@ -463,6 +516,8 @@ class EvmAdapter:
         Args:
             addresses: Список адресов кошельков
             token_contracts: Список адресов контрактов токенов
+            chunk_size: Максимум вызовов в одном multicall (None = один батч)
+            concurrency: Количество одновременных multicall запросов
 
         Returns:
             Dict[address, Dict[token_contract, balance]]
@@ -470,9 +525,11 @@ class EvmAdapter:
         if not addresses or not token_contracts:
             return {}
 
+        web3 = await self._get_web3()
+
         # Готовим calldata для balanceOf
-        erc20_contract = self.w3.eth.contract(
-            address=self.w3.to_checksum_address(token_contracts[0]),
+        erc20_contract = web3.eth.contract(
+            address=web3.to_checksum_address(token_contracts[0]),
             abi=ERC20_ABI,
         )
 
@@ -483,24 +540,22 @@ class EvmAdapter:
         )  # (address, token_contract) для маппинга результатов
 
         for address in addresses:
-            checksum_addr = self.w3.to_checksum_address(address)
+            checksum_addr = web3.to_checksum_address(address)
             for token_contract in token_contracts:
                 calldata = erc20_contract.encode_abi(
                     abi_element_identifier="balanceOf",
                     args=[checksum_addr],
                 )
-                calls.append((self.w3.to_checksum_address(token_contract), calldata))
+                calls.append((web3.to_checksum_address(token_contract), calldata))
                 call_map.append((address.lower(), token_contract.lower()))
 
-        # Вызываем Multicall3
-        multicall_address = get_multicall3_address()
-        multicall = self.w3.eth.contract(
-            address=self.w3.to_checksum_address(multicall_address),
-            abi=self.MULTICALL3_ABI,
-        )
-
+        # Выполняем multicall (возможно chunked)
         try:
-            _, return_data = await multicall.functions.aggregate(calls).call()
+            return_data = await self._multicall_aggregate(
+                calls,
+                chunk_size=chunk_size,
+                concurrency=concurrency,
+            )
         except Exception as e:
             logger.warning(f"Multicall failed, falling back to individual calls: {e}")
             # Fallback на индивидуальные вызовы
@@ -538,7 +593,11 @@ class EvmAdapter:
         return result
 
     async def get_native_balances_batch(
-        self, addresses: list[str]
+        self,
+        addresses: list[str],
+        *,
+        chunk_size: int | None = None,
+        concurrency: int = 4,
     ) -> dict[str, Decimal]:
         """
         Получить native балансы нескольких адресов за ОДИН RPC вызов.
@@ -547,12 +606,16 @@ class EvmAdapter:
 
         Args:
             addresses: Список адресов
+            chunk_size: Максимум вызовов в одном multicall (None = один батч)
+            concurrency: Количество одновременных multicall запросов
 
         Returns:
             Dict[address, balance]
         """
         if not addresses:
             return {}
+
+        web3 = await self._get_web3()
 
         # Multicall3 имеет getEthBalance функцию
         multicall3_with_eth = [
@@ -566,8 +629,8 @@ class EvmAdapter:
         ] + self.MULTICALL3_ABI
 
         multicall_address = get_multicall3_address()
-        multicall = self.w3.eth.contract(
-            address=self.w3.to_checksum_address(multicall_address),
+        multicall = web3.eth.contract(
+            address=web3.to_checksum_address(multicall_address),
             abi=multicall3_with_eth,
         )
 
@@ -576,12 +639,17 @@ class EvmAdapter:
         for address in addresses:
             calldata = multicall.encode_abi(
                 abi_element_identifier="getEthBalance",
-                args=[self.w3.to_checksum_address(address)],
+                args=[web3.to_checksum_address(address)],
             )
             calls.append((multicall_address, calldata))
 
         try:
-            _, return_data = await multicall.functions.aggregate(calls).call()
+            return_data = await self._multicall_aggregate(
+                calls,
+                abi=multicall3_with_eth,
+                chunk_size=chunk_size,
+                concurrency=concurrency,
+            )
         except Exception as e:
             logger.warning(f"Multicall for native balances failed: {e}")
             # Fallback
@@ -1283,7 +1351,17 @@ def get_evm_adapter(chain: str) -> EvmAdapter:
     normalized = normalize_chain_name(chain)
     if normalized not in _adapter_cache:
         _adapter_cache[normalized] = EvmAdapter(normalized)
-    return _adapter_cache[normalized]
+
+    adapter = _adapter_cache[normalized]
+    if adapter._rpc_manager is None:
+        try:
+            from src.blockchain.rpc_manager import get_rpc_manager
+
+            adapter.set_rpc_manager(get_rpc_manager(normalized))
+        except Exception:
+            pass
+
+    return adapter
 
 
 async def close_all_adapters() -> None:

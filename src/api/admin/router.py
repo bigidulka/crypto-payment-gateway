@@ -4,6 +4,7 @@ Admin API Router.
 Защищены секретным ключом ADMIN_SECRET_KEY.
 """
 
+import asyncio
 import math
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
@@ -630,21 +631,15 @@ async def check_all_balances(
     chain_groups: dict[str, list[PaymentSession]] = {}
     seen_addresses: set[tuple[str, str]] = set()
 
-    for ps in payment_sessions:
-        if not ps.deposit_address:
-            continue
+    chunk_size = 200
+    concurrency = 4
 
-        key = (ps.deposit_address.address.lower(), ps.chain)
-        if key in seen_addresses:
-            continue
-        seen_addresses.add(key)
+    async def fetch_deposit_chain(chain_name: str, sessions: list[PaymentSession]):
+        local_grouped: dict[tuple[str, str], dict] = {}
+        local_totals: dict[str, Decimal] = {}
+        local_addresses_checked = 0
+        local_addresses_with_balance = 0
 
-        if ps.chain not in chain_groups:
-            chain_groups[ps.chain] = []
-        chain_groups[ps.chain].append(ps)
-
-    # Обрабатываем каждую сеть батчем
-    for chain_name, sessions in chain_groups.items():
         try:
             adapter = get_evm_adapter(chain_name)
             chain_config = get_chain_config(chain_name)
@@ -656,21 +651,27 @@ async def check_all_balances(
                 chain_config.tokens["USDC"].contract_address,
             ]
 
-            # Batch запросы
-            native_balances = await adapter.get_native_balances_batch(addresses)
-            token_balances = await adapter.get_balances_batch(
-                addresses, token_contracts
+            native_task = adapter.get_native_balances_batch(
+                addresses, chunk_size=chunk_size, concurrency=concurrency
+            )
+            token_task = adapter.get_balances_batch(
+                addresses,
+                token_contracts,
+                chunk_size=chunk_size,
+                concurrency=concurrency,
+            )
+            native_balances, token_balances = await asyncio.gather(
+                native_task, token_task
             )
 
             for ps in sessions:
                 addr = ps.deposit_address.address
                 addr_lower = addr.lower()
-                total_addresses_checked += 1
+                local_addresses_checked += 1
 
                 native_balance_ether = native_balances.get(addr_lower, Decimal(0))
                 addr_token_balances = token_balances.get(addr_lower, {})
 
-                # Собираем токены для этого адреса
                 tokens_list: list[TokenBalance] = []
                 has_any_balance = False
 
@@ -691,23 +692,21 @@ async def check_all_balances(
                     )
 
                     key = f"{chain_name}/{token_symbol}"
-                    total_balances[key] = total_balances.get(key, Decimal(0)) + balance
+                    local_totals[key] = local_totals.get(key, Decimal(0)) + balance
 
                     if balance > 0:
                         has_any_balance = True
 
                 if has_any_balance:
-                    addresses_with_balance += 1
+                    local_addresses_with_balance += 1
 
-                # Получаем имя мерчанта
                 merchant_name = None
                 if ps.invoice and ps.invoice.merchant:
                     merchant_name = ps.invoice.merchant.name
 
-                # Добавляем в результат если есть баланс или нужны все
                 if has_any_balance or not with_balance_only:
                     wallet_key = (addr_lower, chain_name)
-                    grouped_wallets[wallet_key] = {
+                    local_grouped[wallet_key] = {
                         "type": "deposit_address",
                         "chain": chain_name,
                         "address": addr,
@@ -719,7 +718,6 @@ async def check_all_balances(
                     }
 
         except Exception as e:
-            # При ошибке добавляем с нулевыми балансами и логируем
             import logging
 
             logging.error(f"Error fetching balances for chain {chain_name}: {e}")
@@ -729,16 +727,15 @@ async def check_all_balances(
                 native_symbol = chain_config.native_symbol if chain_config else "ETH"
 
                 for ps in sessions:
-                    total_addresses_checked += 1
+                    local_addresses_checked += 1
                     addr = ps.deposit_address.address
                     wallet_key = (addr.lower(), chain_name)
 
-                    # Получаем имя мерчанта
                     merchant_name = None
                     if ps.invoice and ps.invoice.merchant:
                         merchant_name = ps.invoice.merchant.name
 
-                    grouped_wallets[wallet_key] = {
+                    local_grouped[wallet_key] = {
                         "type": "deposit_address",
                         "chain": chain_name,
                         "address": addr,
@@ -751,6 +748,42 @@ async def check_all_balances(
                         "invoice_id": str(ps.invoice.id) if ps.invoice else None,
                         "merchant_name": merchant_name,
                     }
+
+        return (
+            local_grouped,
+            local_totals,
+            local_addresses_checked,
+            local_addresses_with_balance,
+        )
+
+    for ps in payment_sessions:
+        if not ps.deposit_address:
+            continue
+
+        key = (ps.deposit_address.address.lower(), ps.chain)
+        if key in seen_addresses:
+            continue
+        seen_addresses.add(key)
+
+        if ps.chain not in chain_groups:
+            chain_groups[ps.chain] = []
+        chain_groups[ps.chain].append(ps)
+
+    # Обрабатываем каждую сеть батчем (параллельно по chain)
+    if chain_groups:
+        deposit_results = await asyncio.gather(
+            *[
+                fetch_deposit_chain(chain_name, sessions)
+                for chain_name, sessions in chain_groups.items()
+            ]
+        )
+
+        for grouped, totals, checked, with_balance in deposit_results:
+            grouped_wallets.update(grouped)
+            total_addresses_checked += checked
+            addresses_with_balance += with_balance
+            for key, value in totals.items():
+                total_balances[key] = total_balances.get(key, Decimal(0)) + value
 
     # === Теперь обрабатываем WalletAddress (persistent addresses) ===
     stmt_wallet = (
@@ -775,13 +808,12 @@ async def check_all_balances(
             wallet_chain_groups[wa.chain] = []
         wallet_chain_groups[wa.chain].append(wa)
 
-    # Обрабатываем persistent адреса (только поддерживаемые чейны)
-    for chain_name, addresses_list in wallet_chain_groups.items():
-        # Пропускаем неподдерживаемые чейны (solana, ton - закомментированы)
-        from src.blockchain.chains import is_chain_supported
-        if not is_chain_supported(chain_name):
-            continue
-            
+    async def fetch_persistent_chain(chain_name: str, addresses_list: list[WalletAddress]):
+        local_grouped: dict[tuple[str, str], dict] = {}
+        local_totals: dict[str, Decimal] = {}
+        local_addresses_checked = 0
+        local_addresses_with_balance = 0
+
         try:
             adapter = get_evm_adapter(chain_name)
             chain_config = get_chain_config(chain_name)
@@ -793,13 +825,23 @@ async def check_all_balances(
                 chain_config.tokens["USDC"].contract_address,
             ]
 
-            native_balances = await adapter.get_native_balances_batch(addrs)
-            token_balances = await adapter.get_balances_batch(addrs, token_contracts)
+            native_task = adapter.get_native_balances_batch(
+                addrs, chunk_size=chunk_size, concurrency=concurrency
+            )
+            token_task = adapter.get_balances_batch(
+                addrs,
+                token_contracts,
+                chunk_size=chunk_size,
+                concurrency=concurrency,
+            )
+            native_balances, token_balances = await asyncio.gather(
+                native_task, token_task
+            )
 
             for wa in addresses_list:
                 addr = wa.address
                 addr_lower = addr.lower()
-                total_addresses_checked += 1
+                local_addresses_checked += 1
 
                 native_balance_ether = native_balances.get(addr_lower, Decimal(0))
                 addr_token_balances = token_balances.get(addr_lower, {})
@@ -824,15 +866,14 @@ async def check_all_balances(
                     )
 
                     key = f"{chain_name}/{token_symbol}"
-                    total_balances[key] = total_balances.get(key, Decimal(0)) + balance
+                    local_totals[key] = local_totals.get(key, Decimal(0)) + balance
 
                     if balance > 0:
                         has_any_balance = True
 
                 if has_any_balance:
-                    addresses_with_balance += 1
+                    local_addresses_with_balance += 1
 
-                # Получаем имя мерчанта и user_id
                 merchant_name = None
                 user_id = None
                 if wa.user_wallet:
@@ -842,7 +883,7 @@ async def check_all_balances(
 
                 if has_any_balance or not with_balance_only:
                     wallet_key = (addr_lower, chain_name)
-                    grouped_wallets[wallet_key] = {
+                    local_grouped[wallet_key] = {
                         "type": "persistent_address",
                         "chain": chain_name,
                         "address": addr,
@@ -865,7 +906,7 @@ async def check_all_balances(
                 native_symbol = chain_config.native_symbol if chain_config else "ETH"
 
                 for wa in addresses_list:
-                    total_addresses_checked += 1
+                    local_addresses_checked += 1
                     addr = wa.address
                     wallet_key = (addr.lower(), chain_name)
 
@@ -876,7 +917,7 @@ async def check_all_balances(
                         if wa.user_wallet.merchant:
                             merchant_name = wa.user_wallet.merchant.name
 
-                    grouped_wallets[wallet_key] = {
+                    local_grouped[wallet_key] = {
                         "type": "persistent_address",
                         "chain": chain_name,
                         "address": addr,
@@ -889,6 +930,37 @@ async def check_all_balances(
                         "user_id": user_id,
                         "merchant_name": merchant_name,
                     }
+
+        return (
+            local_grouped,
+            local_totals,
+            local_addresses_checked,
+            local_addresses_with_balance,
+        )
+
+    # Обрабатываем persistent адреса (только поддерживаемые чейны)
+    from src.blockchain.chains import is_chain_supported
+
+    supported_wallet_groups = {
+        chain_name: addresses_list
+        for chain_name, addresses_list in wallet_chain_groups.items()
+        if is_chain_supported(chain_name)
+    }
+
+    if supported_wallet_groups:
+        persistent_results = await asyncio.gather(
+            *[
+                fetch_persistent_chain(chain_name, addresses_list)
+                for chain_name, addresses_list in supported_wallet_groups.items()
+            ]
+        )
+
+        for grouped, totals, checked, with_balance in persistent_results:
+            grouped_wallets.update(grouped)
+            total_addresses_checked += checked
+            addresses_with_balance += with_balance
+            for key, value in totals.items():
+                total_balances[key] = total_balances.get(key, Decimal(0)) + value
 
     # Преобразуем в список WalletBalanceItem
     items_list: list[WalletBalanceItem] = []
