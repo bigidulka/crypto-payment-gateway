@@ -1007,16 +1007,40 @@ class EvmAdapter:
         """
         Оценить ПОЛНУЮ стоимость ERC20 transfer в wei.
         
-        Включает:
-        - Gas units * gas price
-        - L1 data fee для L2 сетей (Arbitrum, Base, Optimism)
-        - Буферы для волатильности газа
+        DEPRECATED: Use estimate_sweep_gas_cost() for sweep operations.
+        This method is kept for backward compatibility.
+        """
+        return await self.estimate_sweep_gas_cost(
+            token_contract=token_contract,
+            from_address=from_address,
+            to_address=to_address,
+            amount=amount,
+        )
+
+    async def estimate_sweep_gas_cost(
+        self,
+        token_contract: str,
+        from_address: str,
+        to_address: str,
+        amount: int,
+        include_safety_buffer: bool = True,
+    ) -> int | None:
+        """
+        Оценить ТОЧНУЮ стоимость sweep операции в wei.
+        
+        Использует те же параметры что и send_erc20_transfer():
+        - Gas limit с 30% буфером
+        - Gas price с учётом gas_multiplier из конфига
+        - EIP-1559: maxFeePerGas с 20% буфером
+        - L1 data fee для L2 сетей
+        - Дополнительный safety buffer для волатильности
         
         Args:
             token_contract: Адрес контракта токена
-            from_address: Адрес отправителя
+            from_address: Адрес отправителя  
             to_address: Адрес получателя
             amount: Сумма в raw units
+            include_safety_buffer: Добавить 15% запас на волатильность газа
             
         Returns:
             Стоимость в wei или None при ошибке
@@ -1032,7 +1056,153 @@ class EvmAdapter:
                 args=[self.w3.to_checksum_address(to_address), amount],
             )
             
-            # Получаем gas estimate и gas price
+            # Строим транзакцию как в send_erc20_transfer
+            tx = {
+                "from": self.w3.to_checksum_address(from_address),
+                "to": self.w3.to_checksum_address(token_contract),
+                "data": tx_data,
+                "value": 0,
+            }
+            
+            # 1. Получаем gas estimate с тем же буфером что в send_erc20_transfer
+            gas_units = await self.estimate_gas(tx)
+            if gas_units is None:
+                return None
+            
+            # 30% буфер на gas limit (как в send_erc20_transfer)
+            gas_limit = int(gas_units * 1.3)
+            
+            # 2. Получаем fee params
+            fee_params = await self.get_fee_params()
+            
+            # 3. Вычисляем стоимость газа
+            if fee_params.is_eip1559:
+                # EIP-1559: используем maxFeePerGas с 20% буфером (как в send_erc20_transfer)
+                effective_gas_price = int(fee_params.max_fee_per_gas * 1.2)
+            else:
+                # Legacy: используем gas_multiplier из конфига (как в send_erc20_transfer)
+                effective_gas_price = int(fee_params.gas_price * self.config.gas_multiplier)
+            
+            # Базовая стоимость
+            base_cost = gas_limit * effective_gas_price
+            
+            # 4. Для L2 сетей добавляем L1 data fee
+            if self.config.is_l2:
+                l1_fee = await self._estimate_l1_data_fee(tx_data)
+                base_cost += l1_fee
+            
+            # 5. Safety buffer для волатильности газа между оценкой и отправкой
+            if include_safety_buffer:
+                # 15% дополнительный запас
+                base_cost = int(base_cost * 1.15)
+            
+            return base_cost
+            
+        except Exception as e:
+            logger.warning(f"[{self.chain}] Failed to estimate sweep gas cost: {e}")
+            return None
+
+    async def _estimate_l1_data_fee(self, tx_data: str) -> int:
+        """
+        Оценить L1 data fee для L2 транзакции.
+        
+        Для Optimism/Base используется GasPriceOracle контракт.
+        Для Arbitrum используется своя модель.
+        """
+        calldata_bytes = len(bytes.fromhex(tx_data[2:] if tx_data.startswith("0x") else tx_data))
+        
+        # Optimism/Base: GasPriceOracle at 0x420000000000000000000000000000000000000F
+        # Arbitrum: ArbGasInfo at 0x000000000000000000000000000000000000006C
+        
+        if self.chain in ("optimism", "base"):
+            try:
+                # Пробуем получить реальную L1 fee из GasPriceOracle
+                oracle_address = "0x420000000000000000000000000000000000000F"
+                oracle_abi = [
+                    {
+                        "inputs": [{"name": "_data", "type": "bytes"}],
+                        "name": "getL1Fee",
+                        "outputs": [{"name": "", "type": "uint256"}],
+                        "stateMutability": "view",
+                        "type": "function",
+                    }
+                ]
+                oracle = self.w3.eth.contract(
+                    address=self.w3.to_checksum_address(oracle_address),
+                    abi=oracle_abi,
+                )
+                # Создаём примерную транзакцию для оценки
+                sample_tx = bytes.fromhex(tx_data[2:] if tx_data.startswith("0x") else tx_data)
+                l1_fee = await oracle.functions.getL1Fee(sample_tx).call()
+                # Добавляем 50% буфер на волатильность L1 gas
+                return int(l1_fee * 1.5)
+            except Exception as e:
+                logger.debug(f"[{self.chain}] Failed to get L1 fee from oracle: {e}")
+                # Fallback: консервативная оценка
+                # ~16 gas за non-zero byte, ~4 за zero byte, L1 gas price ~30 gwei
+                return calldata_bytes * 16 * 30_000_000_000
+        
+        elif self.chain == "arbitrum":
+            try:
+                # Arbitrum ArbGasInfo
+                arb_gas_info = "0x000000000000000000000000000000000000006C"
+                arb_abi = [
+                    {
+                        "inputs": [],
+                        "name": "getPricesInWei",
+                        "outputs": [
+                            {"name": "", "type": "uint256"},  # per L2 tx
+                            {"name": "", "type": "uint256"},  # per L1 calldata byte
+                            {"name": "", "type": "uint256"},  # per storage alloc
+                            {"name": "", "type": "uint256"},  # per ArbGas base
+                            {"name": "", "type": "uint256"},  # per ArbGas congestion
+                            {"name": "", "type": "uint256"},  # per ArbGas total
+                        ],
+                        "stateMutability": "view",
+                        "type": "function",
+                    }
+                ]
+                arb_contract = self.w3.eth.contract(
+                    address=self.w3.to_checksum_address(arb_gas_info),
+                    abi=arb_abi,
+                )
+                prices = await arb_contract.functions.getPricesInWei().call()
+                per_l1_byte = prices[1]
+                l1_fee = calldata_bytes * per_l1_byte
+                # 50% буфер
+                return int(l1_fee * 1.5)
+            except Exception as e:
+                logger.debug(f"[{self.chain}] Failed to get Arbitrum L1 fee: {e}")
+                # Fallback
+                return calldata_bytes * 16 * 50_000_000_000
+        
+        # Default fallback для других L2
+        return calldata_bytes * 16 * 30_000_000_000
+
+    async def get_exact_sweep_cost(
+        self,
+        token_contract: str,
+        from_address: str,
+        to_address: str,
+        amount: int,
+    ) -> tuple[int, int, int] | None:
+        """
+        Получить точные параметры для sweep транзакции.
+        
+        Returns:
+            Tuple (gas_limit, gas_price_wei, total_cost_wei) или None при ошибке
+        """
+        try:
+            contract = self.w3.eth.contract(
+                address=self.w3.to_checksum_address(token_contract),
+                abi=ERC20_ABI,
+            )
+            
+            tx_data = contract.encode_abi(
+                abi_element_identifier="transfer",
+                args=[self.w3.to_checksum_address(to_address), amount],
+            )
+            
             tx = {
                 "from": self.w3.to_checksum_address(from_address),
                 "to": self.w3.to_checksum_address(token_contract),
@@ -1041,33 +1211,25 @@ class EvmAdapter:
             }
             
             gas_units = await self.estimate_gas(tx)
-            gas_price = await self.get_gas_price()
+            gas_limit = int(gas_units * 1.3)
             
-            if gas_units is None or gas_price is None:
-                return None
+            fee_params = await self.get_fee_params()
             
-            # Базовая стоимость: gas * price * 1.5 (буфер)
-            base_cost = int(gas_units * gas_price * 1.5)
+            if fee_params.is_eip1559:
+                gas_price = int(fee_params.max_fee_per_gas * 1.2)
+            else:
+                gas_price = int(fee_params.gas_price * self.config.gas_multiplier)
             
-            # Для L2 сетей добавляем L1 data fee
+            total_cost = gas_limit * gas_price
+            
             if self.config.is_l2:
-                # L1 data fee зависит от размера calldata
-                # Примерно 16 gas за каждый ненулевой байт данных
-                # На L1 gas price обычно 20-50 gwei
-                calldata_bytes = len(bytes.fromhex(tx_data[2:]))  # убираем 0x
-                # Консервативная оценка L1 fee: calldata * 16 * 50 gwei
-                l1_fee_estimate = calldata_bytes * 16 * 50_000_000_000
-                
-                # Для Arbitrum L1 fee может быть выше из-за их модели
-                if self.chain == "arbitrum":
-                    l1_fee_estimate = int(l1_fee_estimate * 2)
-                
-                base_cost += l1_fee_estimate
+                l1_fee = await self._estimate_l1_data_fee(tx_data)
+                total_cost += l1_fee
             
-            return base_cost
+            return (gas_limit, gas_price, total_cost)
             
         except Exception as e:
-            logger.warning(f"[{self.chain}] Failed to estimate transfer cost: {e}")
+            logger.warning(f"[{self.chain}] Failed to get exact sweep cost: {e}")
             return None
 
     def private_key_to_address(self, private_key: str) -> str:
