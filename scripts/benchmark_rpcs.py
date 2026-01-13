@@ -23,8 +23,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from web3 import AsyncWeb3, AsyncHTTPProvider
 
-# USDT Transfer event signature
-TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+# Import config from TOML
+from src.blockchain.chains import (
+    get_chain_config,
+    get_evm_chains,
+    get_transfer_event_signature,
+    get_rpc_urls,
+)
+
+TRANSFER_TOPIC = get_transfer_event_signature()
 
 
 @dataclass

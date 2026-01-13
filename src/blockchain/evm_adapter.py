@@ -18,17 +18,22 @@ from web3.types import BlockData, LogReceipt, TxData, TxReceipt
 
 from src.blockchain.chains import (
     ERC20_ABI,
-    TRANSFER_EVENT_SIGNATURE,
     ChainConfig,
     get_chain_config,
+    get_multicall3_address,
     get_token_contract,
     get_token_decimals,
+    get_transfer_event_signature,
+    normalize_chain_name,
     parse_token_amount,
     to_raw_amount,
 )
 from src.core.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# Get transfer event signature from config
+TRANSFER_EVENT_SIGNATURE = get_transfer_event_signature()
 
 
 @dataclass
@@ -64,8 +69,7 @@ class EvmAdapter:
     Предоставляет унифицированный интерфейс для всех операций.
     """
 
-    # Multicall3 контракт (одинаковый адрес на всех EVM сетях)
-    MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
+    # Multicall3 ABI (адрес берётся из конфига)
     MULTICALL3_ABI = [
         {
             "inputs": [
@@ -113,18 +117,9 @@ class EvmAdapter:
             for token in self.config.tokens.values()
         }
 
-        # Получаем RPC URL из настроек если не передан явно
+        # Получаем RPC URL из конфига (chains.toml)
         if rpc_url is None:
-            settings = get_settings()
-            rpc_urls = {
-                "base": settings.base_rpc_url,
-                "arbitrum": settings.arb_rpc_url,
-                "bsc": settings.bsc_rpc_url,
-                "polygon": settings.polygon_rpc_url,
-                "avax": settings.avax_rpc_url,
-                "optimism": settings.optimism_rpc_url,
-            }
-            rpc_url = rpc_urls.get(self.chain, self.config.rpc_url)
+            rpc_url = self.config.rpc_url
 
         self.rpc_url = rpc_url
         self.w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc_url))
@@ -368,6 +363,9 @@ class EvmAdapter:
             if isinstance(log["transactionHash"], bytes)
             else log["transactionHash"]
         )
+        # Ensure 0x prefix
+        if tx_hash and not tx_hash.startswith("0x"):
+            tx_hash = "0x" + tx_hash
 
         # Парсим топики
         from_address = "0x" + log["topics"][1].hex()[-40:]
@@ -495,8 +493,9 @@ class EvmAdapter:
                 call_map.append((address.lower(), token_contract.lower()))
 
         # Вызываем Multicall3
+        multicall_address = get_multicall3_address()
         multicall = self.w3.eth.contract(
-            address=self.w3.to_checksum_address(self.MULTICALL3_ADDRESS),
+            address=self.w3.to_checksum_address(multicall_address),
             abi=self.MULTICALL3_ABI,
         )
 
@@ -566,8 +565,9 @@ class EvmAdapter:
             },
         ] + self.MULTICALL3_ABI
 
+        multicall_address = get_multicall3_address()
         multicall = self.w3.eth.contract(
-            address=self.w3.to_checksum_address(self.MULTICALL3_ADDRESS),
+            address=self.w3.to_checksum_address(multicall_address),
             abi=multicall3_with_eth,
         )
 
@@ -578,7 +578,7 @@ class EvmAdapter:
                 abi_element_identifier="getEthBalance",
                 args=[self.w3.to_checksum_address(address)],
             )
-            calls.append((self.MULTICALL3_ADDRESS, calldata))
+            calls.append((multicall_address, calldata))
 
         try:
             _, return_data = await multicall.functions.aggregate(calls).call()
@@ -764,10 +764,14 @@ class EvmAdapter:
         Отправить подписанную транзакцию.
 
         Returns:
-            Transaction hash
+            Transaction hash (always with 0x prefix)
         """
         tx_hash = await self.w3.eth.send_raw_transaction(signed_tx)
-        return tx_hash.hex() if isinstance(tx_hash, bytes) else tx_hash
+        if isinstance(tx_hash, bytes):
+            tx_hash = "0x" + tx_hash.hex()
+        elif not tx_hash.startswith("0x"):
+            tx_hash = "0x" + tx_hash
+        return tx_hash
 
     async def sign_and_send_transaction(
         self,
@@ -915,17 +919,18 @@ class EvmAdapter:
                     "value": 0,
                 }
 
+                # Сначала estimate gas БЕЗ fee params (чтобы избежать balance check)
+                gas_estimate = await self.estimate_gas(tx)
+                tx["gas"] = int(gas_estimate * 1.3)  # 30% buffer for gas limit
+
+                # Теперь добавляем fee params
                 if fee_params.is_eip1559:
                     # Добавляем буфер 20% к maxFeePerGas для волатильных сетей
                     tx["maxFeePerGas"] = int(fee_params.max_fee_per_gas * 1.2)
                     tx["maxPriorityFeePerGas"] = fee_params.max_priority_fee_per_gas
                 else:
-                    # BSC требует более высокий gas price из-за волатильности
-                    gas_multiplier = 1.5 if self.chain == "bsc" else 1.2
-                    tx["gasPrice"] = int(fee_params.gas_price * gas_multiplier)
-
-                gas_estimate = await self.estimate_gas(tx)
-                tx["gas"] = int(gas_estimate * 1.3)  # 30% buffer for gas limit
+                    # Используем gas_multiplier из конфига чейна
+                    tx["gasPrice"] = int(fee_params.gas_price * self.config.gas_multiplier)
 
                 return await self.sign_and_send_transaction(tx, from_private_key)
             except Exception as e:
@@ -992,6 +997,79 @@ class EvmAdapter:
             logger.warning(f"Failed to get gas price: {e}")
             return None
 
+    async def estimate_erc20_transfer_cost(
+        self,
+        token_contract: str,
+        from_address: str,
+        to_address: str,
+        amount: int,
+    ) -> int | None:
+        """
+        Оценить ПОЛНУЮ стоимость ERC20 transfer в wei.
+        
+        Включает:
+        - Gas units * gas price
+        - L1 data fee для L2 сетей (Arbitrum, Base, Optimism)
+        - Буферы для волатильности газа
+        
+        Args:
+            token_contract: Адрес контракта токена
+            from_address: Адрес отправителя
+            to_address: Адрес получателя
+            amount: Сумма в raw units
+            
+        Returns:
+            Стоимость в wei или None при ошибке
+        """
+        try:
+            contract = self.w3.eth.contract(
+                address=self.w3.to_checksum_address(token_contract),
+                abi=ERC20_ABI,
+            )
+            
+            tx_data = contract.encode_abi(
+                abi_element_identifier="transfer",
+                args=[self.w3.to_checksum_address(to_address), amount],
+            )
+            
+            # Получаем gas estimate и gas price
+            tx = {
+                "from": self.w3.to_checksum_address(from_address),
+                "to": self.w3.to_checksum_address(token_contract),
+                "data": tx_data,
+                "value": 0,
+            }
+            
+            gas_units = await self.estimate_gas(tx)
+            gas_price = await self.get_gas_price()
+            
+            if gas_units is None or gas_price is None:
+                return None
+            
+            # Базовая стоимость: gas * price * 1.5 (буфер)
+            base_cost = int(gas_units * gas_price * 1.5)
+            
+            # Для L2 сетей добавляем L1 data fee
+            if self.config.is_l2:
+                # L1 data fee зависит от размера calldata
+                # Примерно 16 gas за каждый ненулевой байт данных
+                # На L1 gas price обычно 20-50 gwei
+                calldata_bytes = len(bytes.fromhex(tx_data[2:]))  # убираем 0x
+                # Консервативная оценка L1 fee: calldata * 16 * 50 gwei
+                l1_fee_estimate = calldata_bytes * 16 * 50_000_000_000
+                
+                # Для Arbitrum L1 fee может быть выше из-за их модели
+                if self.chain == "arbitrum":
+                    l1_fee_estimate = int(l1_fee_estimate * 2)
+                
+                base_cost += l1_fee_estimate
+            
+            return base_cost
+            
+        except Exception as e:
+            logger.warning(f"[{self.chain}] Failed to estimate transfer cost: {e}")
+            return None
+
     def private_key_to_address(self, private_key: str) -> str:
         """Получить адрес из приватного ключа."""
         account = Account.from_key(private_key)
@@ -1030,22 +1108,7 @@ class EvmAdapter:
 _adapter_cache: dict[str, EvmAdapter] = {}
 
 
-def normalize_chain_name(chain: str) -> str:
-    """
-    Нормализовать имя сети (алиасы -> каноническое имя).
-
-    Args:
-        chain: Имя сети или алиас ('arb', 'opt', 'bnb')
-
-    Returns:
-        Каноническое имя сети ('arbitrum', 'optimism', 'bsc')
-    """
-    aliases = {
-        "arb": "arbitrum",
-        "bnb": "bsc",
-        "opt": "optimism",
-    }
-    return aliases.get(chain.lower(), chain.lower())
+# normalize_chain_name импортирован из src.blockchain.chains
 
 
 def get_evm_adapter(chain: str) -> EvmAdapter:

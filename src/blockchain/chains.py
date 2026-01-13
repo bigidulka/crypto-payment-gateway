@@ -1,28 +1,31 @@
 """
 Конфигурация блокчейн сетей и токенов.
 
+Все настройки загружаются из config/chains.toml.
+Чтобы добавить/удалить сеть - отредактируйте TOML файл.
+
 Поддерживаемые типы сетей:
 - EVM: Ethereum, Base, Arbitrum, BSC, Polygon, Avalanche, Optimism
-- Solana: Solana Mainnet
-- TON: The Open Network
+- Solana: Solana Mainnet (закомментирован в TOML)
+- TON: The Open Network (закомментирован в TOML)
 """
 
+import os
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
-# Типы для сетей и токенов
-ChainName = Literal[
-    "base", "arbitrum", "bsc", "polygon", "avax", "optimism", "solana", "ton"
-]
-TokenSymbol = Literal["USDT", "USDC"]
+try:
+    import tomllib  # Python 3.11+
+except ImportError:
+    import tomli as tomllib  # fallback for older Python
 
 
 class ChainType(str, Enum):
     """Тип блокчейн сети."""
-
     EVM = "evm"
     SOLANA = "solana"
     TON = "ton"
@@ -31,32 +34,41 @@ class ChainType(str, Enum):
 @dataclass(frozen=True)
 class TokenConfig:
     """Конфигурация токена."""
-
     symbol: str
-    contract_address: str  # EVM: 0x..., Solana: mint address, TON: jetton master
+    contract_address: str
     decimals: int = 18
-    variant: str = "native"  # native | bridged | wrapped
+    variant: str = "native"
     bridge: str | None = None
 
 
 @dataclass(frozen=True)
 class ChainConfig:
     """Конфигурация блокчейн сети."""
-
     name: str
-    chain_id: int  # EVM chain_id, для non-EVM используем условные значения
-    chain_type: ChainType  # Тип сети: evm | solana | ton
-    rpc_url: str  # Будет переопределён из env
-    confirmations: int  # Требуемое количество подтверждений
-    reorg_buffer: int  # Буфер для защиты от реорганизаций
-    scan_window: int  # Размер окна сканирования блоков/слотов
-    block_time_sec: float  # Примерное время блока в секундах
-    native_symbol: str  # Нативный токен (ETH/BNB/SOL/TON)
-    native_decimals: int  # Decimals нативного токена
-    explorer_url: str  # URL блок-эксплорера
-    address_length: int  # Длина адреса в символах
+    chain_id: int
+    chain_type: ChainType
+    rpc_url: str  # Primary RPC URL
+    rpc_urls: list[str]  # All RPC URLs for failover
+    confirmations: int
+    reorg_buffer: int
+    scan_window: int
+    block_time_sec: float
+    native_symbol: str
+    native_decimals: int
+    explorer_url: str
+    address_length: int
     tokens: dict[str, TokenConfig] = field(default_factory=dict)
-    treasury_address: str = ""  # Будет переопределён из env
+    treasury_address: str = ""
+    # Gas configuration
+    is_l2: bool = False
+    max_gas_cost_native: float = 0.002  # In native token
+    gas_multiplier: float = 1.25
+    min_funder_balance: float = 0.01  # Minimum funder balance to be healthy
+
+    @property
+    def max_gas_cost_wei(self) -> int:
+        """Get max gas cost in wei."""
+        return int(self.max_gas_cost_native * 10**self.native_decimals)
 
     def get_token(self, symbol: str) -> TokenConfig | None:
         """Получить конфигурацию токена по символу."""
@@ -82,267 +94,232 @@ class ChainConfig:
         return self.chain_type == ChainType.EVM
 
 
-# Дефолтные конфигурации сетей
-# RPC URL и treasury будут переопределены из настроек
+# Global config storage
+_CHAINS_CONFIG: dict[str, ChainConfig] = {}
+_ALIASES: dict[str, str] = {}
+_TRANSFER_EVENT_SIGNATURE: str = ""
+_GAS_BUFFER_PERCENT: int = 10
+_MAX_GAS_TOP_UP_RETRIES: int = 3
+_MULTICALL3_ADDRESS: str = ""
+_CONFIG_LOADED: bool = False
 
-CHAINS_CONFIG: dict[str, ChainConfig] = {
-    # ==================== EVM CHAINS ====================
-    "base": ChainConfig(
-        name="Base",
-        chain_id=8453,
-        chain_type=ChainType.EVM,
-        rpc_url="https://mainnet.base.org",
-        confirmations=12,
-        reorg_buffer=20,
-        scan_window=2000,
-        block_time_sec=2.0,
-        native_symbol="ETH",
-        native_decimals=18,
-        explorer_url="https://basescan.org",
-        address_length=42,
-        tokens={
-            "USDT": TokenConfig(
-                symbol="USDT",
-                contract_address="0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2",
-                decimals=6,
-                variant="bridged",
-            ),
-            "USDC": TokenConfig(
-                symbol="USDC",
-                contract_address="0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-                decimals=6,
-            ),
-        },
-    ),
-    "arbitrum": ChainConfig(
-        name="Arbitrum One",
-        chain_id=42161,
-        chain_type=ChainType.EVM,
-        rpc_url="https://arb1.arbitrum.io/rpc",
-        confirmations=12,
-        reorg_buffer=50,
-        scan_window=2000,
-        block_time_sec=0.25,
-        native_symbol="ETH",
-        native_decimals=18,
-        explorer_url="https://arbiscan.io",
-        address_length=42,
-        tokens={
-            "USDT": TokenConfig(
-                symbol="USDT",
-                contract_address="0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
-                decimals=6,
-            ),
-            "USDC": TokenConfig(
-                symbol="USDC",
-                contract_address="0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
-                decimals=6,
-            ),
-        },
-    ),
-    "bsc": ChainConfig(
-        name="BNB Smart Chain",
-        chain_id=56,
-        chain_type=ChainType.EVM,
-        rpc_url="https://bsc-dataseed.binance.org",
-        confirmations=15,
-        reorg_buffer=30,
-        scan_window=2000,
-        block_time_sec=3.0,
-        native_symbol="BNB",
-        native_decimals=18,
-        explorer_url="https://bscscan.com",
-        address_length=42,
-        tokens={
-            "USDT": TokenConfig(
-                symbol="USDT",
-                contract_address="0x55d398326f99059fF775485246999027B3197955",
-                decimals=18,  # BSC USDT имеет 18 decimals
-            ),
-            "USDC": TokenConfig(
-                symbol="USDC",
-                contract_address="0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
-                decimals=18,  # BSC USDC имеет 18 decimals
-                variant="bridged",
-                bridge="binance-peg",
-            ),
-        },
-    ),
-    "polygon": ChainConfig(
-        name="Polygon PoS",
-        chain_id=137,
-        chain_type=ChainType.EVM,
-        rpc_url="https://polygon-rpc.com",
-        confirmations=12,
-        reorg_buffer=20,
-        scan_window=400,  # Polygon RPC ограничивает до 500 блоков
-        block_time_sec=2.1,
-        native_symbol="MATIC",
-        native_decimals=18,
-        explorer_url="https://polygonscan.com",
-        address_length=42,
-        tokens={
-            "USDT": TokenConfig(
-                symbol="USDT",
-                contract_address="0xc2132D05D31c914a87C6611C10748AEb04B58e8F",
-                decimals=6,
-            ),
-            "USDC": TokenConfig(
-                symbol="USDC",
-                contract_address="0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
-                decimals=6,
-            ),
-        },
-    ),
-    "avax": ChainConfig(
-        name="Avalanche C-Chain",
-        chain_id=43114,
-        chain_type=ChainType.EVM,
-        rpc_url="https://api.avax.network/ext/bc/C/rpc",
-        confirmations=12,
-        reorg_buffer=30,
-        scan_window=2000,
-        block_time_sec=2.0,
-        native_symbol="AVAX",
-        native_decimals=18,
-        explorer_url="https://snowtrace.io",
-        address_length=42,
-        tokens={
-            "USDT": TokenConfig(
-                symbol="USDT",
-                contract_address="0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7",
-                decimals=6,
-                variant="bridged",
-                bridge="avalanche-bridge",
-            ),
-            "USDC": TokenConfig(
-                symbol="USDC",
-                contract_address="0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E",
-                decimals=6,
-            ),
-        },
-    ),
-    "optimism": ChainConfig(
-        name="Optimism",
-        chain_id=10,
-        chain_type=ChainType.EVM,
-        rpc_url="https://mainnet.optimism.io",
-        confirmations=12,
-        reorg_buffer=20,
-        scan_window=2000,
-        block_time_sec=2.0,
-        native_symbol="ETH",
-        native_decimals=18,
-        explorer_url="https://optimistic.etherscan.io",
-        address_length=42,
-        tokens={
-            "USDT": TokenConfig(
-                symbol="USDT",
-                contract_address="0x94b008aA00579c1307B0EF2c499aD98a8ce58e58",
-                decimals=6,
-                variant="bridged",
-                bridge="optimism-bridge",
-            ),
-            "USDC": TokenConfig(
-                symbol="USDC",
-                contract_address="0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
-                decimals=6,
-            ),
-        },
-    ),
-    # ==================== NON-EVM CHAINS ====================
-    "solana": ChainConfig(
-        name="Solana",
-        chain_id=101,  # Условный ID для Solana Mainnet
-        chain_type=ChainType.SOLANA,
-        rpc_url="https://api.mainnet-beta.solana.com",
-        confirmations=32,  # ~32 слота для finality
-        reorg_buffer=10,
-        scan_window=1000,  # Слоты
-        block_time_sec=0.4,  # ~400ms per slot
-        native_symbol="SOL",
-        native_decimals=9,
-        explorer_url="https://solscan.io",
-        address_length=44,  # Base58 encoded (32-44 chars)
-        tokens={
-            "USDT": TokenConfig(
-                symbol="USDT",
-                # USDT SPL Token Mint Address
-                contract_address="Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-                decimals=6,
-            ),
-            "USDC": TokenConfig(
-                symbol="USDC",
-                # USDC SPL Token Mint Address
-                contract_address="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-                decimals=6,
-            ),
-        },
-    ),
-    "ton": ChainConfig(
-        name="The Open Network",
-        chain_id=0,  # TON не использует chain_id
-        chain_type=ChainType.TON,
-        rpc_url="https://toncenter.com/api/v2",  # TON Center HTTP API
-        confirmations=12,  # ~12 блоков для надёжности
-        reorg_buffer=5,
-        scan_window=100,  # Блоки/seqno
-        block_time_sec=5.0,  # ~5 секунд per block
-        native_symbol="TON",
-        native_decimals=9,
-        explorer_url="https://tonviewer.com",
-        address_length=48,  # User-friendly format
-        tokens={
-            "USDT": TokenConfig(
-                symbol="USDT",
-                # USDT Jetton Master Address (official Tether on TON)
-                contract_address="EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs",
-                decimals=6,
-            ),
-            # TON пока не имеет официального USDC
-        },
-    ),
-}
+
+def _get_config_path() -> Path:
+    """Получить путь к файлу конфигурации."""
+    # Сначала проверяем переменную окружения
+    config_path = os.getenv("CHAINS_CONFIG_PATH")
+    if config_path:
+        return Path(config_path)
+    
+    # Ищем относительно корня проекта
+    # Поддерживаем запуск из разных директорий
+    possible_paths = [
+        Path("config/chains.toml"),
+        Path("../config/chains.toml"),
+        Path("/app/config/chains.toml"),  # Docker
+        Path(__file__).parent.parent.parent / "config" / "chains.toml",
+    ]
+    
+    for path in possible_paths:
+        if path.exists():
+            return path
+    
+    raise FileNotFoundError(
+        "chains.toml not found. Set CHAINS_CONFIG_PATH or place in config/chains.toml"
+    )
+
+
+def _load_config() -> None:
+    """Загрузить конфигурацию из TOML файла."""
+    global _CHAINS_CONFIG, _ALIASES, _TRANSFER_EVENT_SIGNATURE, _MULTICALL3_ADDRESS, _CONFIG_LOADED, _GAS_BUFFER_PERCENT, _MAX_GAS_TOP_UP_RETRIES
+    
+    if _CONFIG_LOADED:
+        return
+    
+    config_path = _get_config_path()
+    
+    with open(config_path, "rb") as f:
+        data = tomllib.load(f)
+    
+    # Load constants
+    constants = data.get("constants", {})
+    _TRANSFER_EVENT_SIGNATURE = constants.get(
+        "transfer_event_signature",
+        "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    )
+    _MULTICALL3_ADDRESS = constants.get(
+        "multicall3_address",
+        "0xcA11bde05977b3631167028862bE2a173976CA11"
+    )
+    _GAS_BUFFER_PERCENT = constants.get("gas_buffer_percent", 10)
+    _MAX_GAS_TOP_UP_RETRIES = constants.get("max_gas_top_up_retries", 3)
+    
+    # Load aliases
+    _ALIASES = data.get("aliases", {})
+    
+    # Load chains
+    chains_data = data.get("chains", {})
+    
+    for chain_name, chain_data in chains_data.items():
+        # Parse tokens
+        tokens_data = chain_data.get("tokens", {})
+        tokens = {}
+        for token_symbol, token_data in tokens_data.items():
+            tokens[token_symbol] = TokenConfig(
+                symbol=token_data.get("symbol", token_symbol),
+                contract_address=token_data["contract_address"],
+                decimals=token_data.get("decimals", 18),
+                variant=token_data.get("variant", "native"),
+                bridge=token_data.get("bridge"),
+            )
+        
+        # Parse chain type
+        chain_type_str = chain_data.get("chain_type", "evm")
+        chain_type = ChainType(chain_type_str)
+        
+        # Get RPC URLs
+        rpc_urls = chain_data.get("rpc_urls", [])
+        primary_rpc = rpc_urls[0] if rpc_urls else chain_data.get("rpc_url", "")
+        
+        _CHAINS_CONFIG[chain_name] = ChainConfig(
+            name=chain_data["name"],
+            chain_id=chain_data.get("chain_id", 0),
+            chain_type=chain_type,
+            rpc_url=primary_rpc,
+            rpc_urls=rpc_urls,
+            confirmations=chain_data.get("confirmations", 12),
+            reorg_buffer=chain_data.get("reorg_buffer", 20),
+            scan_window=chain_data.get("scan_window", 2000),
+            block_time_sec=chain_data.get("block_time_sec", 2.0),
+            native_symbol=chain_data.get("native_symbol", "ETH"),
+            native_decimals=chain_data.get("native_decimals", 18),
+            explorer_url=chain_data.get("explorer_url", ""),
+            address_length=chain_data.get("address_length", 42),
+            tokens=tokens,
+            is_l2=chain_data.get("is_l2", False),
+            max_gas_cost_native=chain_data.get("max_gas_cost_native", 0.002),
+            gas_multiplier=chain_data.get("gas_multiplier", 1.25),
+            min_funder_balance=chain_data.get("min_funder_balance", 0.01),
+        )
+    
+    _CONFIG_LOADED = True
+
+
+def reload_config() -> None:
+    """Перезагрузить конфигурацию (для hot-reload)."""
+    global _CONFIG_LOADED
+    _CONFIG_LOADED = False
+    get_chain_config.cache_clear()
+    _load_config()
+
+
+def get_gas_buffer_percent() -> int:
+    """Get gas buffer percent from config."""
+    _load_config()
+    return _GAS_BUFFER_PERCENT
+
+
+def get_max_gas_top_up_retries() -> int:
+    """Get max gas top up retries from config."""
+    _load_config()
+    return _MAX_GAS_TOP_UP_RETRIES
+
+
+def get_transfer_event_signature() -> str:
+    """Получить сигнатуру события Transfer."""
+    _load_config()
+    return _TRANSFER_EVENT_SIGNATURE
+
+
+def get_multicall3_address() -> str:
+    """Получить адрес контракта Multicall3."""
+    _load_config()
+    return _MULTICALL3_ADDRESS
+
+
+def get_aliases() -> dict[str, str]:
+    """Get chain aliases (short name -> canonical name)."""
+    _load_config()
+    return _ALIASES.copy()
+
+
+def normalize_chain_name(chain: str) -> str:
+    """
+    Normalize chain name using aliases.
+    
+    Args:
+        chain: Chain name or alias ('arb', 'opt', 'bnb')
+    
+    Returns:
+        Canonical chain name ('arbitrum', 'optimism', 'bsc')
+    """
+    _load_config()
+    chain_lower = chain.lower()
+    return _ALIASES.get(chain_lower, chain_lower)
 
 
 @lru_cache(maxsize=32)
 def get_chain_config(chain: str) -> ChainConfig:
     """
     Получить конфигурацию сети по имени.
-
     Результат кэшируется для избежания повторных lookups.
     """
-    normalized = {
-        "arb": "arbitrum",
-        "bnb": "bsc",
-        "opt": "optimism",
-        "sol": "solana",
-    }.get(chain.lower(), chain.lower())
-    config = CHAINS_CONFIG.get(normalized)
+    _load_config()
+    
+    # Normalize chain name
+    chain_lower = chain.lower()
+    normalized = _ALIASES.get(chain_lower, chain_lower)
+    
+    config = _CHAINS_CONFIG.get(normalized)
     if not config:
         raise ValueError(
-            f"Unknown chain: {chain}. Supported: {list(CHAINS_CONFIG.keys())}"
+            f"Unknown chain: {chain}. Supported: {list(_CHAINS_CONFIG.keys())}"
         )
     return config
 
 
 def get_all_chains() -> list[str]:
     """Получить список всех поддерживаемых сетей."""
-    return list(CHAINS_CONFIG.keys())
+    _load_config()
+    return list(_CHAINS_CONFIG.keys())
 
 
 def get_evm_chains() -> list[str]:
     """Получить список всех EVM сетей."""
-    return [name for name, cfg in CHAINS_CONFIG.items() if cfg.chain_type == ChainType.EVM]
+    _load_config()
+    return [name for name, cfg in _CHAINS_CONFIG.items() if cfg.chain_type == ChainType.EVM]
 
 
 def get_non_evm_chains() -> list[str]:
     """Получить список всех non-EVM сетей."""
-    return [name for name, cfg in CHAINS_CONFIG.items() if cfg.chain_type != ChainType.EVM]
+    _load_config()
+    return [name for name, cfg in _CHAINS_CONFIG.items() if cfg.chain_type != ChainType.EVM]
+
+
+def is_chain_supported(chain: str) -> bool:
+    """Проверить, поддерживается ли сеть."""
+    _load_config()
+    chain_lower = chain.lower()
+    normalized = _ALIASES.get(chain_lower, chain_lower)
+    return normalized in _CHAINS_CONFIG
+
+
+def is_evm_chain(chain: str) -> bool:
+    """Проверить, является ли сеть EVM."""
+    try:
+        config = get_chain_config(chain)
+        return config.chain_type == ChainType.EVM
+    except ValueError:
+        return False
+
 
 def get_all_tokens() -> list[str]:
     """Получить список всех поддерживаемых токенов."""
-    return ["USDT", "USDC"]
+    _load_config()
+    tokens = set()
+    for chain_config in _CHAINS_CONFIG.values():
+        tokens.update(chain_config.tokens.keys())
+    return sorted(tokens)
 
 
 def get_token_contract(chain: str, token: str) -> str:
@@ -355,7 +332,7 @@ def get_token_contract(chain: str, token: str) -> str:
 
 
 def get_token_decimals(chain: str, token: str) -> int:
-    """Получить количество decimals токена для сети."""
+    """Получить количество decimals токена."""
     chain_config = get_chain_config(chain)
     token_config = chain_config.get_token(token)
     if not token_config:
@@ -377,10 +354,11 @@ def to_raw_amount(amount: Decimal | str, chain: str, token: str) -> int:
     return int(dec_amount * Decimal(10**decimals))
 
 
-# ERC20 Transfer event signature
-TRANSFER_EVENT_SIGNATURE = (
-    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-)
+def get_rpc_urls(chain: str) -> list[str]:
+    """Получить список RPC URLs для сети."""
+    config = get_chain_config(chain)
+    return config.rpc_urls
+
 
 # Minimal ERC20 ABI для transfer и balanceOf
 ERC20_ABI = [
@@ -402,13 +380,17 @@ ERC20_ABI = [
         "type": "function",
     },
     {
-        "anonymous": False,
-        "inputs": [
-            {"indexed": True, "name": "from", "type": "address"},
-            {"indexed": True, "name": "to", "type": "address"},
-            {"indexed": False, "name": "value", "type": "uint256"},
-        ],
-        "name": "Transfer",
-        "type": "event",
+        "constant": True,
+        "inputs": [],
+        "name": "decimals",
+        "outputs": [{"name": "", "type": "uint8"}],
+        "type": "function",
+    },
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "symbol",
+        "outputs": [{"name": "", "type": "string"}],
+        "type": "function",
     },
 ]

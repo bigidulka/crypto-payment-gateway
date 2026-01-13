@@ -80,7 +80,7 @@ class ApiKey(Base, UUIDMixin):
     # Ключ (хранится хеш)
     key_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     key_prefix: Mapped[str] = mapped_column(
-        String(8), nullable=False
+        String(16), nullable=False
     )  # Для идентификации в логах
 
     # Метаданные

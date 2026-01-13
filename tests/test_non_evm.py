@@ -15,12 +15,21 @@ from src.blockchain.chains import (
     get_evm_chains,
     get_non_evm_chains,
     ChainType,
+    is_chain_supported,
+)
+
+
+# Skip all tests if non-EVM chains are not configured
+pytestmark = pytest.mark.skipif(
+    not is_chain_supported("solana") and not is_chain_supported("ton"),
+    reason="Non-EVM chains (solana, ton) are not configured in chains.toml"
 )
 
 
 class TestChainConfig:
     """Тесты конфигурации сетей."""
 
+    @pytest.mark.skipif(not is_chain_supported("solana"), reason="Solana not configured")
     def test_solana_config(self):
         """Проверить конфигурацию Solana."""
         config = get_chain_config("solana")
@@ -42,6 +51,7 @@ class TestChainConfig:
         assert usdc is not None
         assert usdc.contract_address == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
+    @pytest.mark.skipif(not is_chain_supported("ton"), reason="TON not configured")
     def test_ton_config(self):
         """Проверить конфигурацию TON."""
         config = get_chain_config("ton")
@@ -58,6 +68,10 @@ class TestChainConfig:
         assert usdt is not None
         assert usdt.contract_address == "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"
 
+    @pytest.mark.skipif(
+        not is_chain_supported("solana") or not is_chain_supported("ton"),
+        reason="Non-EVM chains not configured"
+    )
     def test_get_all_chains_includes_non_evm(self):
         """Проверить что get_all_chains включает non-EVM."""
         chains = get_all_chains()
@@ -75,6 +89,10 @@ class TestChainConfig:
         assert "solana" not in evm_chains
         assert "ton" not in evm_chains
 
+    @pytest.mark.skipif(
+        not is_chain_supported("solana") or not is_chain_supported("ton"),
+        reason="Non-EVM chains not configured"
+    )
     def test_get_non_evm_chains(self):
         """Проверить get_non_evm_chains."""
         non_evm = get_non_evm_chains()
@@ -83,6 +101,7 @@ class TestChainConfig:
         assert "ton" in non_evm
         assert "base" not in non_evm
 
+    @pytest.mark.skipif(not is_chain_supported("solana"), reason="Solana not configured")
     def test_is_evm_property(self):
         """Проверить is_evm свойство."""
         base_config = get_chain_config("base")
@@ -92,6 +111,7 @@ class TestChainConfig:
         assert solana_config.is_evm is False
 
 
+@pytest.mark.skipif(not is_chain_supported("solana"), reason="Solana not configured")
 class TestSolanaAdapter:
     """Тесты Solana адаптера."""
 
@@ -166,6 +186,7 @@ class TestSolanaAdapter:
             assert confirmed is False  # 10 < 32
 
 
+@pytest.mark.skipif(not is_chain_supported("ton"), reason="TON not configured")
 class TestTonAdapter:
     """Тесты TON адаптера."""
 

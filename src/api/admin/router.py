@@ -1,6 +1,7 @@
 """
 Admin API Router.
 Эндпоинты для администрирования системы.
+Защищены секретным ключом ADMIN_SECRET_KEY.
 """
 
 import math
@@ -32,10 +33,18 @@ from src.api.admin.schemas import (
     SystemLogsResponse,
     SystemStatusResponse,
     WalletBalanceItem,
+    WithdrawRequest,
+    WithdrawResponse,
     WorkerStatus,
 )
-from src.api.deps import SessionDep
-from src.blockchain.chains import get_all_chains, get_chain_config
+from src.api.deps import (
+    SessionDep,
+    SettingsDep,
+    AdminAuthDep,
+    verify_admin_key,
+    create_admin_session,
+)
+from src.blockchain.chains import get_all_chains, get_chain_config, ChainType
 from src.blockchain.evm_adapter import get_evm_adapter
 from src.core.config import get_settings
 from src.db.models import (
@@ -46,8 +55,9 @@ from src.db.models import (
     ApiKey,
     OnchainTx,
     PaymentSession,
-    SweepJob,
+    UnifiedSweepJob,
     SweepState,
+    SweepSource,
     SystemLog,
     SystemLogLevel,
     UserWallet,
@@ -61,27 +71,39 @@ router = APIRouter(tags=["Admin"])
 # === Authentication ===
 
 
-@router.post("/login", response_model=LoginResponse, include_in_schema=False)
-async def admin_login(request: LoginRequest) -> LoginResponse:
+@router.post("/login", response_model=LoginResponse)
+async def admin_login(request: LoginRequest, settings: SettingsDep) -> LoginResponse:
     """
-    Простая авторизация для админки.
-    Логин: admin, Пароль: admin
+    Авторизация для админ-панели.
+    
+    Требует:
+    - username: "admin"
+    - password: значение ADMIN_SECRET_KEY из .env
+    
+    Возвращает session token для последующих запросов.
     """
-    if request.username == "admin" and request.password == "admin":
-        # Генерируем простой токен (в продакшене использовать JWT)
-        import secrets
-
-        token = secrets.token_urlsafe(32)
+    admin_key = settings.admin_secret_key.get_secret_value()
+    
+    if not admin_key or len(admin_key) < 32:
+        return LoginResponse(
+            success=False, 
+            message="Admin access not configured. Set ADMIN_SECRET_KEY in .env"
+        )
+    
+    # Проверяем логин/пароль
+    if request.username == "admin" and verify_admin_key(request.password, settings):
+        token = create_admin_session()
         return LoginResponse(success=True, token=token)
-
+    
     return LoginResponse(success=False, message="Неверный логин или пароль")
 
 
-# === Merchants ===
+# === Protected Endpoints (require AdminAuthDep) ===
 
 
 @router.get("/merchants", response_model=MerchantListResponse)
 async def list_merchants(
+    _: AdminAuthDep,  # Защита эндпоинта
     session: SessionDep,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
@@ -148,6 +170,7 @@ async def list_merchants(
     summary="Статус системы",
 )
 async def get_system_status(
+    _: AdminAuthDep,
     session: SessionDep,
 ) -> SystemStatusResponse:
     """
@@ -224,18 +247,11 @@ async def get_system_status(
                 settings.funder_private_key.get_secret_value()
             )
 
-            # Определяем сети с низким балансом
+            # Определяем сети с низким балансом - берём thresholds из конфига
             low_balance_chains = []
-            thresholds = {
-                "base": 0.001,
-                "arbitrum": 0.001,
-                "optimism": 0.001,
-                "bsc": 0.01,
-                "polygon": 0.5,
-                "avax": 0.1,
-            }
             for chain, balance in funder_balances.items():
-                if balance < thresholds.get(chain, 0.01):
+                chain_config = get_chain_config(chain)
+                if balance < chain_config.min_funder_balance:
                     low_balance_chains.append(chain)
 
             funder_status = FunderStatus(
@@ -279,14 +295,14 @@ async def get_system_status(
     # Статистика sweeps
     failed_sweeps = (
         await session.scalar(
-            select(func.count(SweepJob.id)).where(SweepJob.state == SweepState.FAILED)
+            select(func.count(UnifiedSweepJob.id)).where(UnifiedSweepJob.state == SweepState.FAILED)
         )
         or 0
     )
     pending_sweeps = (
         await session.scalar(
-            select(func.count(SweepJob.id)).where(
-                SweepJob.state.in_(
+            select(func.count(UnifiedSweepJob.id)).where(
+                UnifiedSweepJob.state.in_(
                     [SweepState.PENDING_GAS, SweepState.FUNDING, SweepState.SWEEPING]
                 )
             )
@@ -330,6 +346,7 @@ async def get_system_status(
     summary="Список инвойсов",
 )
 async def list_invoices(
+    _: AdminAuthDep,
     session: SessionDep,
     status: Annotated[str | None, Query(description="Фильтр по статусу")] = None,
     chain: Annotated[str | None, Query(description="Фильтр по сети")] = None,
@@ -429,6 +446,7 @@ async def list_invoices(
     summary="Список sweep jobs",
 )
 async def list_sweeps(
+    _: AdminAuthDep,
     session: SessionDep,
     state: Annotated[str | None, Query(description="Фильтр по статусу")] = None,
     chain: Annotated[str | None, Query(description="Фильтр по сети")] = None,
@@ -437,22 +455,17 @@ async def list_sweeps(
 ) -> SweepListResponse:
     """Получить список sweep jobs."""
     settings = get_settings()
-    stmt = select(SweepJob).options(
-        selectinload(SweepJob.payment_session).selectinload(
-            PaymentSession.deposit_address
-        ),
-        selectinload(SweepJob.payment_session).selectinload(PaymentSession.invoice),
-    )
+    stmt = select(UnifiedSweepJob)
 
     if state:
         try:
             state_enum = SweepState(state)
-            stmt = stmt.where(SweepJob.state == state_enum)
+            stmt = stmt.where(UnifiedSweepJob.state == state_enum)
         except ValueError:
             raise HTTPException(status_code=400, detail=f"Invalid state: {state}")
 
     if chain:
-        stmt = stmt.join(PaymentSession).where(PaymentSession.chain == chain)
+        stmt = stmt.where(UnifiedSweepJob.chain == chain)
 
     # Count
     count_stmt = select(func.count()).select_from(stmt.subquery())
@@ -460,25 +473,31 @@ async def list_sweeps(
 
     # Paginate
     offset = (page - 1) * per_page
-    stmt = stmt.order_by(desc(SweepJob.created_at)).limit(per_page).offset(offset)
+    stmt = stmt.order_by(desc(UnifiedSweepJob.created_at)).limit(per_page).offset(offset)
     result = await session.execute(stmt)
     sweeps = result.scalars().unique().all()
 
     items = []
     for sweep in sweeps:
-        ps = sweep.payment_session
-        inv = ps.invoice if ps else None
+        # Для invoice sweep пробуем получить invoice
+        invoice_id = None
+        invoice_public_id = None
+        if sweep.source == SweepSource.INVOICE:
+            ps = await session.get(PaymentSession, sweep.source_id)
+            if ps:
+                inv = await session.get(Invoice, ps.invoice_id)
+                if inv:
+                    invoice_id = str(inv.id)
+                    invoice_public_id = inv.public_id
 
         item = SweepListItem(
             id=str(sweep.id),
             state=sweep.state.value,
-            chain=ps.chain if ps else "unknown",
-            token=ps.token if ps else "unknown",
-            amount=inv.amount if inv else 0,
-            deposit_address=(
-                ps.deposit_address.address if ps and ps.deposit_address else ""
-            ),
-            treasury_address=settings.treasury_address,
+            chain=sweep.chain,
+            token=sweep.token,
+            amount=float(sweep.amount),
+            deposit_address=sweep.from_address,
+            treasury_address=sweep.to_address,
             gas_tx_hash=sweep.gas_tx_hash,
             sweep_tx_hash=sweep.sweep_tx_hash,
             attempts=sweep.attempts,
@@ -487,8 +506,8 @@ async def list_sweeps(
             next_retry_at=sweep.next_retry_at,
             created_at=sweep.created_at,
             updated_at=sweep.updated_at,
-            invoice_id=str(inv.id) if inv else None,
-            invoice_public_id=inv.public_id if inv else None,
+            invoice_id=invoice_id,
+            invoice_public_id=invoice_public_id,
         )
         items.append(item)
 
@@ -509,11 +528,12 @@ async def list_sweeps(
     summary="Повторить sweep",
 )
 async def retry_sweep(
+    _: AdminAuthDep,
     request: RetrySweepRequest,
     session: SessionDep,
 ) -> ActionResponse:
     """Сбросить счётчик попыток и повторить sweep."""
-    stmt = select(SweepJob).where(SweepJob.id == request.sweep_id)
+    stmt = select(UnifiedSweepJob).where(UnifiedSweepJob.id == request.sweep_id)
     result = await session.execute(stmt)
     sweep = result.scalar_one_or_none()
 
@@ -541,11 +561,12 @@ async def retry_sweep(
     summary="Сбросить sweep",
 )
 async def reset_sweep(
+    _: AdminAuthDep,
     request: ResetSweepRequest,
     session: SessionDep,
 ) -> ActionResponse:
     """Сбросить sweep в указанное состояние."""
-    stmt = select(SweepJob).where(SweepJob.id == request.sweep_id)
+    stmt = select(UnifiedSweepJob).where(UnifiedSweepJob.id == request.sweep_id)
     result = await session.execute(stmt)
     sweep = result.scalar_one_or_none()
 
@@ -574,6 +595,7 @@ async def reset_sweep(
     summary="Проверить все балансы",
 )
 async def check_all_balances(
+    _: AdminAuthDep,
     session: SessionDep,
     with_balance_only: bool = Query(False, description="Только с балансом > 0"),
 ) -> CheckAllBalancesResponse:
@@ -753,8 +775,13 @@ async def check_all_balances(
             wallet_chain_groups[wa.chain] = []
         wallet_chain_groups[wa.chain].append(wa)
 
-    # Обрабатываем persistent адреса
+    # Обрабатываем persistent адреса (только поддерживаемые чейны)
     for chain_name, addresses_list in wallet_chain_groups.items():
+        # Пропускаем неподдерживаемые чейны (solana, ton - закомментированы)
+        from src.blockchain.chains import is_chain_supported
+        if not is_chain_supported(chain_name):
+            continue
+            
         try:
             adapter = get_evm_adapter(chain_name)
             chain_config = get_chain_config(chain_name)
@@ -888,6 +915,7 @@ async def check_all_balances(
     summary="Системные логи",
 )
 async def get_logs(
+    _: AdminAuthDep,
     session: SessionDep,
     level: Annotated[str | None, Query(description="Фильтр по уровню")] = None,
     source: Annotated[str | None, Query(description="Фильтр по источнику")] = None,
@@ -947,6 +975,7 @@ async def get_logs(
     summary="Статистика дашборда",
 )
 async def get_dashboard_stats(
+    _: AdminAuthDep,
     session: SessionDep,
 ) -> DashboardStats:
     """Получить статистику для дашборда."""
@@ -1005,7 +1034,7 @@ async def get_dashboard_stats(
     for state in SweepState:
         count = (
             await session.scalar(
-                select(func.count(SweepJob.id)).where(SweepJob.state == state)
+                select(func.count(UnifiedSweepJob.id)).where(UnifiedSweepJob.state == state)
             )
             or 0
         )
@@ -1046,7 +1075,7 @@ async def get_dashboard_stats(
     "/rpc-status",
     summary="Статус RPC endpoints",
 )
-async def get_rpc_status():
+async def get_rpc_status(_: AdminAuthDep):
     """
     Получить статус всех RPC endpoints:
     - Здоровье каждого endpoint
@@ -1077,7 +1106,7 @@ async def get_rpc_status():
     "/rpc-health-check",
     summary="Запустить health check всех RPC",
 )
-async def run_rpc_health_check():
+async def run_rpc_health_check(_: AdminAuthDep):
     """
     Запустить health check для всех RPC endpoints.
     Обновляет статусы и latency.
@@ -1108,6 +1137,7 @@ async def run_rpc_health_check():
     summary="Проверить балансы всех адресов",
 )
 async def check_all_balances(
+    _: AdminAuthDep,
     session: SessionDep,
     include_zero: bool = Query(False, description="Включить адреса с нулевым балансом"),
 ):
@@ -1238,6 +1268,7 @@ async def check_all_balances(
     summary="Запустить batch sweep всех кошельков",
 )
 async def run_batch_sweep_endpoint(
+    _: AdminAuthDep,
     chains: list[str] | None = Query(
         None, description="Список сетей (все если не указано)"
     ),
@@ -1292,6 +1323,7 @@ async def run_batch_sweep_endpoint(
     summary="Превью batch sweep - показать что будет выведено",
 )
 async def batch_sweep_preview(
+    _: AdminAuthDep,
     chains: list[str] | None = Query(None, description="Список сетей"),
     include_deposits: bool = Query(True),
     include_persistent: bool = Query(True),
@@ -1353,3 +1385,292 @@ async def batch_sweep_preview(
         "by_chain": by_chain,
         "wallets": top_wallets,
     }
+
+
+# === Withdraw (вывод средств с treasury) ===
+
+
+@router.post(
+    "/withdraw",
+    response_model=WithdrawResponse,
+    summary="Вывести средства с treasury кошелька",
+)
+async def withdraw_from_treasury(
+    _: AdminAuthDep,
+    request: WithdrawRequest,
+    settings: SettingsDep,
+) -> WithdrawResponse:
+    """
+    Вывести токены или нативную валюту с treasury кошелька на указанный адрес.
+    
+    Поддерживаемые сети:
+    - EVM: base, arbitrum, bsc, polygon, avax, optimism
+    - Non-EVM: solana, ton (в разработке)
+    
+    Для EVM сетей используется FUNDER_PRIVATE_KEY как источник средств.
+    """
+    from decimal import Decimal, InvalidOperation
+    
+    chain = request.chain.lower()
+    token = request.token.upper()
+    
+    # Валидация суммы
+    try:
+        amount = Decimal(request.amount)
+        if amount <= 0:
+            raise ValueError("Amount must be positive")
+    except (InvalidOperation, ValueError) as e:
+        return WithdrawResponse(
+            success=False,
+            chain=chain,
+            token=token,
+            amount=request.amount,
+            to_address=request.to_address,
+            message=f"Invalid amount: {e}",
+        )
+    
+    # Получаем конфиг сети
+    try:
+        config = get_chain_config(chain)
+    except Exception:
+        return WithdrawResponse(
+            success=False,
+            chain=chain,
+            token=token,
+            amount=request.amount,
+            to_address=request.to_address,
+            message=f"Unknown chain: {chain}. Supported: base, arbitrum, bsc, polygon, avax, optimism, solana, ton",
+        )
+    
+    # EVM chains
+    if config.chain_type == ChainType.EVM:
+        return await _withdraw_evm(
+            chain=chain,
+            token=token,
+            to_address=request.to_address,
+            amount=amount,
+            config=config,
+            settings=settings,
+        )
+    
+    # Solana
+    elif config.chain_type == ChainType.SOLANA:
+        return WithdrawResponse(
+            success=False,
+            chain=chain,
+            token=token,
+            amount=request.amount,
+            to_address=request.to_address,
+            message="Solana withdraw not implemented yet",
+        )
+    
+    # TON
+    elif config.chain_type == ChainType.TON:
+        return WithdrawResponse(
+            success=False,
+            chain=chain,
+            token=token,
+            amount=request.amount,
+            to_address=request.to_address,
+            message="TON withdraw not implemented yet",
+        )
+    
+    return WithdrawResponse(
+        success=False,
+        chain=chain,
+        token=token,
+        amount=request.amount,
+        to_address=request.to_address,
+        message=f"Unsupported chain type: {config.chain_type}",
+    )
+
+
+async def _withdraw_evm(
+    chain: str,
+    token: str,
+    to_address: str,
+    amount: "Decimal",
+    config,
+    settings,
+) -> WithdrawResponse:
+    """Вывод средств для EVM сетей."""
+    from decimal import Decimal
+    from src.blockchain.evm_adapter import get_evm_adapter
+    from src.blockchain.chains import to_raw_amount
+    
+    adapter = get_evm_adapter(chain)
+    funder_key = settings.funder_private_key.get_secret_value()
+    
+    if not funder_key:
+        return WithdrawResponse(
+            success=False,
+            chain=chain,
+            token=token,
+            amount=str(amount),
+            to_address=to_address,
+            message="FUNDER_PRIVATE_KEY not configured",
+        )
+    
+    try:
+        # Нативная валюта
+        if token == "NATIVE" or token == config.native_symbol.upper():
+            # Конвертируем в wei
+            amount_wei = int(amount * Decimal(10 ** config.native_decimals))
+            
+            tx_hash = await adapter.send_native_transfer(
+                from_private_key=funder_key,
+                to_address=to_address,
+                amount_wei=amount_wei,
+            )
+            
+            if tx_hash:
+                return WithdrawResponse(
+                    success=True,
+                    tx_hash=tx_hash,
+                    chain=chain,
+                    token=config.native_symbol,
+                    amount=str(amount),
+                    to_address=to_address,
+                    message=f"Successfully sent {amount} {config.native_symbol}",
+                    explorer_url=config.get_explorer_tx_url(tx_hash),
+                )
+            else:
+                return WithdrawResponse(
+                    success=False,
+                    chain=chain,
+                    token=config.native_symbol,
+                    amount=str(amount),
+                    to_address=to_address,
+                    message="Transaction failed",
+                )
+        
+        # ERC20 токен
+        else:
+            token_config = config.tokens.get(token)
+            if not token_config:
+                available_tokens = list(config.tokens.keys())
+                return WithdrawResponse(
+                    success=False,
+                    chain=chain,
+                    token=token,
+                    amount=str(amount),
+                    to_address=to_address,
+                    message=f"Token {token} not found on {chain}. Available: {available_tokens}",
+                )
+            
+            # Конвертируем в raw amount
+            raw_amount = int(amount * Decimal(10 ** token_config.decimals))
+            
+            tx_hash = await adapter.send_erc20_transfer(
+                from_private_key=funder_key,
+                token_contract=token_config.contract_address,
+                to_address=to_address,
+                amount=raw_amount,
+            )
+            
+            if tx_hash:
+                return WithdrawResponse(
+                    success=True,
+                    tx_hash=tx_hash,
+                    chain=chain,
+                    token=token,
+                    amount=str(amount),
+                    to_address=to_address,
+                    message=f"Successfully sent {amount} {token}",
+                    explorer_url=config.get_explorer_tx_url(tx_hash),
+                )
+            else:
+                return WithdrawResponse(
+                    success=False,
+                    chain=chain,
+                    token=token,
+                    amount=str(amount),
+                    to_address=to_address,
+                    message="Transaction failed - check gas balance",
+                )
+                
+    except Exception as e:
+        return WithdrawResponse(
+            success=False,
+            chain=chain,
+            token=token,
+            amount=str(amount),
+            to_address=to_address,
+            message=f"Error: {str(e)}",
+        )
+
+
+@router.get(
+    "/treasury-balances",
+    summary="Балансы treasury/funder кошельков",
+)
+async def get_treasury_balances(
+    _: AdminAuthDep,
+    settings: SettingsDep,
+):
+    """
+    Получить балансы treasury и funder кошельков во всех сетях.
+    """
+    from decimal import Decimal
+    from src.blockchain.evm_adapter import get_evm_adapter
+    from src.blockchain.chains import get_evm_chains
+    from eth_account import Account
+    
+    funder_key = settings.funder_private_key.get_secret_value()
+    treasury_address = settings.treasury_address
+    
+    if funder_key:
+        funder_address = Account.from_key(funder_key).address
+    else:
+        funder_address = None
+    
+    result = {
+        "treasury_address": treasury_address,
+        "funder_address": funder_address,
+        "balances": {},
+    }
+    
+    for chain in get_evm_chains():
+        try:
+            config = get_chain_config(chain)
+            adapter = get_evm_adapter(chain)
+            
+            chain_balances = {
+                "native": {},
+                "tokens": {},
+            }
+            
+            # Funder native balance
+            if funder_address:
+                funder_native = await adapter.get_native_balance(funder_address)
+                chain_balances["native"]["funder"] = {
+                    "balance": str(funder_native),
+                    "symbol": config.native_symbol,
+                }
+            
+            # Treasury native balance
+            if treasury_address:
+                treasury_native = await adapter.get_native_balance(treasury_address)
+                chain_balances["native"]["treasury"] = {
+                    "balance": str(treasury_native),
+                    "symbol": config.native_symbol,
+                }
+            
+            # Token balances for treasury
+            if treasury_address:
+                for token_sym, token_cfg in config.tokens.items():
+                    try:
+                        raw_balance = await adapter.get_erc20_balance_raw(
+                            treasury_address, token_cfg.contract_address
+                        )
+                        human_balance = Decimal(raw_balance) / Decimal(10 ** token_cfg.decimals)
+                        chain_balances["tokens"][token_sym] = str(human_balance)
+                    except Exception:
+                        chain_balances["tokens"][token_sym] = "error"
+            
+            result["balances"][chain] = chain_balances
+            
+        except Exception as e:
+            result["balances"][chain] = {"error": str(e)}
+    
+    return result

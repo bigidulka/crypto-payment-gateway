@@ -19,7 +19,7 @@ from typing import Optional
 from sqlalchemy import and_, select
 from sqlalchemy.orm import selectinload
 
-from src.blockchain.chains import CHAINS_CONFIG, get_chain_config, get_all_chains
+from src.blockchain.chains import get_chain_config, get_all_chains, is_chain_supported
 from src.blockchain.evm_adapter import get_evm_adapter, EvmAdapter
 from src.core.config import get_settings
 from src.crypto.encryption import decrypt_private_key
@@ -466,21 +466,49 @@ class BatchSweeper:
                             )
                             return False
 
-                    # 2. Выполняем sweep
+                    # 2. Получаем актуальный баланс токена (выводим ВСЁ под ноль)
+                    try:
+                        actual_balance_raw = await adapter.get_erc20_balance_raw(
+                            wallet.address, wallet.token_contract
+                        )
+                        if actual_balance_raw <= 0:
+                            logger.warning(
+                                f"[{chain}] No balance to sweep on {wallet.address[:10]}..."
+                            )
+                            return False
+                    except Exception as e:
+                        logger.error(
+                            f"[{chain}] Failed to get actual balance for {wallet.address[:10]}...: {e}"
+                        )
+                        # Fallback на сохранённый баланс
+                        actual_balance_raw = wallet.balance_raw
+
+                    # 3. Выполняем sweep
+                    # encrypted_privkey может быть bytes или hex string
+                    encrypted_data = wallet.encrypted_privkey
+                    if isinstance(encrypted_data, str):
+                        encrypted_data = bytes.fromhex(encrypted_data)
+                    
                     privkey = decrypt_private_key(
-                        wallet.encrypted_privkey, self.encryption_key
+                        encrypted_data, self.encryption_key
                     )
 
                     tx_hash = await adapter.send_erc20_transfer(
-                        private_key=privkey,
+                        from_private_key=privkey,
                         token_contract=wallet.token_contract,
                         to_address=self.treasury,
-                        amount_raw=wallet.balance_raw,
+                        amount=actual_balance_raw,
                     )
 
                     if tx_hash:
+                        # Логируем реальную сумму
+                        config = get_chain_config(chain)
+                        token_config = config.tokens.get(wallet.token)
+                        decimals = token_config.decimals if token_config else 18
+                        actual_amount = Decimal(actual_balance_raw) / Decimal(10 ** decimals)
+                        
                         logger.info(
-                            f"[{chain}] Swept {wallet.balance} {wallet.token} "
+                            f"[{chain}] Swept {actual_amount} {wallet.token} "
                             f"from {wallet.address[:10]}... tx={tx_hash[:16]}..."
                         )
                         return True

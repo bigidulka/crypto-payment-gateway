@@ -27,7 +27,8 @@ from src.db.models import (
     InvoiceStatus,
     OnchainTx,
     PaymentSession,
-    SweepJob,
+    UnifiedSweepJob,
+    SweepSource,
     SweepState,
     TxStatus,
 )
@@ -210,6 +211,10 @@ class PaymentService:
         Returns:
             Созданная запись OnchainTx
         """
+        # Normalize tx_hash to always have 0x prefix
+        if tx_hash and not tx_hash.startswith("0x"):
+            tx_hash = "0x" + tx_hash
+
         # Проверяем, не записана ли уже эта транзакция
         existing = await self._get_onchain_tx(payment_session.chain, tx_hash, log_index)
         if existing:
@@ -295,7 +300,7 @@ class PaymentService:
     ) -> None:
         """
         Обработать подтверждённый платёж.
-        Обновляет статус инвойса и создаёт sweep job.
+        Обновляет статус инвойса и создаёт UnifiedSweepJob.
         """
         # Обновляем статус инвойса
         invoice_service = InvoiceService(self.session)
@@ -308,11 +313,30 @@ class PaymentService:
             },
         )
 
-        # Создаём sweep job
-        sweep_job = SweepJob(
+        # Создаём UnifiedSweepJob для invoice
+        from src.blockchain.chains import get_chain_config
+        
+        config = get_chain_config(payment_session.chain)
+        token_config = config.tokens.get(payment_session.token)
+        decimals = token_config.decimals if token_config else 6
+        
+        # Получаем deposit address
+        deposit_addr = payment_session.deposit_address
+        
+        sweep_job = UnifiedSweepJob(
             id=uuid.uuid4(),
-            payment_session_id=payment_session.id,
+            source=SweepSource.INVOICE,
+            source_id=payment_session.id,
+            chain=payment_session.chain,
+            token=payment_session.token,
+            token_contract=token_config.contract_address if token_config else "",
+            from_address=deposit_addr.address,
+            to_address=self.settings.get_treasury_address(payment_session.chain),
+            encrypted_private_key=deposit_addr.encrypted_privkey.hex() if isinstance(deposit_addr.encrypted_privkey, bytes) else deposit_addr.encrypted_privkey,
+            amount=invoice.amount,
+            amount_raw=str(int(invoice.amount * (10 ** decimals))),
             state=SweepState.PENDING_GAS,
+            priority=50 if invoice.amount >= 100 else 10,
         )
         self.session.add(sweep_job)
         await self.session.commit()

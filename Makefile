@@ -8,9 +8,9 @@ help:
 	@echo "  install       Install production dependencies"
 	@echo "  dev           Install development dependencies"
 	@echo ""
-	@echo "Database (SQLite - локально):"
-	@echo "  db-init       Создать новую БД (arbitron_payment.db)"
-	@echo "  db-reset      Удалить и пересоздать БД"
+	@echo "Database (PostgreSQL):"
+	@echo "  db-start      Start PostgreSQL container"
+	@echo "  db-stop       Stop PostgreSQL container"
 	@echo "  migrate       Run database migrations"
 	@echo "  migrate-new   Create new migration (NAME=migration_name)"
 	@echo "  migrate-down  Rollback last migration"
@@ -54,11 +54,14 @@ dev:
 # Database
 # ========================================
 
-db-init:
-	python scripts/init_db.py
+db-start:
+	docker-compose up -d postgres
+	@echo "Waiting for PostgreSQL to be ready..."
+	@sleep 3
+	docker-compose exec postgres pg_isready -U arbitron -d arbitron_payment
 
-db-reset:
-	python scripts/reset_db.py
+db-stop:
+	docker-compose stop postgres
 
 migrate:
 	alembic upgrade head

@@ -15,9 +15,10 @@ from src.db.models import (
     OutboxStatus,
     OutboxWebhook,
     PaymentSession,
-    SweepJob,
+    SweepSource,
     SweepState,
     TxStatus,
+    UnifiedSweepJob,
     Webhook,
 )
 from src.db.session import (
@@ -49,8 +50,9 @@ __all__ = [
     "PaymentSession",
     "OnchainTx",
     "TxStatus",
-    "SweepJob",
+    "UnifiedSweepJob",
     "SweepState",
+    "SweepSource",
     "OutboxWebhook",
     "OutboxStatus",
     "ChainCheckpoint",

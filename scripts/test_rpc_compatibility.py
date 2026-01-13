@@ -32,8 +32,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from web3 import AsyncWeb3, AsyncHTTPProvider
 
-# Transfer event signature
-TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+# Import config from TOML
+from src.blockchain.chains import (
+    get_chain_config,
+    get_evm_chains,
+    get_transfer_event_signature,
+    get_rpc_urls,
+)
+
+# Transfer event signature from config
+TRANSFER_TOPIC = get_transfer_event_signature()
 
 # Multicall3 (одинаковый на всех EVM сетях)
 MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
@@ -125,123 +133,32 @@ class RPCTestResult:
         return len(self.methods)
 
 
-# Конфигурация сетей
-CHAINS_CONFIG = {
-    "arbitrum": {
-        "usdt": "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
-        "usdc": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
-        "chain_id": 42161,
-    },
-    "base": {
-        "usdt": "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2",
-        "usdc": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-        "chain_id": 8453,
-    },
-    "bsc": {
-        "usdt": "0x55d398326f99059fF775485246999027B3197955",
-        "usdc": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
-        "chain_id": 56,
-    },
-    "polygon": {
-        "usdt": "0xc2132D05D31c914a87C6611C10748AEb04B58e8F",
-        "usdc": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
-        "chain_id": 137,
-    },
-    "avax": {
-        "usdt": "0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7",
-        "usdc": "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E",
-        "chain_id": 43114,
-    },
-    "optimism": {
-        "usdt": "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58",
-        "usdc": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
-        "chain_id": 10,
-    },
-}
+def get_chains_config() -> dict:
+    """Build chains config from TOML."""
+    result = {}
+    for chain_name in get_evm_chains():
+        cfg = get_chain_config(chain_name)
+        tokens = {}
+        for symbol, token_cfg in cfg.tokens.items():
+            tokens[symbol.lower()] = token_cfg.contract_address
+        tokens["chain_id"] = cfg.chain_id
+        result[chain_name] = tokens
+    return result
 
-# RPC списки
-RPC_LISTS = {
-    "arbitrum": [
-        "https://arbitrum.gateway.tenderly.co",
-        "https://arbitrum-one.public.blastapi.io",
-        "https://arbitrum-one-public.nodies.app",
-        "https://arb1.lava.build",
-        "https://arb1.arbitrum.io/rpc",
-        "https://arbitrum.meowrpc.com",
-        "https://arb-one-mainnet.gateway.tatum.io",
-        "https://arbitrum-one-rpc.publicnode.com",
-        "https://arbitrum.drpc.org",
-        "https://1rpc.io/arb",
-        "https://arbitrum.public.blockpi.network/v1/rpc/public",
-        "https://api.zan.top/arb-one",
-    ],
-    "base": [
-        "https://base-mainnet.gateway.tatum.io",
-        "https://base.drpc.org",
-        "https://base-mainnet.public.blastapi.io",
-        "https://base.lava.build",
-        "https://base-public.nodies.app",
-        "https://mainnet.base.org",
-        "https://1rpc.io/base",
-        "https://base.meowrpc.com",
-        "https://base-rpc.publicnode.com",
-        "https://developer-access-mainnet.base.org",
-        "https://gateway.tenderly.co/public/base",
-        "https://base.rpc.blxrbdn.com",
-        "https://api.zan.top/base-mainnet",
-        "https://base.public.blockpi.network/v1/rpc/public",
-        "https://endpoints.omniatech.io/v1/base/mainnet/public",
-        "https://base.llamarpc.com",
-    ],
-    "bsc": [
-        "https://0.48.club",
-        "https://binance-smart-chain-public.nodies.app",
-        "https://bsc.drpc.org",
-        "https://bsc-mainnet.public.blastapi.io",
-        "https://bsc.blockrazor.xyz",
-        "https://rpc-bsc.48.club",
-        "https://bsc.meowrpc.com",
-        "https://1rpc.io/bnb",
-        "https://bsc-rpc.publicnode.com",
-        "https://bnb.rpc.subquery.network/public",
-        "https://api.zan.top/bsc-mainnet",
-    ],
-    "polygon": [
-        "https://gateway.tenderly.co/public/polygon",
-        "https://polygon-public.nodies.app",
-        "https://polygon.drpc.org",
-        "https://polygon-bor-rpc.publicnode.com",
-        "https://polygon-rpc.com",
-        "https://polygon.lava.build",
-        "https://polygon.gateway.tenderly.co",
-        "https://1rpc.io/matic",
-        "https://rpc-mainnet.matic.quiknode.pro",
-        "https://api.zan.top/polygon-mainnet",
-    ],
-    "avax": [
-        "https://avalanche-mainnet.gateway.tenderly.co",
-        "https://avalanche.drpc.org",
-        "https://avalanche-public.nodies.app/ext/bc/C/rpc",
-        "https://api.avax.network/ext/bc/C/rpc",
-        "https://1rpc.io/avax/c",
-        "https://avalanche-c-chain-rpc.publicnode.com",
-        "https://avalanche.api.onfinality.io/public/ext/bc/C/rpc",
-        "https://api.zan.top/avax-mainnet/ext/bc/C/rpc",
-    ],
-    "optimism": [
-        "https://gateway.tenderly.co/public/optimism",
-        "https://optimism.gateway.tenderly.co",
-        "https://optimism-rpc.publicnode.com",
-        "https://optimism.drpc.org",
-        "https://optimism-public.nodies.app",
-        "https://optimism.rpc.subquery.network/public",
-        "https://optimism.api.onfinality.io/public",
-        "https://1rpc.io/op",
-        "https://api.zan.top/opt-mainnet",
-        "https://optimism.public.blockpi.network/v1/rpc/public",
-        "https://endpoints.omniatech.io/v1/op/mainnet/public",
-    ],
-}
+
+def get_rpc_lists() -> dict:
+    """Build RPC lists from TOML config."""
+    result = {}
+    for chain_name in get_evm_chains():
+        result[chain_name] = get_rpc_urls(chain_name)
+    return result
+
+
+# Конфигурация сетей - загружается из TOML
+CHAINS_CONFIG = get_chains_config()
+
+# RPC списки - загружаются из TOML
+RPC_LISTS = get_rpc_lists()
 
 
 async def test_method(name: str, coro) -> MethodResult:

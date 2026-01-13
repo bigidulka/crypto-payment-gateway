@@ -2,7 +2,6 @@
 Модели платежей: DepositAddress, PaymentSession, OnchainTx.
 """
 
-import enum
 import uuid
 from datetime import datetime
 from decimal import Decimal
@@ -30,10 +29,10 @@ from src.db.models.base import (
     UniversalBytes,
     UniversalUUID,
 )
+from src.db.models.enums import TxStatus, enum_values
 
 if TYPE_CHECKING:
     from src.db.models.invoice import Invoice
-    from src.db.models.sweep import SweepJob
 
 
 class DepositAddress(Base, UUIDMixin):
@@ -120,11 +119,7 @@ class PaymentSession(Base, UUIDMixin):
         back_populates="payment_session",
         cascade="all, delete-orphan",
     )
-    sweep_job: Mapped[Optional["SweepJob"]] = relationship(
-        "SweepJob",
-        back_populates="payment_session",
-        uselist=False,
-    )
+    # Sweep job теперь в UnifiedSweepJob (source='invoice', source_id=payment_session.id)
 
     __table_args__ = (
         # Один инвойс — одна сессия на chain+token
@@ -133,14 +128,6 @@ class PaymentSession(Base, UUIDMixin):
         ),
         Index("idx_session_address", "deposit_address_id"),
     )
-
-
-class TxStatus(str, enum.Enum):
-    """Статус транзакции."""
-
-    PENDING = "pending"  # Найдена, но не подтверждена
-    CONFIRMING = "confirming"  # В процессе подтверждения
-    CONFIRMED = "confirmed"  # Полностью подтверждена
 
 
 class OnchainTx(Base, UUIDMixin):
@@ -178,7 +165,7 @@ class OnchainTx(Base, UUIDMixin):
 
     # Статус и подтверждения
     status: Mapped[TxStatus] = mapped_column(
-        Enum(TxStatus, name="tx_status"),
+        Enum(TxStatus, name="tx_status", values_callable=enum_values(TxStatus)),
         default=TxStatus.PENDING,
         nullable=False,
         index=True,

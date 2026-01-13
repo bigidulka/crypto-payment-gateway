@@ -1,8 +1,10 @@
 """
-Модели для sweep (вывод токенов) и webhook outbox.
+Модели для webhook outbox и системных логов.
+
+Старые модели SweepJob и DepositSweepJob удалены.
+Используйте UnifiedSweepJob из unified_sweep.py.
 """
 
-import enum
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
@@ -27,72 +29,14 @@ from src.db.models.base import (
     UniversalJSON,
     UniversalUUID,
 )
+from src.db.models.enums import (
+    OutboxStatus,
+    SystemLogLevel,
+    enum_values,
+)
 
 if TYPE_CHECKING:
     from src.db.models.merchant import Webhook
-    from src.db.models.payment import PaymentSession
-
-
-class SweepState(str, enum.Enum):
-    """Состояние sweep job."""
-
-    PENDING_GAS = "pending_gas"  # Ожидает проверки газа
-    FUNDING = "funding"  # Отправка газа на deposit address
-    SWEEPING = "sweeping"  # Вывод токенов на treasury
-    COMPLETED = "completed"  # Успешно завершено
-    FAILED = "failed"  # Ошибка
-
-
-class SweepJob(Base, UUIDMixin, TimestampMixin):
-    """
-    Задача на вывод токенов с deposit address на treasury.
-    """
-
-    __tablename__ = "sweep_jobs"
-
-    # Связь с сессией оплаты
-    payment_session_id: Mapped[uuid.UUID] = mapped_column(
-        UniversalUUID(),
-        ForeignKey("payment_sessions.id", ondelete="CASCADE"),
-        nullable=False,
-        unique=True,
-    )
-
-    # Состояние
-    state: Mapped[SweepState] = mapped_column(
-        Enum(SweepState, name="sweep_state"),
-        default=SweepState.PENDING_GAS,
-        nullable=False,
-        index=True,
-    )
-
-    # Хеши транзакций
-    gas_tx_hash: Mapped[Optional[str]] = mapped_column(String(66), nullable=True)
-    sweep_tx_hash: Mapped[Optional[str]] = mapped_column(String(66), nullable=True)
-
-    # Retry логика
-    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    max_attempts: Mapped[int] = mapped_column(Integer, default=10, nullable=False)
-    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    next_retry_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-
-    # Relationships
-    payment_session: Mapped["PaymentSession"] = relationship(
-        "PaymentSession",
-        back_populates="sweep_job",
-    )
-
-    __table_args__ = (Index("idx_sweep_state_retry", "state", "next_retry_at"),)
-
-
-class OutboxStatus(str, enum.Enum):
-    """Статус webhook в outbox."""
-
-    PENDING = "pending"  # Ожидает отправки
-    SENT = "sent"  # Успешно отправлен
-    FAILED = "failed"  # Все попытки исчерпаны
 
 
 class OutboxWebhook(Base, UUIDMixin):
@@ -132,7 +76,7 @@ class OutboxWebhook(Base, UUIDMixin):
 
     # Статус
     status: Mapped[OutboxStatus] = mapped_column(
-        Enum(OutboxStatus, name="outbox_status"),
+        Enum(OutboxStatus, name="outbox_status", values_callable=enum_values(OutboxStatus)),
         default=OutboxStatus.PENDING,
         nullable=False,
     )
@@ -176,15 +120,6 @@ class ChainCheckpoint(Base, UUIDMixin):
     )
 
 
-class SystemLogLevel(str, enum.Enum):
-    """Уровень лога."""
-
-    INFO = "info"
-    WARNING = "warning"
-    ERROR = "error"
-    CRITICAL = "critical"
-
-
 class SystemLog(Base, UUIDMixin):
     """
     Системные логи для админ панели.
@@ -203,7 +138,7 @@ class SystemLog(Base, UUIDMixin):
 
     # Уровень лога
     level: Mapped[SystemLogLevel] = mapped_column(
-        Enum(SystemLogLevel, name="system_log_level"),
+        Enum(SystemLogLevel, name="system_log_level", values_callable=enum_values(SystemLogLevel)),
         nullable=False,
         index=True,
     )

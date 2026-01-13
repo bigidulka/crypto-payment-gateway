@@ -1,7 +1,7 @@
 """Add user wallets for persistent deposits
 
 Revision ID: 20260107_000001
-Revises: 20251225_000000_0001
+Revises: 20250115_000000_0002_non_evm_support
 Create Date: 2026-01-07
 
 Добавляет таблицы для постоянных депозитных адресов:
@@ -16,8 +16,8 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision = "20260107_000001"
-down_revision = "20251225_000000_0001"
+revision = "0003_user_wallets"
+down_revision = "0002_non_evm"
 branch_labels = None
 depends_on = None
 

@@ -326,3 +326,28 @@ class ActionResponse(BaseModel):
 
     success: bool
     message: str
+
+
+# === Withdraw ===
+
+
+class WithdrawRequest(BaseModel):
+    """Запрос на вывод средств с treasury."""
+
+    chain: str = Field(..., description="Сеть (base, arbitrum, bsc, polygon, avax, optimism, solana, ton)")
+    token: str = Field(..., description="Токен (USDT, USDC) или 'native' для нативной валюты")
+    to_address: str = Field(..., description="Адрес получателя")
+    amount: str = Field(..., description="Сумма для вывода (human-readable, например '100.50')")
+
+
+class WithdrawResponse(BaseModel):
+    """Ответ на вывод средств."""
+
+    success: bool
+    tx_hash: str | None = None
+    chain: str
+    token: str
+    amount: str
+    to_address: str
+    message: str | None = None
+    explorer_url: str | None = None
