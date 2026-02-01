@@ -756,6 +756,8 @@ def _render_admin_panel() -> str:
 
     <script>
         let authToken = localStorage.getItem('adminToken');
+        const basePath = window.location.pathname.replace(/\/admin\/?$/, '') || '';
+        const adminApiBase = `${basePath}/v1/admin`;
         let currentTab = 'merchants';
         let merchantsData = [];
         let walletsData = [];
@@ -775,7 +777,7 @@ def _render_admin_panel() -> str:
             const password = document.getElementById('password').value;
 
             try {
-                const response = await fetch('/v1/admin/login', {
+                const response = await fetch(`${adminApiBase}/login`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ username, password })
@@ -849,7 +851,7 @@ def _render_admin_panel() -> str:
 
         async function loadMerchants() {
             try {
-                const data = await api('/v1/admin/merchants?limit=500');
+                const data = await api(`${adminApiBase}/merchants?limit=500`);
                 merchantsData = data.items;
                 renderMerchants();
             } catch (error) {
@@ -889,7 +891,7 @@ def _render_admin_panel() -> str:
 
         async function loadWallets() {
             try {
-                const data = await api('/v1/admin/wallets/balances?with_balance_only=false');
+                const data = await api(`${adminApiBase}/wallets/balances?with_balance_only=false`);
                 walletsData = data.items || [];
                 renderWallets();
             } catch (error) {
@@ -926,7 +928,7 @@ def _render_admin_panel() -> str:
 
         async function loadInvoices() {
             try {
-                const data = await api('/v1/admin/invoices?limit=500');
+                const data = await api(`${adminApiBase}/invoices?limit=500`);
                 invoicesData = data.items;
                 renderInvoices();
             } catch (error) {
