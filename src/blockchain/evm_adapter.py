@@ -820,8 +820,8 @@ class EvmAdapter:
         else:
             tx["gasPrice"] = fee_params.gas_price
 
-        # Gas для простого перевода
-        tx["gas"] = 21000
+        # Gas для простого перевода (L2 сети требуют больше из-за L1 data fee)
+        tx["gas"] = 65000 if self.config.is_l2 else 21000
 
         return tx
 
@@ -889,13 +889,17 @@ class EvmAdapter:
                 fee_params = await self.get_fee_params()
                 nonce = await self.get_nonce(account.address)
 
+                # L2 сети (Arbitrum, Optimism, Base) требуют больше газа
+                # из-за L1 data fee, включённого в intrinsic gas
+                gas_limit = 65000 if self.config.is_l2 else 21000
+
                 tx: dict[str, Any] = {
                     "chainId": self.config.chain_id,
                     "from": self.w3.to_checksum_address(account.address),
                     "to": self.w3.to_checksum_address(to_address),
                     "value": amount_wei,
                     "nonce": nonce,
-                    "gas": 21000,
+                    "gas": gas_limit,
                 }
 
                 if fee_params.is_eip1559:
