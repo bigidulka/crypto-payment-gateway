@@ -1,0 +1,15 @@
+{
+    "sqltools.connections": [
+        {
+            "ssh": "Disabled",
+            "previewLimit": 50,
+            "server": "localhost",
+            "port": 5432,
+            "driver": "PostgreSQL",
+            "name": "arbitron-payment",
+            "username": "arbitron",
+            "password": "arbitron_pass",
+            "database": "arbitron_db"
+        }
+    ]
+}
