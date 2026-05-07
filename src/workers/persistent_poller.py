@@ -177,6 +177,18 @@ class TransferLog:
     raw_amount: int
 
 
+@dataclass
+class PollPersistentDepositsResult:
+    """Результат сканирования persistent депозитов."""
+
+    deposits_found: int
+    is_complete: bool
+    fetch_is_complete: bool
+    failed_address_count: int
+    record_error_count: int
+    checkpoint_advanced: bool
+
+
 def _parse_transfer_log(chain: str, log: dict) -> TransferLog | None:
     """Распарсить Transfer event лог из raw dict."""
     config = get_chain_config(chain)
@@ -254,7 +266,11 @@ def _parse_transfer_log(chain: str, log: dict) -> TransferLog | None:
 # === Main Polling Functions ===
 
 
-async def poll_persistent_deposits(chain: str) -> int:
+async def poll_persistent_deposits(
+    chain: str,
+    *,
+    fetcher_override: ResilientLogFetcher | None = None,
+) -> PollPersistentDepositsResult:
     """
     Сканировать блокчейн на предмет Transfer событий на persistent адреса.
 
@@ -266,10 +282,14 @@ async def poll_persistent_deposits(chain: str) -> int:
     5. Sequential fallback
 
     Returns:
-        Количество найденных депозитов
+        Результат сканирования с флагом полноты и checkpoint статусом
     """
     config = get_chain_config(chain)
     deposits_found = 0
+    fetch_is_complete = True
+    failed_address_count = 0
+    record_error_count = 0
+    checkpoint_advanced = False
 
     async with get_session_context() as session:
         # Получаем все активные wallet addresses для сети
@@ -277,7 +297,14 @@ async def poll_persistent_deposits(chain: str) -> int:
 
         if not address_map:
             logger.debug(f"[{chain}] No active wallet addresses, skipping")
-            return 0
+            return PollPersistentDepositsResult(
+                deposits_found=0,
+                is_complete=True,
+                fetch_is_complete=True,
+                failed_address_count=0,
+                record_error_count=0,
+                checkpoint_advanced=False,
+            )
 
         logger.debug(f"[{chain}] Scanning {len(address_map)} persistent addresses")
 
@@ -302,7 +329,14 @@ async def poll_persistent_deposits(chain: str) -> int:
 
         if safe_block <= min_scanned:
             logger.debug(f"[{chain}] No new blocks to scan")
-            return 0
+            return PollPersistentDepositsResult(
+                deposits_found=0,
+                is_complete=True,
+                fetch_is_complete=True,
+                failed_address_count=0,
+                record_error_count=0,
+                checkpoint_advanced=False,
+            )
 
         from_block = min_scanned + 1
         to_block = min(safe_block, from_block + config.scan_window - 1)
@@ -319,7 +353,7 @@ async def poll_persistent_deposits(chain: str) -> int:
 
         try:
             # Используем ResilientLogFetcher для получения логов
-            fetcher = get_resilient_fetcher(chain)
+            fetcher = fetcher_override or get_resilient_fetcher(chain)
             all_addresses = list(address_map.keys())
 
             if fetcher:
@@ -331,11 +365,19 @@ async def poll_persistent_deposits(chain: str) -> int:
                     token_contracts=token_contracts,
                 )
 
+                fetch_is_complete = result.is_complete
+                failed_address_count = result.failed_address_count
+
                 raw_logs = result.logs
                 logger.debug(
                     f"[{chain}] Fetched {len(raw_logs)} logs via {result.method_used.value} "
                     f"in {result.latency_ms:.0f}ms"
                 )
+
+                if not fetch_is_complete:
+                    logger.warning(
+                        f"[{chain}] Partial fetch detected: failed_address_count={failed_address_count}"
+                    )
 
                 # Парсим логи в TransferLog
                 transfers = []
@@ -351,18 +393,49 @@ async def poll_persistent_deposits(chain: str) -> int:
                 logger.warning(
                     f"[{chain}] ResilientLogFetcher not available, using adapter"
                 )
-                transfers = await adapter.get_transfer_logs_batch(
+                batch_result = await adapter.get_transfer_logs_batch(
                     from_block=from_block,
                     to_block=to_block,
                     to_addresses=all_addresses,
                     token_contracts=token_contracts,
                 )
+                transfers = batch_result.transfers
+                fetch_is_complete = batch_result.is_complete
+                failed_address_count = batch_result.failed_address_count
+
+                if not fetch_is_complete:
+                    logger.warning(
+                        f"[{chain}] Partial adapter fetch detected: "
+                        f"failed_address_count={failed_address_count}"
+                    )
         except Exception as e:
             logger.error(f"[{chain}] Error fetching transfer logs: {e}")
-            return 0
+            return PollPersistentDepositsResult(
+                deposits_found=0,
+                is_complete=False,
+                fetch_is_complete=False,
+                failed_address_count=len(address_map),
+                record_error_count=0,
+                checkpoint_advanced=False,
+            )
 
         if transfers:
             logger.info(f"[{chain}] Found {len(transfers)} transfers")
+
+        if not fetch_is_complete:
+            await session.rollback()
+            logger.warning(
+                f"[{chain}] Skipping transfer processing due to incomplete fetch: "
+                f"failed_address_count={failed_address_count}"
+            )
+            return PollPersistentDepositsResult(
+                deposits_found=0,
+                is_complete=False,
+                fetch_is_complete=False,
+                failed_address_count=failed_address_count,
+                record_error_count=0,
+                checkpoint_advanced=False,
+            )
 
         # Обрабатываем найденные трансферы
         wallet_service = UserWalletService(session)
@@ -417,23 +490,43 @@ async def poll_persistent_deposits(chain: str) -> int:
                     )
 
             except Exception as e:
+                record_error_count += 1
                 logger.error(f"[{chain}] Error recording deposit: {e}")
 
-        # Обновляем last_scanned_block для всех адресов
-        stmt = (
-            update(WalletAddress)
-            .where(
-                and_(
-                    WalletAddress.chain == chain,
-                    WalletAddress.is_active == True,
-                )
-            )
-            .values(last_scanned_block=to_block)
-        )
-        await session.execute(stmt)
-        await session.commit()
+        is_complete = fetch_is_complete and record_error_count == 0
 
-    return deposits_found
+        if is_complete:
+            # Обновляем last_scanned_block для всех адресов только при полном проходе
+            stmt = (
+                update(WalletAddress)
+                .where(
+                    and_(
+                        WalletAddress.chain == chain,
+                        WalletAddress.is_active == True,
+                    )
+                )
+                .values(last_scanned_block=to_block)
+            )
+            await session.execute(stmt)
+            await session.commit()
+            checkpoint_advanced = True
+        else:
+            await session.rollback()
+            logger.warning(
+                f"[{chain}] Checkpoint not advanced due to incomplete scan: "
+                f"fetch_is_complete={fetch_is_complete}, "
+                f"failed_address_count={failed_address_count}, "
+                f"record_error_count={record_error_count}"
+            )
+
+    return PollPersistentDepositsResult(
+        deposits_found=deposits_found,
+        is_complete=is_complete,
+        fetch_is_complete=fetch_is_complete,
+        failed_address_count=failed_address_count,
+        record_error_count=record_error_count,
+        checkpoint_advanced=checkpoint_advanced,
+    )
 
 
 async def update_deposit_confirmations(chain: str) -> int:
@@ -597,7 +690,20 @@ async def run_persistent_poller() -> None:
     - Sequential fallback (последняя надежда)
     """
     settings = get_settings()
-    chains = get_all_chains()
+    # Scan chains that have active persistent wallets first. Dead/slow RPCs on idle
+    # chains must not delay BSC/Base/etc checkpoints by minutes.
+    async with get_session_context() as session:
+        active_chains_result = await session.execute(
+            select(WalletAddress.chain)
+            .where(WalletAddress.is_active == True)
+            .distinct()
+        )
+        active_chains = [row[0] for row in active_chains_result.all()]
+
+    supported_chains = set(get_all_chains())
+    chains = [chain for chain in active_chains if chain in supported_chains]
+    if not chains:
+        chains = get_all_chains()
 
     logger.info(f"Starting Persistent Deposit Poller for chains: {chains}")
 
@@ -609,10 +715,11 @@ async def run_persistent_poller() -> None:
         while True:
             iteration += 1
 
-            for chain in chains:
+            async def process_chain(chain: str) -> None:
                 try:
                     # Сканируем новые депозиты
-                    new_deposits = await poll_persistent_deposits(chain)
+                    scan_result = await poll_persistent_deposits(chain)
+                    new_deposits = scan_result.deposits_found
 
                     # Обновляем подтверждения
                     confirmed = await update_deposit_confirmations(chain)
@@ -623,8 +730,21 @@ async def run_persistent_poller() -> None:
                             f"+{confirmed} confirmed"
                         )
 
+                    if not scan_result.is_complete:
+                        logger.warning(
+                            f"[{chain}] Incomplete scan detected: "
+                            f"fetch_is_complete={scan_result.fetch_is_complete}, "
+                            f"failed_address_count={scan_result.failed_address_count}, "
+                            f"record_error_count={scan_result.record_error_count}, "
+                            f"checkpoint_advanced={scan_result.checkpoint_advanced}"
+                        )
+
                 except Exception as e:
                     logger.error(f"[{chain}] Error in persistent poller: {e}")
+
+            # Isolate chains from each other. Slow/dead RPCs on one chain must not
+            # block BSC/Base/etc deposit detection.
+            await asyncio.gather(*(process_chain(chain) for chain in chains))
 
             # Логируем статистику каждые 100 итераций
             if iteration % 100 == 0:
