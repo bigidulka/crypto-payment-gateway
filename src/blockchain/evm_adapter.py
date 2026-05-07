@@ -51,6 +51,15 @@ class TransferLog:
 
 
 @dataclass
+class BatchTransferLogsResult:
+    """Результат batch-сканирования transfer логов."""
+
+    transfers: list[TransferLog]
+    is_complete: bool
+    failed_address_count: int
+
+
+@dataclass
 class FeeParams:
     """Параметры gas fee."""
 
@@ -320,7 +329,7 @@ class EvmAdapter:
         to_block: int,
         to_addresses: list[str],
         token_contracts: list[str] | None = None,
-    ) -> list[TransferLog]:
+    ) -> BatchTransferLogsResult:
         """
         Получить Transfer события для МНОЖЕСТВА адресов получателей.
 
@@ -333,9 +342,14 @@ class EvmAdapter:
             token_contracts: Список контрактов токенов для фильтрации
         """
         if not to_addresses:
-            return []
+            return BatchTransferLogsResult(
+                transfers=[],
+                is_complete=True,
+                failed_address_count=0,
+            )
 
         result: list[TransferLog] = []
+        failed_address_count = 0
 
         # Делаем запросы для каждого адреса отдельно
         # Это надёжнее чем OR в topics (не все RPC поддерживают)
@@ -349,9 +363,14 @@ class EvmAdapter:
                 )
                 result.extend(transfers)
             except Exception as e:
+                failed_address_count += 1
                 logger.warning(f"Error fetching logs for {to_address}: {e}")
 
-        return result
+        return BatchTransferLogsResult(
+            transfers=result,
+            is_complete=(failed_address_count == 0),
+            failed_address_count=failed_address_count,
+        )
 
     def _parse_transfer_log(self, log: LogReceipt) -> TransferLog | None:
         """Распарсить Transfer event лог."""

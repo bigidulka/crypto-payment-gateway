@@ -183,12 +183,13 @@ async def poll_chain(chain: str) -> None:
         all_addresses = list(address_map.keys())
 
         try:
-            all_transfers = await adapter.get_transfer_logs_batch(
+            batch_result = await adapter.get_transfer_logs_batch(
                 from_block=from_block,
                 to_block=to_block,
                 to_addresses=all_addresses,
                 token_contracts=token_contracts,
             )
+            all_transfers = batch_result.transfers
         except Exception as e:
             logger.error(f"[{chain}] Error fetching transfer logs: {e}")
             return

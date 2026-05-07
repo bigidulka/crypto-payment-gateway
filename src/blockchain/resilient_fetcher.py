@@ -138,6 +138,8 @@ class TransferLogResult:
     latency_ms: float
     from_block: int
     to_block: int
+    is_complete: bool
+    failed_address_count: int
 
 
 class ResilientLogFetcher:
@@ -150,6 +152,8 @@ class ResilientLogFetcher:
     # Лимиты
     MAX_PARALLEL_REQUESTS = 10  # Максимум параллельных запросов
     BATCH_SIZE = 50  # Адресов на batch при parallel fetching
+    MAX_FAILED_ADDRESS_RATIO = 0.05  # Partial result tolerance before retrying next RPC
+    MAX_FAILED_ADDRESSES_TOLERATED = 5  # Low partial loss accepted to keep checkpoints moving
     OR_TOPICS_LIMIT = 100  # Максимум адресов для OR Topics
 
     # Timeouts
@@ -334,9 +338,12 @@ class ResilientLogFetcher:
         to_block: int,
         to_addresses: list[str],
         token_contracts: list[str],
-    ) -> list[dict]:
+    ) -> tuple[list[dict], int]:
         """
         Получить логи параллельными запросами.
+
+        Returns:
+            tuple: (logs, failed_address_count)
         """
         if not endpoint.circuit_parallel.can_execute():
             raise RuntimeError("Circuit breaker open for parallel fetch")
@@ -369,16 +376,20 @@ class ResilientLogFetcher:
         endpoint.update_latency(latency)
         endpoint.total_requests += 1
 
-        # Если слишком много ошибок - считаем неудачей
+        # Если есть существенные ошибки - считаем endpoint неуспешным и пробуем следующий.
+        # Нельзя возвращать partial result: poller не двигает checkpoint, и сеть застревает.
         error_rate = len(errors) / len(to_addresses) if to_addresses else 0
-        if error_rate > 0.5:
+        if (
+            len(errors) > self.MAX_FAILED_ADDRESSES_TOLERATED
+            and error_rate >= self.MAX_FAILED_ADDRESS_RATIO
+        ):
             endpoint.circuit_parallel.record_failure()
             raise RuntimeError(
                 f"Too many errors in parallel fetch: {len(errors)}/{len(to_addresses)}"
             )
 
         endpoint.circuit_parallel.record_success()
-        return all_logs
+        return all_logs, len(errors)
 
     async def fetch_transfer_logs(
         self,
@@ -405,6 +416,8 @@ class ResilientLogFetcher:
                 latency_ms=0,
                 from_block=from_block,
                 to_block=to_block,
+                is_complete=True,
+                failed_address_count=0,
             )
 
         primary = self._get_primary()
@@ -441,6 +454,8 @@ class ResilientLogFetcher:
                             latency_ms=latency,
                             from_block=from_block,
                             to_block=to_block,
+                            is_complete=True,
+                            failed_address_count=0,
                         )
                     except Exception as e:
                         last_error = e
@@ -475,6 +490,8 @@ class ResilientLogFetcher:
                             latency_ms=latency,
                             from_block=from_block,
                             to_block=to_block,
+                            is_complete=True,
+                            failed_address_count=0,
                         )
                     except Exception as e:
                         last_error = e
@@ -488,7 +505,7 @@ class ResilientLogFetcher:
         if primary and primary.circuit_parallel.can_execute():
             try:
                 start = time.time()
-                logs = await self._fetch_parallel_batch(
+                logs, failed_address_count = await self._fetch_parallel_batch(
                     primary, from_block, to_block, to_addresses, token_contracts
                 )
                 latency = (time.time() - start) * 1000
@@ -505,6 +522,8 @@ class ResilientLogFetcher:
                     latency_ms=latency,
                     from_block=from_block,
                     to_block=to_block,
+                    is_complete=(failed_address_count == 0),
+                    failed_address_count=failed_address_count,
                 )
             except Exception as e:
                 last_error = e
@@ -514,7 +533,7 @@ class ResilientLogFetcher:
         if secondary and secondary.circuit_parallel.can_execute():
             try:
                 start = time.time()
-                logs = await self._fetch_parallel_batch(
+                logs, failed_address_count = await self._fetch_parallel_batch(
                     secondary, from_block, to_block, to_addresses, token_contracts
                 )
                 latency = (time.time() - start) * 1000
@@ -531,6 +550,8 @@ class ResilientLogFetcher:
                     latency_ms=latency,
                     from_block=from_block,
                     to_block=to_block,
+                    is_complete=(failed_address_count == 0),
+                    failed_address_count=failed_address_count,
                 )
             except Exception as e:
                 last_error = e
@@ -544,6 +565,8 @@ class ResilientLogFetcher:
                 start = time.time()
                 logs: list[dict] = []
 
+                failed_address_count = 0
+
                 for addr in to_addresses:
                     try:
                         addr_logs = await self._fetch_single_address(
@@ -556,6 +579,7 @@ class ResilientLogFetcher:
                         )
                         logs.extend(addr_logs)
                     except Exception:
+                        failed_address_count += 1
                         continue  # Пропускаем ошибки отдельных адресов
 
                 latency = (time.time() - start) * 1000
@@ -571,6 +595,8 @@ class ResilientLogFetcher:
                     latency_ms=latency,
                     from_block=from_block,
                     to_block=to_block,
+                    is_complete=(failed_address_count == 0),
+                    failed_address_count=failed_address_count,
                 )
             except Exception as e:
                 last_error = e
