@@ -1,0 +1,310 @@
+# =============================================================================
+# CHAINS CONFIGURATION
+# =============================================================================
+# Все настройки сетей, токенов, контрактов и RPC
+# Чтобы добавить/удалить чейн - просто раскомментируйте/закомментируйте секцию
+# =============================================================================
+
+# Global constants
+[constants]
+# ERC20 Transfer event signature (стандартный для всех EVM)
+transfer_event_signature = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+# Multicall3 contract address (одинаковый на всех EVM сетях)
+multicall3_address = "0xcA11bde05977b3631167028862bE2a173976CA11"
+
+# Gas configuration
+gas_buffer_percent = 10
+max_gas_top_up_retries = 3
+
+# =============================================================================
+# EVM CHAINS
+# =============================================================================
+
+[chains.base]
+name = "Base"
+chain_id = 8453
+chain_type = "evm"
+is_l2 = true
+max_gas_cost_native = 0.0005  # ETH - достаточно для L2 с L1 data fee
+gas_multiplier = 1.25
+min_funder_balance = 0.001  # Minimum balance to consider funder healthy
+rpc_urls = [
+    "https://gateway.tenderly.co/public/base",
+    "https://base.lava.build",
+    "https://base-public.nodies.app",
+    "https://base-mainnet.public.blastapi.io",
+]
+confirmations = 12
+reorg_buffer = 20
+scan_window = 2000
+block_time_sec = 2.0
+native_symbol = "ETH"
+native_decimals = 18
+explorer_url = "https://basescan.org"
+address_length = 42
+
+[chains.base.tokens.USDT]
+symbol = "USDT"
+contract_address = "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"
+decimals = 6
+variant = "bridged"
+
+[chains.base.tokens.USDC]
+symbol = "USDC"
+contract_address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+decimals = 6
+variant = "native"
+
+
+[chains.arbitrum]
+name = "Arbitrum One"
+chain_id = 42161
+chain_type = "evm"
+is_l2 = true
+max_gas_cost_native = 0.0005  # ETH - L2 with L1 data fee
+gas_multiplier = 1.25
+min_funder_balance = 0.001
+rpc_urls = [
+    "https://arbitrum.gateway.tenderly.co",
+    "https://arbitrum-one.public.blastapi.io",
+    "https://arbitrum-one-public.nodies.app",
+    "https://arbitrum.meowrpc.com",
+]
+confirmations = 12
+reorg_buffer = 50
+scan_window = 2000
+block_time_sec = 0.25
+native_symbol = "ETH"
+native_decimals = 18
+explorer_url = "https://arbiscan.io"
+address_length = 42
+
+[chains.arbitrum.tokens.USDT]
+symbol = "USDT"
+contract_address = "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"
+decimals = 6
+variant = "native"
+
+[chains.arbitrum.tokens.USDC]
+symbol = "USDC"
+contract_address = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+decimals = 6
+variant = "native"
+
+
+[chains.bsc]
+name = "BNB Smart Chain"
+chain_id = 56
+chain_type = "evm"
+is_l2 = false
+max_gas_cost_native = 0.01  # BNB - increased for stuck txns - reduced fallback
+gas_multiplier = 1.50
+min_funder_balance = 0.01
+rpc_urls = [
+    "https://bsc-rpc.publicnode.com",
+    "https://api.zan.top/bsc-mainnet",
+    "https://bsc.blockrazor.xyz",
+    "https://bsc-dataseed.binance.org",
+]
+confirmations = 15
+reorg_buffer = 30
+scan_window = 2000
+block_time_sec = 3.0
+native_symbol = "BNB"
+native_decimals = 18
+explorer_url = "https://bscscan.com"
+address_length = 42
+
+[chains.bsc.tokens.USDT]
+symbol = "USDT"
+contract_address = "0x55d398326f99059fF775485246999027B3197955"
+decimals = 18  # BSC USDT has 18 decimals!
+variant = "native"
+
+[chains.bsc.tokens.USDC]
+symbol = "USDC"
+contract_address = "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"
+decimals = 18  # BSC USDC has 18 decimals!
+variant = "bridged"
+bridge = "binance-peg"
+
+
+[chains.polygon]
+name = "Polygon PoS"
+chain_id = 137
+chain_type = "evm"
+is_l2 = false
+max_gas_cost_native = 0.1  # MATIC - reduced fallback
+gas_multiplier = 1.25
+min_funder_balance = 0.5
+rpc_urls = [
+    "https://polygon.gateway.tenderly.co",
+    "https://gateway.tenderly.co/public/polygon",
+    "https://polygon.lava.build",
+    "https://polygon-public.nodies.app",
+]
+confirmations = 12
+reorg_buffer = 20
+scan_window = 400  # Polygon RPC limits to 500 blocks
+block_time_sec = 2.1
+native_symbol = "MATIC"
+native_decimals = 18
+explorer_url = "https://polygonscan.com"
+address_length = 42
+
+[chains.polygon.tokens.USDT]
+symbol = "USDT"
+contract_address = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"
+decimals = 6
+variant = "native"
+
+[chains.polygon.tokens.USDC]
+symbol = "USDC"
+contract_address = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+decimals = 6
+variant = "native"
+
+
+[chains.avax]
+name = "Avalanche C-Chain"
+chain_id = 43114
+chain_type = "evm"
+is_l2 = false
+max_gas_cost_native = 0.005  # AVAX - reduced fallback
+gas_multiplier = 1.25
+min_funder_balance = 0.1
+rpc_urls = [
+    "https://avalanche-c-chain-rpc.publicnode.com",
+    "https://1rpc.io/avax/c",
+    "https://avalanche-mainnet.gateway.tenderly.co",
+    "https://avalanche-public.nodies.app/ext/bc/C/rpc",
+]
+confirmations = 12
+reorg_buffer = 30
+scan_window = 2000
+block_time_sec = 2.0
+native_symbol = "AVAX"
+native_decimals = 18
+explorer_url = "https://snowtrace.io"
+address_length = 42
+
+[chains.avax.tokens.USDT]
+symbol = "USDT"
+contract_address = "0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7"
+decimals = 6
+variant = "bridged"
+bridge = "avalanche-bridge"
+
+[chains.avax.tokens.USDC]
+symbol = "USDC"
+contract_address = "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E"
+decimals = 6
+variant = "native"
+
+
+[chains.optimism]
+name = "Optimism"
+chain_id = 10
+chain_type = "evm"
+is_l2 = true
+max_gas_cost_native = 0.0005  # ETH - L2 with L1 data fee
+gas_multiplier = 1.25
+min_funder_balance = 0.001
+rpc_urls = [
+    "https://gateway.tenderly.co/public/optimism",
+    "https://optimism.gateway.tenderly.co",
+    "https://optimism.drpc.org",
+    "https://optimism-public.nodies.app",
+]
+confirmations = 12
+reorg_buffer = 20
+scan_window = 2000
+block_time_sec = 2.0
+native_symbol = "ETH"
+native_decimals = 18
+explorer_url = "https://optimistic.etherscan.io"
+address_length = 42
+
+[chains.optimism.tokens.USDT]
+symbol = "USDT"
+contract_address = "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58"
+decimals = 6
+variant = "bridged"
+bridge = "optimism-bridge"
+
+[chains.optimism.tokens.USDC]
+symbol = "USDC"
+contract_address = "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"
+decimals = 6
+variant = "native"
+
+
+# =============================================================================
+# NON-EVM CHAINS (закомментированы - раскомментируйте для включения)
+# =============================================================================
+
+# [chains.solana]
+# name = "Solana"
+# chain_id = 0  # Solana doesn't use chain_id
+# chain_type = "solana"
+# rpc_urls = [
+#     "https://api.mainnet-beta.solana.com",
+#     "https://solana-api.projectserum.com",
+# ]
+# confirmations = 31
+# reorg_buffer = 10
+# scan_window = 1000
+# block_time_sec = 0.4
+# native_symbol = "SOL"
+# native_decimals = 9
+# explorer_url = "https://solscan.io"
+# address_length = 44
+#
+# [chains.solana.tokens.USDT]
+# symbol = "USDT"
+# contract_address = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+# decimals = 6
+# variant = "native"
+#
+# [chains.solana.tokens.USDC]
+# symbol = "USDC"
+# contract_address = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+# decimals = 6
+# variant = "native"
+
+
+# [chains.ton]
+# name = "The Open Network"
+# chain_id = 0  # TON doesn't use chain_id
+# chain_type = "ton"
+# rpc_urls = [
+#     "https://toncenter.com/api/v2",
+# ]
+# confirmations = 12
+# reorg_buffer = 5
+# scan_window = 100
+# block_time_sec = 5.0
+# native_symbol = "TON"
+# native_decimals = 9
+# explorer_url = "https://tonviewer.com"
+# address_length = 48
+#
+# [chains.ton.tokens.USDT]
+# symbol = "USDT"
+# contract_address = "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"
+# decimals = 6
+# variant = "native"
+
+
+# =============================================================================
+# CHAIN ALIASES (короткие имена для удобства)
+# =============================================================================
+
+[aliases]
+arb = "arbitrum"
+bnb = "bsc"
+opt = "optimism"
+sol = "solana"
+matic = "polygon"
+avalanche = "avax"
