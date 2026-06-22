@@ -5,21 +5,33 @@ EVM Log Poller Worker.
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import selectinload
 
-from src.blockchain.chains import get_all_chains, get_chain_config
+from src.blockchain.chains import (
+    get_all_chains,
+    get_chain_config,
+    get_transfer_event_signature,
+)
 from src.blockchain.evm_adapter import EvmAdapter, close_all_adapters, get_evm_adapter
+from src.blockchain.oklink_client import (
+    OKLinkClientConfig,
+    OKLinkExplorerClient,
+    OKLinkTransferLogFetcher,
+)
 from src.core.config import get_settings
 from src.db.models import (
     ChainCheckpoint,
-    Invoice,
+    DepositAddress,
+    DepositAddressLeaseStatus,
     InvoiceStatus,
     OnchainTx,
     PaymentSession,
+    PaymentSessionStatus,
     TxStatus,
 )
 from src.db.session import get_session_context
@@ -27,6 +39,124 @@ from src.services.invoice_service import InvoiceService
 from src.services.payment_service import PaymentService
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class TransferLog:
+    """Распарсенный Transfer event из OKLink/Web3 log."""
+
+    tx_hash: str
+    log_index: int
+    block_number: int
+    from_address: str
+    to_address: str
+    token_contract: str
+    amount: Decimal
+
+
+def _hex_or_int(value, default: int = 0) -> int:
+    """Parse JSON-RPC hex strings, bytes-like values, or ints."""
+    if value is None:
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, bytes):
+        return int(value.hex(), 16) if value else default
+    if hasattr(value, "hex"):
+        return int(value.hex(), 16)
+    if isinstance(value, str):
+        return int(value, 16) if value.startswith("0x") else int(value)
+    return default
+
+
+def _parse_transfer_log(chain: str, log: dict) -> TransferLog | None:
+    """Parse raw Web3-compatible Transfer log."""
+    config = get_chain_config(chain)
+    topics = log.get("topics", [])
+    if len(topics) < 3:
+        return None
+
+    tx_hash = log.get("transactionHash", "")
+    if isinstance(tx_hash, bytes):
+        tx_hash = "0x" + tx_hash.hex()
+    elif hasattr(tx_hash, "hex"):
+        tx_hash = "0x" + tx_hash.hex()
+    if tx_hash and not str(tx_hash).startswith("0x"):
+        tx_hash = "0x" + str(tx_hash)
+
+    topic1 = topics[1]
+    topic2 = topics[2]
+    from_address = _topic_to_address(topic1)
+    to_address = _topic_to_address(topic2)
+
+    data = log.get("data", "0x0")
+    if isinstance(data, bytes):
+        raw_amount = int(data.hex(), 16) if data else 0
+    elif hasattr(data, "hex"):
+        raw_amount = int(data.hex(), 16)
+    else:
+        raw_amount = int(data, 16) if data else 0
+
+    token_contract = log.get("address", "")
+    if isinstance(token_contract, bytes):
+        token_contract = "0x" + token_contract.hex()
+    elif hasattr(token_contract, "hex"):
+        token_contract = "0x" + token_contract.hex()
+    token_contract = str(token_contract).lower()
+
+    decimals = 18
+    for token in config.tokens.values():
+        if token.contract_address.lower() == token_contract:
+            decimals = token.decimals
+            break
+
+    return TransferLog(
+        tx_hash=str(tx_hash),
+        log_index=_hex_or_int(log.get("logIndex"), 0),
+        block_number=_hex_or_int(log.get("blockNumber"), 0),
+        from_address=from_address,
+        to_address=to_address,
+        token_contract=token_contract,
+        amount=Decimal(raw_amount) / Decimal(10**decimals),
+    )
+
+
+def _topic_to_address(topic) -> str:
+    if isinstance(topic, bytes):
+        return "0x" + topic.hex()[-40:]
+    if hasattr(topic, "hex"):
+        return "0x" + topic.hex()[-40:]
+    return "0x" + str(topic)[-40:]
+
+
+def _build_oklink_fetcher(chain: str, config) -> OKLinkTransferLogFetcher:
+    """Build OKLink transfer fetcher for active payment checks."""
+    settings = get_settings()
+    oklink_chain = str(getattr(config, "oklink_chain", "") or "").strip()
+    if not oklink_chain:
+        raise RuntimeError(f"[{chain}] oklink_chain is required for OKLink scanner")
+
+    client = OKLinkExplorerClient(
+        OKLinkClientConfig(
+            base_url=settings.oklink_base_url,
+            api_prefix=settings.oklink_api_prefix,
+            referer=settings.oklink_referer,
+            user_agent=settings.oklink_user_agent,
+            web_key=settings.oklink_web_key.get_secret_value(),
+            transfer_event_signature=get_transfer_event_signature(),
+            page_limit=int(getattr(config, "scanner_page_limit", 0)),
+            request_timeout_seconds=settings.oklink_request_timeout_seconds,
+            request_delay_seconds=(
+                int(getattr(config, "scanner_request_delay_ms", 0)) / 1000
+            ),
+            max_pages_per_address=int(
+                getattr(config, "scanner_max_pages_per_address", 0)
+            ),
+            max_log_pages_per_tx=int(getattr(config, "scanner_max_log_pages_per_tx", 0)),
+            api_key_time_shift_ms=settings.oklink_api_key_time_shift_ms,
+        )
+    )
+    return OKLinkTransferLogFetcher(oklink_chain, client)
 
 
 async def get_or_create_checkpoint(
@@ -67,7 +197,8 @@ async def get_or_create_checkpoint(
 
         logger.info(
             f"[{chain}] Creating new checkpoint at block {start_block} "
-            f"(current={current_block}, oldest invoice age: {age_seconds}s, blocks back: {blocks_back})"
+            f"(current={current_block}, oldest invoice age: {age_seconds}s, "
+            f"blocks back: {blocks_back})"
         )
 
     checkpoint = ChainCheckpoint(
@@ -98,9 +229,30 @@ async def get_active_deposit_addresses(
     Получить все активные deposit адреса для сети.
     Возвращает словарь: address -> PaymentSession
     """
+    now = datetime.now(timezone.utc)
+    active_window = and_(
+        PaymentSession.status.in_(
+            [
+                PaymentSessionStatus.PENDING,
+                PaymentSessionStatus.SEEN_ONCHAIN,
+            ]
+        ),
+        PaymentSession.expires_at > now,
+    )
+    late_window = and_(
+        PaymentSession.status.in_(
+            [
+                PaymentSessionStatus.EXPIRED,
+                PaymentSessionStatus.LATE,
+            ]
+        ),
+        DepositAddress.lease_status == DepositAddressLeaseStatus.COOLDOWN,
+        DepositAddress.cooldown_until > now,
+    )
+
     stmt = (
         select(PaymentSession)
-        .join(Invoice)
+        .join(DepositAddress, PaymentSession.deposit_address_id == DepositAddress.id)
         .options(
             selectinload(PaymentSession.deposit_address),
             selectinload(PaymentSession.invoice),
@@ -108,19 +260,35 @@ async def get_active_deposit_addresses(
         .where(
             and_(
                 PaymentSession.chain == chain,
-                Invoice.status.in_(
-                    [InvoiceStatus.AWAITING_PAYMENT, InvoiceStatus.SEEN_ONCHAIN]
-                ),
-                Invoice.expires_at > datetime.now(timezone.utc),
+                or_(active_window, late_window),
             )
         )
     )
     result = await session.execute(stmt)
     sessions = result.scalars().all()
 
-    return {
-        ps.deposit_address.address.lower(): ps for ps in sessions if ps.deposit_address
-    }
+    address_map: dict[str, PaymentSession] = {}
+    for payment_session in sessions:
+        if not payment_session.deposit_address:
+            continue
+        address = payment_session.deposit_address.address.lower()
+        current = address_map.get(address)
+        if current is None or _session_recency(payment_session) > _session_recency(current):
+            address_map[address] = payment_session
+    return address_map
+
+
+def _session_recency(payment_session: PaymentSession) -> datetime:
+    recency = (
+        payment_session.released_at
+        or payment_session.paid_at
+        or payment_session.chosen_at
+    )
+    if recency is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if recency.tzinfo is None:
+        return recency.replace(tzinfo=timezone.utc)
+    return recency
 
 
 async def poll_chain(chain: str) -> None:
@@ -169,7 +337,8 @@ async def poll_chain(chain: str) -> None:
         from_block = last_scanned + 1
 
         logger.info(
-            f"[{chain}] Scanning blocks {from_block} - {to_block} (active addresses: {len(address_map)})"
+            f"[{chain}] Scanning blocks {from_block} - {to_block} "
+            f"(active addresses: {len(address_map)})"
         )
 
         # Получаем адреса токенов
@@ -178,21 +347,60 @@ async def poll_chain(chain: str) -> None:
             config.tokens["USDC"].contract_address,
         ]
 
-        # ОПТИМИЗАЦИЯ: Получаем ВСЕ Transfer логи за один RPC вызов
-        # вместо N вызовов для каждого адреса
         all_addresses = list(address_map.keys())
+        scanner_provider = str(getattr(config, "scanner_provider", "rpc")).lower()
+        oklink_fetcher = None
 
         try:
-            batch_result = await adapter.get_transfer_logs_batch(
-                from_block=from_block,
-                to_block=to_block,
-                to_addresses=all_addresses,
-                token_contracts=token_contracts,
-            )
-            all_transfers = batch_result.transfers
+            if scanner_provider == "oklink":
+                oklink_fetcher = _build_oklink_fetcher(chain, config)
+                fetch_result = await oklink_fetcher.fetch_transfer_logs(
+                    from_block=from_block,
+                    to_block=to_block,
+                    to_addresses=all_addresses,
+                    token_contracts=token_contracts,
+                )
+                if not fetch_result.is_complete:
+                    logger.warning(
+                        f"[{chain}] OKLink active-check scan incomplete: "
+                        f"failed_address_count={fetch_result.failed_address_count}"
+                    )
+                    await session.rollback()
+                    return
+
+                all_transfers = []
+                for log in fetch_result.logs:
+                    try:
+                        transfer = _parse_transfer_log(chain, log)
+                        if transfer is not None:
+                            all_transfers.append(transfer)
+                    except Exception as e:
+                        logger.warning(f"[{chain}] Failed to parse OKLink log: {e}")
+            elif scanner_provider == "rpc":
+                batch_result = await adapter.get_transfer_logs_batch(
+                    from_block=from_block,
+                    to_block=to_block,
+                    to_addresses=all_addresses,
+                    token_contracts=token_contracts,
+                )
+                all_transfers = batch_result.transfers
+                if not batch_result.is_complete:
+                    logger.warning(
+                        f"[{chain}] RPC active-check scan incomplete: "
+                        f"failed_address_count={batch_result.failed_address_count}"
+                    )
+                    await session.rollback()
+                    return
+            else:
+                raise RuntimeError(
+                    f"[{chain}] Unsupported scanner_provider={scanner_provider}"
+                )
         except Exception as e:
             logger.error(f"[{chain}] Error fetching transfer logs: {e}")
             return
+        finally:
+            if oklink_fetcher is not None:
+                await oklink_fetcher.aclose()
 
         if all_transfers:
             logger.info(
@@ -200,7 +408,8 @@ async def poll_chain(chain: str) -> None:
             )
             for t in all_transfers:
                 logger.debug(
-                    f"[{chain}]   Transfer: to={t.to_address}, amount={t.amount}, token={t.token_contract}"
+                    f"[{chain}]   Transfer: to={t.to_address}, "
+                    f"amount={t.amount}, token={t.token_contract}"
                 )
 
         # Обрабатываем найденные трансферы
@@ -246,7 +455,7 @@ async def poll_chain(chain: str) -> None:
 
                 # Записываем транзакцию
                 payment_service = PaymentService(session)
-                onchain_tx = await payment_service.record_onchain_tx(
+                await payment_service.record_onchain_tx(
                     payment_session=payment_session,
                     tx_hash=transfer.tx_hash,
                     block_number=transfer.block_number,
@@ -255,7 +464,10 @@ async def poll_chain(chain: str) -> None:
                     amount=transfer.amount,
                 )
 
-                # Обновляем статус инвойса на SEEN_ONCHAIN
+                # Обновляем статус payment session и инвойса на SEEN_ONCHAIN
+                if payment_session.status == PaymentSessionStatus.PENDING:
+                    payment_session.status = PaymentSessionStatus.SEEN_ONCHAIN
+
                 if invoice.status == InvoiceStatus.AWAITING_PAYMENT:
                     invoice_service = InvoiceService(session)
                     await invoice_service.update_invoice_status(
@@ -292,7 +504,10 @@ async def update_confirmations(chain: str) -> None:
             .options(
                 selectinload(OnchainTx.payment_session).selectinload(
                     PaymentSession.invoice
-                )
+                ),
+                selectinload(OnchainTx.payment_session).selectinload(
+                    PaymentSession.deposit_address
+                ),
             )
             .where(
                 and_(
@@ -325,12 +540,31 @@ async def update_confirmations(chain: str) -> None:
                 )
 
                 if is_confirmed:
-                    # Обрабатываем подтверждённый платёж
-                    await payment_service.process_confirmed_payment(
-                        tx.payment_session,
-                        tx.payment_session.invoice,
-                    )
-                    logger.info(f"[{chain}] Transaction {tx.tx_hash} confirmed!")
+                    payment_session = tx.payment_session
+                    invoice = payment_session.invoice
+                    if payment_session.status == PaymentSessionStatus.LATE:
+                        await payment_service.process_late_payment(
+                            payment_session,
+                            invoice,
+                        )
+                        logger.warning(
+                            f"[{chain}] Late transaction {tx.tx_hash} confirmed"
+                        )
+                    elif invoice.status == InvoiceStatus.EXPIRED:
+                        await payment_service.process_late_payment(
+                            payment_session,
+                            invoice,
+                        )
+                        logger.warning(
+                            f"[{chain}] Expired-invoice transaction "
+                            f"{tx.tx_hash} confirmed as late"
+                        )
+                    else:
+                        await payment_service.process_confirmed_payment(
+                            payment_session,
+                            invoice,
+                        )
+                        logger.info(f"[{chain}] Transaction {tx.tx_hash} confirmed!")
                 else:
                     logger.debug(
                         f"[{chain}] Transaction {tx.tx_hash}: "

@@ -16,7 +16,6 @@ from decimal import Decimal
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
 
 try:
     import tomllib  # Python 3.11+
@@ -59,6 +58,13 @@ class ChainConfig:
     address_length: int
     tokens: dict[str, TokenConfig] = field(default_factory=dict)
     treasury_address: str = ""
+    # Deposit scanner configuration
+    scanner_provider: str = "rpc"
+    oklink_chain: str = ""
+    scanner_page_limit: int = 20
+    scanner_max_pages_per_address: int = 5
+    scanner_max_log_pages_per_tx: int = 20
+    scanner_request_delay_ms: int = 200
     # Gas configuration
     is_l2: bool = False
     max_gas_cost_native: float = 0.002  # In native token
@@ -131,7 +137,8 @@ def _get_config_path() -> Path:
 
 def _load_config() -> None:
     """Загрузить конфигурацию из TOML файла."""
-    global _CHAINS_CONFIG, _ALIASES, _TRANSFER_EVENT_SIGNATURE, _MULTICALL3_ADDRESS, _CONFIG_LOADED, _GAS_BUFFER_PERCENT, _MAX_GAS_TOP_UP_RETRIES
+    global _ALIASES, _CHAINS_CONFIG, _CONFIG_LOADED, _GAS_BUFFER_PERCENT
+    global _MAX_GAS_TOP_UP_RETRIES, _MULTICALL3_ADDRESS, _TRANSFER_EVENT_SIGNATURE
     
     if _CONFIG_LOADED:
         return
@@ -196,6 +203,16 @@ def _load_config() -> None:
             explorer_url=chain_data.get("explorer_url", ""),
             address_length=chain_data.get("address_length", 42),
             tokens=tokens,
+            scanner_provider=chain_data.get("scanner_provider", "rpc"),
+            oklink_chain=chain_data.get("oklink_chain", chain_name),
+            scanner_page_limit=chain_data.get("scanner_page_limit", 20),
+            scanner_max_pages_per_address=chain_data.get(
+                "scanner_max_pages_per_address", 5
+            ),
+            scanner_max_log_pages_per_tx=chain_data.get(
+                "scanner_max_log_pages_per_tx", 20
+            ),
+            scanner_request_delay_ms=chain_data.get("scanner_request_delay_ms", 200),
             is_l2=chain_data.get("is_l2", False),
             max_gas_cost_native=chain_data.get("max_gas_cost_native", 0.002),
             gas_multiplier=chain_data.get("gas_multiplier", 1.25),

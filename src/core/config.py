@@ -73,6 +73,15 @@ class Settings(BaseSettings):
     poll_interval_seconds: int = 5
     scan_window_size: int = 2000
 
+    # === OKLink Deposit Scanner ===
+    oklink_base_url: str = ""
+    oklink_api_prefix: str = ""
+    oklink_referer: str = ""
+    oklink_user_agent: str = ""
+    oklink_web_key: SecretStr = Field(default="")
+    oklink_api_key_time_shift_ms: int = 0
+    oklink_request_timeout_seconds: float = 20.0
+
     # === Security / Anti-Phishing ===
     # Минимальная сумма депозита (защита от dust/poison attacks)
     min_deposit_usdt: str = "0.01"  # $0.01 минимум

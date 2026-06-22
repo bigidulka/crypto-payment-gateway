@@ -12,11 +12,8 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.blockchain.chains import get_chain_config
 from src.core.config import get_settings
 from src.core.exceptions import (
-    DuplicateError,
-    InvoiceExpiredError,
     InvoiceNotFoundError,
     ValidationError,
 )
@@ -26,12 +23,13 @@ from src.db.models import (
     InvoiceEvent,
     InvoiceStatus,
     Merchant,
-    OnchainTx,
     OutboxStatus,
     OutboxWebhook,
     PaymentSession,
+    PaymentSessionStatus,
     Webhook,
 )
+from src.services.address_lease_service import AddressLeaseService
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +252,19 @@ class InvoiceService:
             )
 
         invoice.status = InvoiceStatus.EXPIRED
+
+        lease_service = AddressLeaseService(self.session)
+        for payment_session in invoice.payment_sessions:
+            if payment_session.status in (
+                PaymentSessionStatus.PENDING,
+                PaymentSessionStatus.SEEN_ONCHAIN,
+            ):
+                await lease_service.release_to_cooldown(
+                    payment_session,
+                    lease_service.cooldown_until_for_invoice(invoice),
+                    status=PaymentSessionStatus.EXPIRED,
+                    reason="invoice_expired_manual",
+                )
 
         # Событие
         event = InvoiceEvent(
