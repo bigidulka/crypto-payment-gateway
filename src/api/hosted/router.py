@@ -134,10 +134,15 @@ async def select_payment_option(
     chain_config = get_chain_config(payment_session.chain)
     deposit_address = payment_session.deposit_address.address
 
-    # Формируем QR data (EIP-681 формат для ERC20)
+    # Формируем QR data (EIP-681 формат для EVM/native)
     token_config = chain_config.get_token(payment_session.token)
     token_contract_address = token_config.contract_address if token_config else ""
     qr_data = f"ethereum:{deposit_address}@{chain_config.chain_id}"
+    explorer_token_url = (
+        chain_config.get_explorer_address_url(token_contract_address)
+        if token_contract_address
+        else ""
+    )
 
     return PaymentSelectResponse(
         deposit_address=deposit_address,
@@ -148,9 +153,7 @@ async def select_payment_option(
         qr_data=qr_data,
         explorer_address_url=chain_config.get_explorer_address_url(deposit_address),
         token_contract=token_contract_address,
-        explorer_token_url=chain_config.get_explorer_address_url(
-            token_contract_address
-        ),
+        explorer_token_url=explorer_token_url,
     )
 
 

@@ -12,7 +12,12 @@ from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.blockchain.chains import ChainType, get_chain_config, get_token_contract
+from src.blockchain.chains import (
+    NATIVE_TOKEN_CONTRACT,
+    ChainType,
+    get_chain_config,
+    get_token_contract,
+)
 from src.core.config import get_settings
 from src.core.exceptions import (
     InvoiceExpiredError,
@@ -143,12 +148,15 @@ class PaymentService:
                 details={"allowed_chains": invoice.allowed_chains},
             )
 
-        # Проверяем, что токен совпадает с asset инвойса
+        # Проверяем, что токен совпадает с asset инвойса и поддерживается сетью
         token = token.upper()
         if token != invoice.asset:
             raise ValidationError(
                 f"Token {token} does not match invoice asset {invoice.asset}",
             )
+        chain_config = get_chain_config(chain)
+        if not chain_config.supports_asset(token):
+            raise ValidationError(f"Asset {token} is not supported on {chain}")
 
         # Проверяем, нет ли уже сессии для этой комбинации
         existing = await self._get_existing_session(invoice.id, chain, token)
@@ -381,8 +389,9 @@ class PaymentService:
             return existing
 
         config = get_chain_config(payment_session.chain)
+        is_native = config.is_native_asset(payment_session.token)
         token_config = config.tokens.get(payment_session.token)
-        decimals = token_config.decimals if token_config else 6
+        decimals = config.get_asset_decimals(payment_session.token)
         deposit_addr = payment_session.deposit_address
 
         sweep_job = UnifiedSweepJob(
@@ -391,7 +400,11 @@ class PaymentService:
             source_id=payment_session.id,
             chain=payment_session.chain,
             token=payment_session.token,
-            token_contract=token_config.contract_address if token_config else "",
+            token_contract=(
+                NATIVE_TOKEN_CONTRACT
+                if is_native
+                else token_config.contract_address if token_config else ""
+            ),
             from_address=deposit_addr.address,
             to_address=self.settings.get_treasury_address(payment_session.chain),
             encrypted_private_key=(
