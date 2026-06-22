@@ -87,8 +87,10 @@ services:
       postgres:
         condition: service_healthy
 
-  # ========== Persistent Deposit Poller (User Wallets) ==========
+  # ========== Legacy Persistent Deposit Poller (disabled by default) ==========
   worker-persistent:
+    profiles:
+      - legacy
     build:
       context: .
       dockerfile: Dockerfile
