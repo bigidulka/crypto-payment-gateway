@@ -42,8 +42,10 @@ class _FakeFetcher:
     def __init__(self, result: _FetchResult):
         self.result = result
         self.closed = False
+        self.calls = []
 
     async def fetch_transfer_logs(self, **kwargs):
+        self.calls.append(kwargs)
         return self.result
 
     async def aclose(self):
@@ -104,7 +106,7 @@ def _patch_common(monkeypatch, session: _Session, adapter: _Adapter, checkpoint)
 
 
 @pytest.mark.asyncio
-async def test_oklink_active_check_scan_advances_checkpoint_without_rpc_fallback(
+async def test_oklink_active_check_scan_ignores_stale_checkpoint(
     monkeypatch,
 ):
     session = _Session()
@@ -121,6 +123,14 @@ async def test_oklink_active_check_scan_advances_checkpoint_without_rpc_fallback
     assert adapter.batch_called is False
     assert fetcher.closed is True
     assert checkpoint == {"block": 150}
+    assert fetcher.calls == [
+        {
+            "from_block": 0,
+            "to_block": 150,
+            "to_addresses": ["0x" + "a" * 40],
+            "token_contracts": ["0x" + "b" * 40, "0x" + "c" * 40],
+        }
+    ]
     assert session.rollback_count == 0
 
 
