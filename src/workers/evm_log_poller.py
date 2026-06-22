@@ -350,6 +350,8 @@ async def poll_chain(chain: str) -> None:
         all_addresses = list(address_map.keys())
         scanner_provider = str(getattr(config, "scanner_provider", "rpc")).lower()
         oklink_fetcher = None
+        scan_complete = True
+        failed_address_count = 0
 
         try:
             if scanner_provider == "oklink":
@@ -361,12 +363,13 @@ async def poll_chain(chain: str) -> None:
                     token_contracts=token_contracts,
                 )
                 if not fetch_result.is_complete:
+                    scan_complete = False
+                    failed_address_count = fetch_result.failed_address_count
                     logger.warning(
-                        f"[{chain}] OKLink active-check scan incomplete: "
+                        f"[{chain}] OKLink active-check scan incomplete; "
+                        f"processing partial results without checkpoint advance: "
                         f"failed_address_count={fetch_result.failed_address_count}"
                     )
-                    await session.rollback()
-                    return
 
                 all_transfers = []
                 for log in fetch_result.logs:
@@ -385,12 +388,13 @@ async def poll_chain(chain: str) -> None:
                 )
                 all_transfers = batch_result.transfers
                 if not batch_result.is_complete:
+                    scan_complete = False
+                    failed_address_count = batch_result.failed_address_count
                     logger.warning(
-                        f"[{chain}] RPC active-check scan incomplete: "
+                        f"[{chain}] RPC active-check scan incomplete; "
+                        f"processing partial results without checkpoint advance: "
                         f"failed_address_count={batch_result.failed_address_count}"
                     )
-                    await session.rollback()
-                    return
             else:
                 raise RuntimeError(
                     f"[{chain}] Unsupported scanner_provider={scanner_provider}"
@@ -487,8 +491,14 @@ async def poll_chain(chain: str) -> None:
             except Exception as e:
                 logger.error(f"[{chain}] Error processing transfer to {to_addr}: {e}")
 
-        # Обновляем checkpoint
-        await update_checkpoint(session, chain, to_block)
+        # Обновляем checkpoint только после полного скана.
+        if scan_complete:
+            await update_checkpoint(session, chain, to_block)
+        else:
+            logger.warning(
+                f"[{chain}] Active-check checkpoint not advanced: "
+                f"failed_address_count={failed_address_count}"
+            )
 
 
 async def update_confirmations(chain: str) -> None:

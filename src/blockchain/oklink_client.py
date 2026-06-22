@@ -310,34 +310,37 @@ class OKLinkExplorerClient:
         for address in sorted(watched_addresses):
             offset = 0
             address_scan_complete = False
-            for _ in range(self.config.max_pages_per_address):
-                transfers = await self.fetch_address_token_transfers(
-                    chain,
-                    address,
-                    offset=offset,
-                    limit=self.config.page_limit,
-                )
-                if not transfers:
-                    address_scan_complete = True
-                    break
+            try:
+                for _ in range(self.config.max_pages_per_address):
+                    transfers = await self.fetch_address_token_transfers(
+                        chain,
+                        address,
+                        offset=offset,
+                        limit=self.config.page_limit,
+                    )
+                    if not transfers:
+                        address_scan_complete = True
+                        break
 
-                reached_older_blocks = False
-                for transfer in transfers:
-                    if transfer.block_number < from_block:
-                        reached_older_blocks = True
-                        continue
-                    if transfer.block_number > to_block:
-                        continue
-                    if _normalize_address(transfer.to_address) != address:
-                        continue
-                    if _normalize_address(transfer.token_contract) not in watched_tokens:
-                        continue
-                    candidate_tx_hashes.add(transfer.tx_hash)
+                    reached_older_blocks = False
+                    for transfer in transfers:
+                        if transfer.block_number < from_block:
+                            reached_older_blocks = True
+                            continue
+                        if transfer.block_number > to_block:
+                            continue
+                        if _normalize_address(transfer.to_address) != address:
+                            continue
+                        if _normalize_address(transfer.token_contract) not in watched_tokens:
+                            continue
+                        candidate_tx_hashes.add(transfer.tx_hash)
 
-                if reached_older_blocks or len(transfers) < self.config.page_limit:
-                    address_scan_complete = True
-                    break
-                offset += self.config.page_limit
+                    if reached_older_blocks or len(transfers) < self.config.page_limit:
+                        address_scan_complete = True
+                        break
+                    offset += self.config.page_limit
+            except OKLinkClientError:
+                address_scan_complete = False
 
             if not address_scan_complete:
                 failed_address_count += 1
@@ -345,7 +348,11 @@ class OKLinkExplorerClient:
         logs: list[dict[str, Any]] = []
         seen_logs: set[tuple[str, int]] = set()
         for tx_hash in sorted(candidate_tx_hashes):
-            tx_logs, tx_logs_complete = await self._fetch_all_transaction_logs(chain, tx_hash)
+            try:
+                tx_logs, tx_logs_complete = await self._fetch_all_transaction_logs(chain, tx_hash)
+            except OKLinkClientError:
+                failed_address_count = max(failed_address_count, 1)
+                continue
             if not tx_logs_complete:
                 failed_address_count = max(failed_address_count, 1)
             for log in tx_logs:

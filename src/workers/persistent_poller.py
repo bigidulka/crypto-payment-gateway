@@ -479,18 +479,9 @@ async def poll_persistent_deposits(
             logger.info(f"[{chain}] Found {len(transfers)} transfers")
 
         if not fetch_is_complete:
-            await session.rollback()
             logger.warning(
-                f"[{chain}] Skipping transfer processing due to incomplete fetch: "
+                f"[{chain}] Processing partial transfer results without checkpoint advance: "
                 f"failed_address_count={failed_address_count}"
-            )
-            return PollPersistentDepositsResult(
-                deposits_found=0,
-                is_complete=False,
-                fetch_is_complete=False,
-                failed_address_count=failed_address_count,
-                record_error_count=0,
-                checkpoint_advanced=False,
             )
 
         # Обрабатываем найденные трансферы
@@ -566,10 +557,18 @@ async def poll_persistent_deposits(
             await session.execute(stmt)
             await session.commit()
             checkpoint_advanced = True
+        elif record_error_count == 0:
+            await session.commit()
+            logger.warning(
+                f"[{chain}] Checkpoint not advanced due to incomplete scan: "
+                f"fetch_is_complete={fetch_is_complete}, "
+                f"failed_address_count={failed_address_count}, "
+                f"record_error_count={record_error_count}"
+            )
         else:
             await session.rollback()
             logger.warning(
-                f"[{chain}] Checkpoint not advanced due to incomplete scan: "
+                f"[{chain}] Changes rolled back due to record errors: "
                 f"fetch_is_complete={fetch_is_complete}, "
                 f"failed_address_count={failed_address_count}, "
                 f"record_error_count={record_error_count}"
