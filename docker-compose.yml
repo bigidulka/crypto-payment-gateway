@@ -87,6 +87,9 @@ services:
       postgres:
         condition: service_healthy
 
+    healthcheck:
+      disable: true
+
   # ========== Legacy Persistent Deposit Poller (disabled by default) ==========
   worker-persistent:
     profiles:
@@ -112,6 +115,9 @@ services:
       postgres:
         condition: service_healthy
 
+    healthcheck:
+      disable: true
+
   # ========== Webhook Dispatcher Worker ==========
   worker-webhook:
     build:
@@ -134,6 +140,9 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+
+    healthcheck:
+      disable: true
 
   # ========== Unified Sweeper Worker (Single sweep queue for all sources) ==========
   worker-sweeper:
@@ -158,6 +167,9 @@ services:
       postgres:
         condition: service_healthy
 
+    healthcheck:
+      disable: true
+
   # ========== Invoice Expirer Worker ==========
   worker-expirer:
     build:
@@ -180,6 +192,9 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+
+    healthcheck:
+      disable: true
 
 volumes:
   arbitron_payment_postgres_data:
