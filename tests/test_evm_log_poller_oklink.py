@@ -142,4 +142,4 @@ async def test_oklink_active_check_incomplete_scan_does_not_advance_checkpoint(
     assert adapter.batch_called is False
     assert fetcher.closed is True
     assert checkpoint == {}
-    assert session.rollback_count == 1
+    assert session.rollback_count == 0
