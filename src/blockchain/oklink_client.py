@@ -130,8 +130,8 @@ class OKLinkExplorerClient:
         if self.config.api_key_time_shift_ms <= 0:
             raise OKLinkClientError("OKLink api_key_time_shift_ms must be positive")
 
-    def _headers(self) -> dict[str, str]:
-        return {
+    def _headers(self, *, has_body: bool = False) -> dict[str, str]:
+        headers = {
             "accept": "application/json",
             "user-agent": self.config.user_agent,
             "referer": self.config.referer,
@@ -140,18 +140,37 @@ class OKLinkExplorerClient:
                 self.config.api_key_time_shift_ms,
             ),
         }
+        if has_body:
+            headers["content-type"] = "application/json"
+        return headers
 
-    async def _request(self, path: str, params: dict[str, str]) -> Any:
+    async def _request(
+        self,
+        path: str,
+        params: dict[str, str],
+        *,
+        method: str = "GET",
+    ) -> Any:
         query = {key: value for key, value in params.items() if value != ""}
         query["t"] = str(int(time.time() * 1000))
         normalized_path = "/" + self.config.api_prefix.strip("/") + "/" + path.lstrip("/")
+        upper_method = method.upper()
 
         try:
-            response = await self._client.get(
-                normalized_path,
-                params=query,
-                headers=self._headers(),
-            )
+            if upper_method == "POST":
+                body = {key: value for key, value in query.items() if key != "t"}
+                response = await self._client.post(
+                    normalized_path,
+                    params={"t": query["t"]},
+                    json=body,
+                    headers=self._headers(has_body=True),
+                )
+            else:
+                response = await self._client.get(
+                    normalized_path,
+                    params=query,
+                    headers=self._headers(),
+                )
             response.raise_for_status()
         except httpx.HTTPError as exc:
             raise OKLinkClientError(f"OKLink request failed: {exc}") from exc
@@ -191,6 +210,7 @@ class OKLinkExplorerClient:
                 "limit": str(page_limit),
                 "address": address,
             },
+            method="POST",
         )
 
         if not isinstance(data, dict):
