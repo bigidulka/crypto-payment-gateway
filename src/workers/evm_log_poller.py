@@ -291,6 +291,24 @@ def _session_recency(payment_session: PaymentSession) -> datetime:
     return recency
 
 
+def _active_invoice_from_block(
+    head_block: int,
+    config,
+    earliest_invoice_time: datetime | None,
+) -> int:
+    """Lower bound for active invoice address scan, independent of checkpoint."""
+    if earliest_invoice_time is None:
+        return max(0, head_block - int(getattr(config, "scan_window", 2000)))
+    if earliest_invoice_time.tzinfo is None:
+        earliest_invoice_time = earliest_invoice_time.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    age_seconds = max(0, int((now - earliest_invoice_time).total_seconds()))
+    age_seconds += 120
+    block_time = max(1, int(getattr(config, "block_time_sec", 1)))
+    blocks_back = int(age_seconds / block_time) + int(getattr(config, "reorg_buffer", 0))
+    return max(0, head_block - blocks_back)
+
+
 async def poll_chain(chain: str) -> None:
     """
     Сканировать блокчейн на предмет Transfer событий.
@@ -315,30 +333,43 @@ async def poll_chain(chain: str) -> None:
         # Используем кэшированный adapter
         adapter = get_evm_adapter(chain)
 
-        # Получаем checkpoint (передаём earliest_invoice_time для правильного начального блока)
-        last_scanned = await get_or_create_checkpoint(
-            session, chain, adapter, earliest_invoice_time
-        )
-
         # Получаем текущий head блок
         head_block = await adapter.get_latest_block_number()
 
         # Вычисляем safe block (с учётом reorg buffer)
         safe_block = head_block - config.reorg_buffer
-
-        if safe_block <= last_scanned:
-            logger.debug(
-                f"[{chain}] No new blocks to scan (last={last_scanned}, safe={safe_block})"
-            )
+        if safe_block <= 0:
             return
 
-        # Ограничиваем окно сканирования
-        to_block = min(safe_block, last_scanned + config.scan_window)
-        from_block = last_scanned + 1
+        scanner_provider = str(getattr(config, "scanner_provider", "rpc")).lower()
+        last_scanned: int | None = None
+
+        if scanner_provider == "oklink":
+            # Invoice-flow сканирует active addresses напрямую. Stale checkpoint
+            # не должен скрывать свежий payment, поэтому lower bound считается
+            # от возраста active invoice, а не от chain_checkpoints.
+            from_block = _active_invoice_from_block(
+                safe_block,
+                config,
+                earliest_invoice_time,
+            )
+            to_block = safe_block
+        else:
+            # Legacy/RPC path остаётся checkpoint-based.
+            last_scanned = await get_or_create_checkpoint(
+                session, chain, adapter, earliest_invoice_time
+            )
+            if safe_block <= last_scanned:
+                logger.debug(
+                    f"[{chain}] No new blocks to scan (last={last_scanned}, safe={safe_block})"
+                )
+                return
+            to_block = min(safe_block, last_scanned + config.scan_window)
+            from_block = last_scanned + 1
 
         logger.info(
             f"[{chain}] Scanning blocks {from_block} - {to_block} "
-            f"(active addresses: {len(address_map)})"
+            f"(active addresses: {len(address_map)}, provider={scanner_provider})"
         )
 
         # Получаем адреса токенов
@@ -348,7 +379,6 @@ async def poll_chain(chain: str) -> None:
         ]
 
         all_addresses = list(address_map.keys())
-        scanner_provider = str(getattr(config, "scanner_provider", "rpc")).lower()
         oklink_fetcher = None
         scan_complete = True
         failed_address_count = 0
