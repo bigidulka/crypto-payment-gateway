@@ -63,6 +63,17 @@ class OKLinkTokenTransfer:
 
 
 @dataclass(frozen=True)
+class OKLinkNativeTransfer:
+    """Address native transaction row from OKLink."""
+
+    tx_hash: str
+    block_number: int
+    from_address: str
+    to_address: str
+    value: Decimal | None
+
+
+@dataclass(frozen=True)
 class OKLinkIncomingScanResult:
     """Incoming transfer scan result before poller adapter conversion."""
 
@@ -221,6 +232,35 @@ class OKLinkExplorerClient:
             raise OKLinkAPIError("OKLink address token-transfer response missing hits")
 
         return [_parse_token_transfer(item) for item in hits if isinstance(item, dict)]
+
+    async def fetch_address_transactions(
+        self,
+        chain: str,
+        address: str,
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> list[OKLinkNativeTransfer]:
+        """Fetch one OKLink native address transaction page for one address."""
+        page_limit = limit or self.config.page_limit
+        path = f"v2/{chain}/addresses/{address}/transactionsByClassfy/condition"
+        data = await self._request(
+            path,
+            {
+                "offset": str(offset),
+                "limit": str(page_limit),
+                "address": address,
+            },
+        )
+
+        if not isinstance(data, dict):
+            raise OKLinkAPIError("OKLink address transaction response must be object")
+
+        hits = data.get("hits")
+        if not isinstance(hits, list):
+            raise OKLinkAPIError("OKLink address transaction response missing hits")
+
+        return [_parse_native_transfer(item) for item in hits if isinstance(item, dict)]
 
     async def fetch_transaction_logs(
         self,
@@ -466,6 +506,16 @@ def _parse_token_transfer(item: dict[str, Any]) -> OKLinkTokenTransfer:
         from_address=str(item.get("from") or ""),
         to_address=str(item.get("to") or ""),
         token_contract=str(item.get("tokenContractAddress") or item.get("address") or ""),
+        value=_decimal_or_none(item.get("value")),
+    )
+
+
+def _parse_native_transfer(item: dict[str, Any]) -> OKLinkNativeTransfer:
+    return OKLinkNativeTransfer(
+        tx_hash=str(item.get("txhash") or item.get("hash") or ""),
+        block_number=_int_value(item.get("blockHeight"), 0),
+        from_address=str(item.get("from") or ""),
+        to_address=str(item.get("to") or ""),
         value=_decimal_or_none(item.get("value")),
     )
 

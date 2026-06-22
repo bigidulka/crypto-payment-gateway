@@ -13,6 +13,7 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import selectinload
 
 from src.blockchain.chains import (
+    NATIVE_TOKEN_CONTRACT,
     get_all_chains,
     get_chain_config,
     get_transfer_event_signature,
@@ -372,13 +373,19 @@ async def poll_chain(chain: str) -> None:
             f"(active addresses: {len(address_map)}, provider={scanner_provider})"
         )
 
-        # Получаем адреса токенов
-        token_contracts = [
-            config.tokens["USDT"].contract_address,
-            config.tokens["USDC"].contract_address,
+        erc20_token_contracts = [
+            token.contract_address for token in config.tokens.values()
         ]
-
-        all_addresses = list(address_map.keys())
+        native_addresses = [
+            address
+            for address, payment_session in address_map.items()
+            if config.is_native_asset(payment_session.token)
+        ]
+        erc20_addresses = [
+            address
+            for address, payment_session in address_map.items()
+            if not config.is_native_asset(payment_session.token)
+        ]
         oklink_fetcher = None
         scan_complete = True
         failed_address_count = 0
@@ -389,8 +396,8 @@ async def poll_chain(chain: str) -> None:
                 fetch_result = await oklink_fetcher.fetch_transfer_logs(
                     from_block=from_block,
                     to_block=to_block,
-                    to_addresses=all_addresses,
-                    token_contracts=token_contracts,
+                    to_addresses=erc20_addresses,
+                    token_contracts=erc20_token_contracts,
                 )
                 if not fetch_result.is_complete:
                     scan_complete = False
@@ -409,12 +416,43 @@ async def poll_chain(chain: str) -> None:
                             all_transfers.append(transfer)
                     except Exception as e:
                         logger.warning(f"[{chain}] Failed to parse OKLink log: {e}")
+
+                for address in native_addresses:
+                    try:
+                        native_transfers = await oklink_fetcher.client.fetch_address_transactions(
+                            oklink_fetcher.chain,
+                            address,
+                        )
+                        for native_transfer in native_transfers:
+                            if native_transfer.block_number < from_block:
+                                continue
+                            if native_transfer.block_number > to_block:
+                                continue
+                            if native_transfer.to_address.lower() != address:
+                                continue
+                            if native_transfer.value is None or native_transfer.value <= 0:
+                                continue
+                            all_transfers.append(
+                                TransferLog(
+                                    tx_hash=native_transfer.tx_hash,
+                                    log_index=-1,
+                                    block_number=native_transfer.block_number,
+                                    from_address=native_transfer.from_address.lower(),
+                                    to_address=native_transfer.to_address.lower(),
+                                    token_contract=NATIVE_TOKEN_CONTRACT,
+                                    amount=native_transfer.value,
+                                )
+                            )
+                    except Exception as e:
+                        scan_complete = False
+                        failed_address_count += 1
+                        logger.warning(f"[{chain}] Failed to fetch native OKLink txs: {e}")
             elif scanner_provider == "rpc":
                 batch_result = await adapter.get_transfer_logs_batch(
                     from_block=from_block,
                     to_block=to_block,
-                    to_addresses=all_addresses,
-                    token_contracts=token_contracts,
+                    to_addresses=erc20_addresses,
+                    token_contracts=erc20_token_contracts,
                 )
                 all_transfers = batch_result.transfers
                 if not batch_result.is_complete:
@@ -454,15 +492,9 @@ async def poll_chain(chain: str) -> None:
                 continue
 
             try:
-                # Проверяем токен (кэшируем expected_token для сессии)
-                expected_token_addr = config.get_token(payment_session.token)
-                if expected_token_addr is None:
-                    continue
-
-                if (
-                    transfer.token_contract.lower()
-                    != expected_token_addr.contract_address.lower()
-                ):
+                # Проверяем asset: ERC20 contract или native marker
+                expected_token_contract = config.get_asset_contract(payment_session.token)
+                if transfer.token_contract.lower() != expected_token_contract.lower():
                     continue
 
                 # Проверяем сумму (с учётом разной точности Decimal)

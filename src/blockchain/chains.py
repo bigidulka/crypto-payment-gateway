@@ -80,6 +80,32 @@ class ChainConfig:
         """Получить конфигурацию токена по символу."""
         return self.tokens.get(symbol.upper())
 
+    def is_native_asset(self, symbol: str) -> bool:
+        """Проверить, является ли asset нативной монетой сети."""
+        return symbol.upper() == self.native_symbol.upper()
+
+    def supports_asset(self, symbol: str) -> bool:
+        """Проверить поддержку asset как ERC20 token или native coin."""
+        return self.is_native_asset(symbol) or self.get_token(symbol) is not None
+
+    def get_asset_decimals(self, symbol: str) -> int:
+        """Получить decimals для ERC20 token или native coin."""
+        if self.is_native_asset(symbol):
+            return self.native_decimals
+        token = self.get_token(symbol)
+        if token is None:
+            raise ValueError(f"Asset {symbol} not supported on chain")
+        return token.decimals
+
+    def get_asset_contract(self, symbol: str) -> str:
+        """Получить token contract или zero-address marker для native asset."""
+        if self.is_native_asset(symbol):
+            return NATIVE_TOKEN_CONTRACT
+        token = self.get_token(symbol)
+        if token is None:
+            raise ValueError(f"Asset {symbol} not supported on chain")
+        return token.contract_address
+
     def get_explorer_tx_url(self, tx_hash: str) -> str:
         """Получить URL транзакции в эксплорере."""
         if self.chain_type == ChainType.SOLANA:
@@ -98,6 +124,9 @@ class ChainConfig:
     def is_evm(self) -> bool:
         """Проверить, является ли сеть EVM-совместимой."""
         return self.chain_type == ChainType.EVM
+
+
+NATIVE_TOKEN_CONTRACT = "0x0000000000000000000000000000000000000000"
 
 
 # Global config storage
@@ -331,30 +360,25 @@ def is_evm_chain(chain: str) -> bool:
 
 
 def get_all_tokens() -> list[str]:
-    """Получить список всех поддерживаемых токенов."""
+    """Получить список всех поддерживаемых ERC20/native assets."""
     _load_config()
     tokens = set()
     for chain_config in _CHAINS_CONFIG.values():
         tokens.update(chain_config.tokens.keys())
+        tokens.add(chain_config.native_symbol.upper())
     return sorted(tokens)
 
 
 def get_token_contract(chain: str, token: str) -> str:
-    """Получить адрес контракта токена для сети."""
+    """Получить адрес контракта токена или native zero-address marker."""
     chain_config = get_chain_config(chain)
-    token_config = chain_config.get_token(token)
-    if not token_config:
-        raise ValueError(f"Token {token} not supported on {chain}")
-    return token_config.contract_address
+    return chain_config.get_asset_contract(token)
 
 
 def get_token_decimals(chain: str, token: str) -> int:
-    """Получить количество decimals токена."""
+    """Получить количество decimals ERC20 token или native asset."""
     chain_config = get_chain_config(chain)
-    token_config = chain_config.get_token(token)
-    if not token_config:
-        raise ValueError(f"Token {token} not supported on {chain}")
-    return token_config.decimals
+    return chain_config.get_asset_decimals(token)
 
 
 def parse_token_amount(amount: int | str, chain: str, token: str) -> Decimal:

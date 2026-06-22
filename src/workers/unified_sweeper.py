@@ -24,7 +24,7 @@ from typing import Optional
 from sqlalchemy import select, and_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.blockchain.chains import get_chain_config, get_evm_chains
+from src.blockchain.chains import NATIVE_TOKEN_CONTRACT, get_chain_config, get_evm_chains
 from src.blockchain.evm_adapter import get_evm_adapter, EvmAdapter
 from src.core.config import get_settings
 from src.crypto.encryption import decrypt_private_key
@@ -256,6 +256,10 @@ class UnifiedBatchSweeper:
             )
             return SweepResult(job_id=str(job.id), success=True)
         
+        is_native_job = job.token_contract.lower() == NATIVE_TOKEN_CONTRACT.lower()
+        if is_native_job:
+            return await self._process_native_job(adapter, config, job, dry_run)
+
         # === State Machine ===
         
         if job.state == SweepState.PENDING_GAS:
@@ -412,6 +416,9 @@ class UnifiedBatchSweeper:
                 
                 privkey = decrypt_private_key(encrypted_data, self.encryption_key)
                 
+                if is_native_job:
+                    return await self._sweep_native_job(adapter, config, job, privkey)
+
                 # Получаем актуальный баланс
                 actual_balance = await adapter.get_erc20_balance_raw(
                     job.from_address, job.token_contract
@@ -502,6 +509,119 @@ class UnifiedBatchSweeper:
                 )
         
         return SweepResult(job_id=str(job.id), success=False, error="Unknown state")
+
+    async def _process_native_job(
+        self,
+        adapter: EvmAdapter,
+        config,
+        job: UnifiedSweepJob,
+        dry_run: bool,
+    ) -> SweepResult:
+        """Process native coin sweep with gas top-up from funder when needed."""
+        if dry_run:
+            return SweepResult(job_id=str(job.id), success=True)
+
+        if job.state in (SweepState.PENDING_GAS, SweepState.FUNDING):
+            if job.state == SweepState.FUNDING and job.gas_tx_hash:
+                receipt = await adapter.get_transaction_receipt(job.gas_tx_hash)
+                if not receipt or receipt.get("status") != 1:
+                    return SweepResult(job_id=str(job.id), success=False, error="Gas pending")
+
+            native_wei = await adapter.get_native_balance_wei(job.from_address)
+            required_gas = await self._estimate_native_transfer_gas_wei(adapter, config)
+            target_amount = int(Decimal(job.amount_raw or "0"))
+            target_balance = target_amount + required_gas
+            job.estimated_gas_wei = str(required_gas)
+
+            if native_wei >= target_balance:
+                job.needs_gas_funding = False
+                job.state = SweepState.SWEEPING
+                logger.info(
+                    f"[{job.chain}] Job {job.id}: native balance enough for sweep "
+                    f"({Decimal(native_wei)/Decimal(10**18):.8f} {config.native_symbol})"
+                )
+            else:
+                gas_to_send = int((target_balance - native_wei) * 1.05)
+                tx_hash = await adapter.send_native_transfer(
+                    self.funder_key,
+                    job.from_address,
+                    gas_to_send,
+                )
+                if tx_hash is None:
+                    await self._mark_job_failed(job, "Native gas funding failed")
+                    return SweepResult(job_id=str(job.id), success=False, error="Native gas funding failed")
+                job.gas_tx_hash = tx_hash
+                job.state = SweepState.FUNDING
+                job.needs_gas_funding = True
+                gas_human = Decimal(gas_to_send) / Decimal(10**18)
+                logger.info(
+                    f"[{job.chain}] Job {job.id}: native gas sent "
+                    f"({gas_human:.8f} {config.native_symbol}), tx={tx_hash[:16]}..."
+                )
+                await asyncio.sleep(3)
+                return SweepResult(job_id=str(job.id), success=False, error="Native gas funding sent")
+
+        if job.state == SweepState.SWEEPING:
+            encrypted_data = job.encrypted_private_key
+            if isinstance(encrypted_data, str):
+                try:
+                    encrypted_data = bytes.fromhex(encrypted_data)
+                except ValueError:
+                    encrypted_data = encrypted_data.encode()
+            privkey = decrypt_private_key(encrypted_data, self.encryption_key)
+            return await self._sweep_native_job(adapter, config, job, privkey)
+
+        return SweepResult(job_id=str(job.id), success=False, error="Unknown native state")
+
+    async def _estimate_native_transfer_gas_wei(self, adapter: EvmAdapter, config) -> int:
+        """Estimate native transfer gas cost with buffer."""
+        gas_limit = 65000 if config.is_l2 else 21000
+        fee_params = await adapter.get_fee_params()
+        if fee_params.is_eip1559:
+            gas_price = int((fee_params.max_fee_per_gas or 0) * 1.2)
+        else:
+            gas_price = int((fee_params.gas_price or 0) * config.gas_multiplier)
+        return int(gas_limit * gas_price * 1.1)
+
+    async def _sweep_native_job(
+        self,
+        adapter: EvmAdapter,
+        config,
+        job: UnifiedSweepJob,
+        privkey: str,
+    ) -> SweepResult:
+        """Sweep native invoice amount, leaving funded gas reserve."""
+        native_wei = await adapter.get_native_balance_wei(job.from_address)
+        required_gas = await self._estimate_native_transfer_gas_wei(adapter, config)
+        amount_to_send = int(Decimal(job.amount_raw or "0"))
+
+        if native_wei < amount_to_send + required_gas:
+            job.state = SweepState.PENDING_GAS
+            return SweepResult(
+                job_id=str(job.id),
+                success=False,
+                error="Native balance is below amount plus sweep gas cost",
+            )
+
+        tx_hash = await adapter.send_native_transfer(
+            from_private_key=privkey,
+            to_address=job.to_address,
+            amount_wei=amount_to_send,
+        )
+        if not tx_hash:
+            job.state = SweepState.PENDING_GAS
+            job.attempts += 1
+            return SweepResult(job_id=str(job.id), success=False, error="Native sweep tx failed")
+
+        job.sweep_tx_hash = tx_hash
+        job.state = SweepState.COMPLETED
+        job.completed_at = datetime.now(timezone.utc)
+        swept_amount = Decimal(amount_to_send) / Decimal(10 ** config.native_decimals)
+        logger.info(
+            f"[{job.chain}] Swept {swept_amount} {job.token} "
+            f"from {job.from_address[:10]}... tx={tx_hash[:16]}..."
+        )
+        return SweepResult(job_id=str(job.id), success=True, tx_hash=tx_hash)
 
     async def _mark_job_failed(
         self,

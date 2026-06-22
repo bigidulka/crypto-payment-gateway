@@ -53,6 +53,16 @@ class _FakeFetcher:
 
 
 def _chain_config():
+    tokens = {
+        "USDT": SimpleNamespace(
+            contract_address="0x" + "b" * 40,
+            decimals=18,
+        ),
+        "USDC": SimpleNamespace(
+            contract_address="0x" + "c" * 40,
+            decimals=18,
+        ),
+    }
     return SimpleNamespace(
         scanner_provider="oklink",
         oklink_chain="bsc",
@@ -63,21 +73,20 @@ def _chain_config():
         reorg_buffer=0,
         scan_window=100,
         block_time_sec=2,
-        tokens={
-            "USDT": SimpleNamespace(
-                contract_address="0x" + "b" * 40,
-                decimals=18,
-            ),
-            "USDC": SimpleNamespace(
-                contract_address="0x" + "c" * 40,
-                decimals=18,
-            ),
-        },
+        native_symbol="BNB",
+        tokens=tokens,
+        is_native_asset=lambda symbol: symbol.upper() == "BNB",
+        get_asset_contract=lambda symbol: (
+            "0x0000000000000000000000000000000000000000"
+            if symbol.upper() == "BNB"
+            else tokens[symbol.upper()].contract_address
+        ),
     )
 
 
-def _payment_session():
+def _payment_session(token: str = "USDT"):
     return SimpleNamespace(
+        token=token,
         invoice=SimpleNamespace(created_at=datetime(2026, 1, 1, tzinfo=UTC)),
         deposit_address=SimpleNamespace(address="0x" + "a" * 40),
     )

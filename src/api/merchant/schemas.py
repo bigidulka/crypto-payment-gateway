@@ -4,12 +4,12 @@ Pydantic схемы для Merchant API.
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from src.blockchain.chains import get_all_chains, get_all_tokens
+from src.blockchain.chains import get_all_chains, get_all_tokens, get_chain_config
 
 
 # === Invoice Schemas ===
@@ -24,9 +24,9 @@ class InvoiceCreateRequest(BaseModel):
         description="Сумма платежа в USDT/USDC",
         examples=["100.50"],
     )
-    asset: Literal["USDT", "USDC"] = Field(
+    asset: str = Field(
         ...,
-        description="Актив для оплаты",
+        description="Актив для оплаты (USDT/USDC или native asset сети)",
     )
     allowed_chains: list[str] = Field(
         default_factory=lambda: get_all_chains(),
@@ -45,6 +45,16 @@ class InvoiceCreateRequest(BaseModel):
         examples=[{"order_id": "ORD-12345", "comment": "Payment for order"}],
     )
 
+    @field_validator("asset")
+    @classmethod
+    def normalize_asset(cls, v: str) -> str:
+        asset = v.upper().strip()
+        if not asset:
+            raise ValueError("Asset is required")
+        if asset not in get_all_tokens():
+            raise ValueError(f"Invalid asset: {asset}. Supported: {get_all_tokens()}")
+        return asset
+
     @field_validator("allowed_chains")
     @classmethod
     def validate_chains(cls, v: list[str]) -> list[str]:
@@ -53,6 +63,17 @@ class InvoiceCreateRequest(BaseModel):
             if chain.lower() not in valid_chains:
                 raise ValueError(f"Invalid chain: {chain}. Supported: {valid_chains}")
         return [c.lower() for c in v]
+
+    @model_validator(mode="after")
+    def validate_asset_supported_on_chains(self) -> "InvoiceCreateRequest":
+        invalid = [
+            chain
+            for chain in self.allowed_chains
+            if not get_chain_config(chain).supports_asset(self.asset)
+        ]
+        if invalid:
+            raise ValueError(f"Asset {self.asset} is not supported on chains: {invalid}")
+        return self
 
 
 class PaymentInfo(BaseModel):
