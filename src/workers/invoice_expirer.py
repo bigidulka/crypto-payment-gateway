@@ -11,8 +11,16 @@ from datetime import datetime, timezone
 from sqlalchemy import and_, select
 from sqlalchemy.orm import selectinload
 
-from src.db.models import Invoice, InvoiceStatus, OutboxStatus, OutboxWebhook, Webhook
+from src.db.models import (
+    Invoice,
+    InvoiceStatus,
+    OutboxStatus,
+    OutboxWebhook,
+    PaymentSessionStatus,
+    Webhook,
+)
 from src.db.session import get_session_context
+from src.services.address_lease_service import AddressLeaseService
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +50,10 @@ async def expire_overdue_invoices() -> int:
         # Находим invoices с истёкшим expires_at
         stmt = (
             select(Invoice)
-            .options(selectinload(Invoice.merchant))
+            .options(
+                selectinload(Invoice.merchant),
+                selectinload(Invoice.payment_sessions),
+            )
             .where(
                 and_(
                     Invoice.status.in_(
@@ -60,10 +71,24 @@ async def expire_overdue_invoices() -> int:
         result = await session.execute(stmt)
         invoices = result.scalars().all()
 
+        lease_service = AddressLeaseService(session)
+
         for invoice in invoices:
             logger.info(f"Expiring invoice {invoice.public_id}")
 
             invoice.status = InvoiceStatus.EXPIRED
+
+            for payment_session in invoice.payment_sessions:
+                if payment_session.status in (
+                    PaymentSessionStatus.PENDING,
+                    PaymentSessionStatus.SEEN_ONCHAIN,
+                ):
+                    await lease_service.release_to_cooldown(
+                        payment_session,
+                        lease_service.cooldown_until_for_invoice(invoice),
+                        status=PaymentSessionStatus.EXPIRED,
+                        reason="invoice_expired",
+                    )
 
             # Найти активный webhook для мерчанта с подпиской на invoice.expired
             webhook_stmt = select(Webhook).where(

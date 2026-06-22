@@ -15,29 +15,40 @@ Persistent Deposit Poller Worker.
 import asyncio
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import and_, select, update
 from sqlalchemy.orm import selectinload
 
-from src.blockchain.chains import get_all_chains, get_chain_config, get_evm_chains
-from src.blockchain.evm_adapter import get_evm_adapter, close_all_adapters
+from src.blockchain.chains import (
+    get_all_chains,
+    get_chain_config,
+    get_evm_chains,
+    get_transfer_event_signature,
+)
+from src.blockchain.evm_adapter import close_all_adapters, get_evm_adapter
+from src.blockchain.oklink_client import (
+    OKLinkClientConfig,
+    OKLinkExplorerClient,
+    OKLinkTransferLogFetcher,
+)
 from src.blockchain.resilient_fetcher import (
     ResilientLogFetcher,
+    close_resilient_fetchers,
     get_resilient_fetcher,
     init_resilient_fetchers,
-    close_resilient_fetchers,
 )
-from src.blockchain.rpc_manager import RpcManager, RpcEndpoint, RpcManagerConfig
+from src.blockchain.rpc_manager import RpcEndpoint, RpcManager, RpcManagerConfig
 from src.core.config import get_settings
 from src.db.models import (
     Deposit,
     DepositStatus,
     OutboxStatus,
     OutboxWebhook,
-    SweepState,
     SweepSource,
+    SweepState,
     UnifiedSweepJob,
     UserWallet,
     WalletAddress,
@@ -159,8 +170,6 @@ async def create_unified_sweep_job(session, deposit: Deposit) -> UnifiedSweepJob
 
 # === Transfer Log Parsing ===
 
-from dataclasses import dataclass
-
 
 @dataclass
 class TransferLog:
@@ -266,6 +275,36 @@ def _parse_transfer_log(chain: str, log: dict) -> TransferLog | None:
 # === Main Polling Functions ===
 
 
+def _build_oklink_fetcher(chain: str, config) -> OKLinkTransferLogFetcher:
+    """Build OKLink transfer fetcher for a configured chain."""
+    settings = get_settings()
+    oklink_chain = str(getattr(config, "oklink_chain", "") or "").strip()
+    if not oklink_chain:
+        raise RuntimeError(f"[{chain}] oklink_chain is required for OKLink scanner")
+
+    client = OKLinkExplorerClient(
+        OKLinkClientConfig(
+            base_url=settings.oklink_base_url,
+            api_prefix=settings.oklink_api_prefix,
+            referer=settings.oklink_referer,
+            user_agent=settings.oklink_user_agent,
+            web_key=settings.oklink_web_key.get_secret_value(),
+            transfer_event_signature=get_transfer_event_signature(),
+            page_limit=int(getattr(config, "scanner_page_limit", 0)),
+            request_timeout_seconds=settings.oklink_request_timeout_seconds,
+            request_delay_seconds=(
+                int(getattr(config, "scanner_request_delay_ms", 0)) / 1000
+            ),
+            max_pages_per_address=int(
+                getattr(config, "scanner_max_pages_per_address", 0)
+            ),
+            max_log_pages_per_tx=int(getattr(config, "scanner_max_log_pages_per_tx", 0)),
+            api_key_time_shift_ms=settings.oklink_api_key_time_shift_ms,
+        )
+    )
+    return OKLinkTransferLogFetcher(oklink_chain, client)
+
+
 async def poll_persistent_deposits(
     chain: str,
     *,
@@ -351,13 +390,24 @@ async def poll_persistent_deposits(
             config.tokens["USDC"].contract_address,
         ]
 
+        oklink_fetcher = None
         try:
-            # Используем ResilientLogFetcher для получения логов
-            fetcher = fetcher_override or get_resilient_fetcher(chain)
+            scanner_provider = str(getattr(config, "scanner_provider", "rpc")).lower()
             all_addresses = list(address_map.keys())
 
-            if fetcher:
-                # Используем resilient fetcher с OR Topics + fallback
+            if fetcher_override is not None:
+                fetcher = fetcher_override
+            elif scanner_provider == "oklink":
+                oklink_fetcher = _build_oklink_fetcher(chain, config)
+                fetcher = oklink_fetcher
+            elif scanner_provider == "rpc":
+                fetcher = get_resilient_fetcher(chain)
+            else:
+                raise RuntimeError(
+                    f"[{chain}] Unsupported scanner_provider={scanner_provider}"
+                )
+
+            if fetcher is not None:
                 result = await fetcher.fetch_transfer_logs(
                     from_block=from_block,
                     to_block=to_block,
@@ -376,7 +426,8 @@ async def poll_persistent_deposits(
 
                 if not fetch_is_complete:
                     logger.warning(
-                        f"[{chain}] Partial fetch detected: failed_address_count={failed_address_count}"
+                        f"[{chain}] Partial fetch detected: "
+                        f"failed_address_count={failed_address_count}"
                     )
 
                 # Парсим логи в TransferLog
@@ -388,8 +439,8 @@ async def poll_persistent_deposits(
                             transfers.append(transfer)
                     except Exception as e:
                         logger.warning(f"[{chain}] Failed to parse log: {e}")
-            else:
-                # Fallback на старый метод через adapter
+            elif scanner_provider == "rpc":
+                # Fallback на старый метод через adapter только для RPC provider.
                 logger.warning(
                     f"[{chain}] ResilientLogFetcher not available, using adapter"
                 )
@@ -408,6 +459,8 @@ async def poll_persistent_deposits(
                         f"[{chain}] Partial adapter fetch detected: "
                         f"failed_address_count={failed_address_count}"
                     )
+            else:
+                raise RuntimeError(f"[{chain}] OKLink scanner is not initialized")
         except Exception as e:
             logger.error(f"[{chain}] Error fetching transfer logs: {e}")
             return PollPersistentDepositsResult(
@@ -418,6 +471,9 @@ async def poll_persistent_deposits(
                 record_error_count=0,
                 checkpoint_advanced=False,
             )
+        finally:
+            if oklink_fetcher is not None:
+                await oklink_fetcher.aclose()
 
         if transfers:
             logger.info(f"[{chain}] Found {len(transfers)} transfers")
@@ -536,7 +592,6 @@ async def update_deposit_confirmations(chain: str) -> int:
     Returns:
         Количество подтверждённых депозитов
     """
-    config = get_chain_config(chain)
     confirmed_count = 0
 
     async with get_session_context() as session:

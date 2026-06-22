@@ -3,10 +3,12 @@ Database модуль.
 """
 
 from src.db.models import (
+    AddressLeaseEvent,
     ApiKey,
     Base,
     ChainCheckpoint,
     DepositAddress,
+    DepositAddressLeaseStatus,
     Invoice,
     InvoiceEvent,
     InvoiceStatus,
@@ -15,6 +17,7 @@ from src.db.models import (
     OutboxStatus,
     OutboxWebhook,
     PaymentSession,
+    PaymentSessionStatus,
     SweepSource,
     SweepState,
     TxStatus,
@@ -47,7 +50,10 @@ __all__ = [
     "InvoiceEvent",
     "InvoiceStatus",
     "DepositAddress",
+    "DepositAddressLeaseStatus",
     "PaymentSession",
+    "PaymentSessionStatus",
+    "AddressLeaseEvent",
     "OnchainTx",
     "TxStatus",
     "UnifiedSweepJob",

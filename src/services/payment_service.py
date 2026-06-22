@@ -8,11 +8,11 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.blockchain.chains import get_chain_config, get_token_contract, ChainType
+from src.blockchain.chains import ChainType, get_chain_config, get_token_contract
 from src.core.config import get_settings
 from src.core.exceptions import (
     InvoiceExpiredError,
@@ -27,11 +27,13 @@ from src.db.models import (
     InvoiceStatus,
     OnchainTx,
     PaymentSession,
-    UnifiedSweepJob,
+    PaymentSessionStatus,
     SweepSource,
     SweepState,
     TxStatus,
+    UnifiedSweepJob,
 )
+from src.services.address_lease_service import AddressLeaseService
 from src.services.invoice_service import InvoiceService
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,7 @@ class PaymentService:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
         self.settings = get_settings()
+        self.address_leases = AddressLeaseService(session)
         self._hd_wallets: dict[str, Any] = {}  # chain_group -> wallet
 
     def _get_hd_wallet(self, chain_group: str = "evm") -> Any:
@@ -155,21 +158,30 @@ class PaymentService:
         # Определяем chain_group для выбранной сети
         chain_group = self._get_chain_group(chain)
 
-        # Получаем или создаём deposit address для этой группы
-        deposit_address = await self._get_or_create_deposit_address(chain_group)
+        # Получаем lease на deposit address для этой группы
+        session_id = uuid.uuid4()
+        deposit_address = await self._acquire_deposit_address_lease(
+            chain_group,
+            invoice.expires_at,
+        )
 
         # Создаём payment session
         session = PaymentSession(
-            id=uuid.uuid4(),
+            id=session_id,
             invoice_id=invoice.id,
             chain=chain,
             token=token,
             deposit_address_id=deposit_address.id,
+            status=PaymentSessionStatus.PENDING,
+            expires_at=invoice.expires_at,
         )
         self.session.add(session)
-
-        # Помечаем адрес как используемый
-        deposit_address.is_used = True
+        await self.session.flush()
+        await self.address_leases.bind_payment_session(
+            deposit_address,
+            session.id,
+            reason="payment_session_created",
+        )
 
         # Обновляем статус инвойса
         if invoice.status == InvoiceStatus.CREATED:
@@ -313,16 +325,66 @@ class PaymentService:
             },
         )
 
-        # Создаём UnifiedSweepJob для invoice
-        from src.blockchain.chains import get_chain_config
-        
+        sweep_job = await self._create_invoice_sweep_job(
+            payment_session,
+            invoice,
+            priority=50 if invoice.amount >= 100 else 10,
+        )
+        await self.address_leases.release_to_cooldown(
+            payment_session,
+            self.address_leases.cooldown_until_for_invoice(invoice),
+            status=PaymentSessionStatus.PAID,
+            reason="invoice_confirmed",
+        )
+        await self.session.commit()
+
+        logger.info(f"Invoice {invoice.id} confirmed, created sweep job {sweep_job.id}")
+
+    async def process_late_payment(
+        self,
+        payment_session: PaymentSession,
+        invoice: Invoice,
+    ) -> None:
+        """
+        Обработать подтверждённый late payment.
+        Инвойс не подтверждается, средства ставятся в sweep для ручной сверки.
+        """
+        if payment_session.status != PaymentSessionStatus.LATE:
+            await self.address_leases.mark_late_deposit(
+                payment_session,
+                reason="late_payment_confirmed",
+            )
+        if payment_session.paid_at is None:
+            payment_session.paid_at = datetime.now(timezone.utc)
+
+        sweep_job = await self._create_invoice_sweep_job(
+            payment_session,
+            invoice,
+            priority=0,
+        )
+        await self.session.commit()
+
+        logger.warning(
+            f"Late payment for expired invoice {invoice.id}; "
+            f"session={payment_session.id}, sweep_job={sweep_job.id}"
+        )
+
+    async def _create_invoice_sweep_job(
+        self,
+        payment_session: PaymentSession,
+        invoice: Invoice,
+        *,
+        priority: int,
+    ) -> UnifiedSweepJob:
+        existing = await self._get_invoice_sweep_job(payment_session.id)
+        if existing is not None:
+            return existing
+
         config = get_chain_config(payment_session.chain)
         token_config = config.tokens.get(payment_session.token)
         decimals = token_config.decimals if token_config else 6
-        
-        # Получаем deposit address
         deposit_addr = payment_session.deposit_address
-        
+
         sweep_job = UnifiedSweepJob(
             id=uuid.uuid4(),
             source=SweepSource.INVOICE,
@@ -332,16 +394,31 @@ class PaymentService:
             token_contract=token_config.contract_address if token_config else "",
             from_address=deposit_addr.address,
             to_address=self.settings.get_treasury_address(payment_session.chain),
-            encrypted_private_key=deposit_addr.encrypted_privkey.hex() if isinstance(deposit_addr.encrypted_privkey, bytes) else deposit_addr.encrypted_privkey,
+            encrypted_private_key=(
+                deposit_addr.encrypted_privkey.hex()
+                if isinstance(deposit_addr.encrypted_privkey, bytes)
+                else deposit_addr.encrypted_privkey
+            ),
             amount=invoice.amount,
-            amount_raw=str(int(invoice.amount * (10 ** decimals))),
+            amount_raw=str(int(invoice.amount * (10**decimals))),
             state=SweepState.PENDING_GAS,
-            priority=50 if invoice.amount >= 100 else 10,
+            priority=priority,
         )
         self.session.add(sweep_job)
-        await self.session.commit()
+        return sweep_job
 
-        logger.info(f"Invoice {invoice.id} confirmed, created sweep job {sweep_job.id}")
+    async def _get_invoice_sweep_job(
+        self,
+        payment_session_id: uuid.UUID,
+    ) -> UnifiedSweepJob | None:
+        stmt = select(UnifiedSweepJob).where(
+            and_(
+                UnifiedSweepJob.source == SweepSource.INVOICE,
+                UnifiedSweepJob.source_id == payment_session_id,
+            )
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
 
     async def _get_existing_session(
         self,
@@ -364,37 +441,34 @@ class PaymentService:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
-    async def _get_or_create_deposit_address(
-        self, chain_group: str = "evm"
+    async def _acquire_deposit_address_lease(
+        self,
+        chain_group: str,
+        leased_until: datetime,
     ) -> DepositAddress:
         """
-        Получить свободный или создать новый deposit address.
-        Использует SELECT FOR UPDATE для предотвращения race condition.
-
-        Args:
-            chain_group: 'evm' | 'solana' | 'ton'
+        Получить lease на свободный или новый deposit address.
+        Использует SELECT FOR UPDATE SKIP LOCKED внутри AddressLeaseService.
         """
-        # Сначала пробуем найти неиспользуемый адрес с блокировкой
-        stmt = (
-            select(DepositAddress)
-            .where(
-                and_(
-                    DepositAddress.chain_group == chain_group,
-                    DepositAddress.is_used == False,  # noqa: E712
-                )
-            )
-            .with_for_update(skip_locked=True)  # Пропустить заблокированные записи
-            .limit(1)
+        address = await self.address_leases.acquire_available_address(
+            chain_group,
+            leased_until,
         )
-        result = await self.session.execute(stmt)
-        address = result.scalar_one_or_none()
-
         if address:
-            logger.info(f"Reusing existing deposit address {address.address}")
+            logger.info(f"Leased existing deposit address {address.address}")
             return address
 
-        # Создаём новый адрес с блокировкой на max index
-        return await self._create_new_deposit_address(chain_group)
+        for _ in range(2):
+            created = await self._create_new_deposit_address(chain_group)
+            leased = await self.address_leases.acquire_address_by_id(
+                created.id,
+                leased_until,
+            )
+            if leased is not None:
+                logger.info(f"Leased new deposit address {leased.address}")
+                return leased
+
+        raise PaymentError("Unable to acquire deposit address lease")
 
     async def _create_new_deposit_address(
         self, chain_group: str = "evm"
@@ -492,22 +566,4 @@ class PaymentService:
         Получить все активные payment sessions для сети.
         Активные = инвойс не истёк и не подтверждён.
         """
-        stmt = (
-            select(PaymentSession)
-            .join(Invoice)
-            .options(
-                selectinload(PaymentSession.deposit_address),
-                selectinload(PaymentSession.invoice),
-            )
-            .where(
-                and_(
-                    PaymentSession.chain == chain,
-                    Invoice.status.in_(
-                        [InvoiceStatus.AWAITING_PAYMENT, InvoiceStatus.SEEN_ONCHAIN]
-                    ),
-                    Invoice.expires_at > datetime.now(timezone.utc),
-                )
-            )
-        )
-        result = await self.session.execute(stmt)
-        return list(result.scalars().all())
+        return await self.address_leases.get_active_sessions_for_chain(chain)

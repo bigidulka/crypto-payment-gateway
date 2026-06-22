@@ -17,19 +17,26 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
+    Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.db.models.base import (
     Base,
-    TimestampMixin,
-    UUIDMixin,
     UniversalBytes,
+    UniversalJSON,
     UniversalUUID,
+    UUIDMixin,
 )
-from src.db.models.enums import TxStatus, enum_values
+from src.db.models.enums import (
+    DepositAddressLeaseStatus,
+    PaymentSessionStatus,
+    TxStatus,
+    enum_values,
+)
 
 if TYPE_CHECKING:
     from src.db.models.invoice import Invoice
@@ -59,8 +66,37 @@ class DepositAddress(Base, UUIDMixin):
     derivation_path: Mapped[str] = mapped_column(String(50), nullable=False)
     derivation_index: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
 
-    # Флаг использования (занят ли текущим активным инвойсом)
+    # Legacy флаг использования. Новая логика использует lease_status.
     is_used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    lease_status: Mapped[DepositAddressLeaseStatus] = mapped_column(
+        Enum(
+            DepositAddressLeaseStatus,
+            name="deposit_address_lease_status",
+            values_callable=enum_values(DepositAddressLeaseStatus),
+        ),
+        default=DepositAddressLeaseStatus.AVAILABLE,
+        nullable=False,
+        index=True,
+    )
+    leased_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    cooldown_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    last_used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    retired_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     # Timestamp
     created_at: Mapped[datetime] = mapped_column(
@@ -69,7 +105,10 @@ class DepositAddress(Base, UUIDMixin):
         nullable=False,
     )
 
-    __table_args__ = (Index("idx_deposit_addr_available", "chain_group", "is_used"),)
+    __table_args__ = (
+        Index("idx_deposit_addr_available", "chain_group", "is_used"),
+        Index("idx_deposit_addr_lease", "chain_group", "lease_status"),
+    )
 
 
 class PaymentSession(Base, UUIDMixin):
@@ -102,11 +141,35 @@ class PaymentSession(Base, UUIDMixin):
         index=True,
     )
 
+    status: Mapped[PaymentSessionStatus] = mapped_column(
+        Enum(
+            PaymentSessionStatus,
+            name="payment_session_status",
+            values_callable=enum_values(PaymentSessionStatus),
+        ),
+        default=PaymentSessionStatus.PENDING,
+        nullable=False,
+        index=True,
+    )
+
     # Когда была выбрана сеть
     chosen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    paid_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    released_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )
 
     # Relationships
@@ -127,6 +190,59 @@ class PaymentSession(Base, UUIDMixin):
             "invoice_id", "chain", "token", name="uq_session_invoice_chain_token"
         ),
         Index("idx_session_address", "deposit_address_id"),
+        Index("idx_session_status_expires", "status", "expires_at"),
+        Index(
+            "uq_payment_session_address_active",
+            "deposit_address_id",
+            unique=True,
+            postgresql_where=text("status IN ('pending', 'seen_onchain')"),
+            sqlite_where=text("status IN ('pending', 'seen_onchain')"),
+        ),
+    )
+
+
+class AddressLeaseEvent(Base, UUIDMixin):
+    """Audit log for deposit address lease lifecycle."""
+
+    __tablename__ = "address_lease_events"
+
+    deposit_address_id: Mapped[uuid.UUID] = mapped_column(
+        UniversalUUID(),
+        ForeignKey("deposit_addresses.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    payment_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UniversalUUID(),
+        ForeignKey("payment_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    previous_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    new_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload: Mapped[dict | None] = mapped_column(UniversalJSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    deposit_address: Mapped["DepositAddress"] = relationship("DepositAddress")
+    payment_session: Mapped[Optional["PaymentSession"]] = relationship("PaymentSession")
+
+    __table_args__ = (
+        Index(
+            "idx_address_lease_events_address_created",
+            "deposit_address_id",
+            "created_at",
+        ),
+        Index(
+            "idx_address_lease_events_session_created",
+            "payment_session_id",
+            "created_at",
+        ),
     )
 
 

@@ -40,6 +40,26 @@ class TxStatus(str, enum.Enum):
     CONFIRMED = "confirmed"  # Подтверждена
 
 
+class DepositAddressLeaseStatus(str, enum.Enum):
+    """Статусы lease для reusable deposit address pool."""
+
+    AVAILABLE = "available"  # Адрес свободен для новой payment session
+    LEASED = "leased"  # Адрес закреплён за active payment session
+    COOLDOWN = "cooldown"  # Адрес ждёт cooldown перед reuse
+    RETIRED = "retired"  # Адрес выведен из оборота
+
+
+class PaymentSessionStatus(str, enum.Enum):
+    """Статусы payment session/check."""
+
+    PENDING = "pending"  # Ожидает оплату
+    SEEN_ONCHAIN = "seen_onchain"  # Транзакция найдена, ждём подтверждения
+    PAID = "paid"  # Оплата подтверждена
+    EXPIRED = "expired"  # Lease/payment window истёк
+    LATE = "late"  # Поступление после expiry/cooldown policy
+    CANCELLED = "cancelled"  # Отменено вручную/системно
+
+
 class SweepState(str, enum.Enum):
     """
     Состояние sweep job.
