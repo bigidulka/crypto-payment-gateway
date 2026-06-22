@@ -121,6 +121,19 @@ async def test_oklink_incoming_scan_converts_logs() -> None:
     assert logs[0]["data"] == "0x" + hex(1250000000000000000)[2:].zfill(64)
     assert all(request.url.params.get("t") for request in requests)
     assert all(request.headers.get("x-apiKey") for request in requests)
+    address_requests = [
+        request
+        for request in requests
+        if request.url.path.endswith(f"/v2/bsc/addresses/{address}/transfers/condition/token")
+    ]
+    log_requests = [
+        request
+        for request in requests
+        if request.url.path.endswith(f"/v1/bsc/transactions/{tx_hash}/logs")
+    ]
+    assert all(request.method == "POST" for request in address_requests)
+    assert all(json.loads(request.content)["address"] == address for request in address_requests)
+    assert all(request.method == "GET" for request in log_requests)
 
 
 @pytest.mark.asyncio
