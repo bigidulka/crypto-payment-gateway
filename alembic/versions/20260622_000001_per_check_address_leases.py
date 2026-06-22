@@ -143,13 +143,6 @@ def upgrade() -> None:
         ["status", "expires_at"],
     )
     op.create_index(
-        "uq_payment_session_address_active",
-        "payment_sessions",
-        ["deposit_address_id"],
-        unique=True,
-        postgresql_where=sa.text("status IN ('pending', 'seen_onchain')"),
-    )
-    op.create_index(
         "idx_address_lease_events_address_created",
         "address_lease_events",
         ["deposit_address_id", "created_at"],
@@ -241,6 +234,14 @@ def upgrade() -> None:
         )
           AND da.retired_at IS NULL
         """
+    )
+
+    op.create_index(
+        "uq_payment_session_address_active",
+        "payment_sessions",
+        ["deposit_address_id"],
+        unique=True,
+        postgresql_where=sa.text("status IN ('pending', 'seen_onchain')"),
     )
 
     op.alter_column("deposit_addresses", "lease_status", server_default=None)
