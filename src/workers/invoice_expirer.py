@@ -28,12 +28,17 @@ logger = logging.getLogger(__name__)
 def build_invoice_payload(invoice: Invoice) -> dict:
     """Собрать payload для webhook события."""
     return {
-        "invoice_id": str(invoice.public_id),
-        "merchant_order_id": invoice.merchant_order_id or "",
-        "status": invoice.status.value,
-        "amount": str(invoice.amount),
-        "asset": invoice.asset,
-        "expired_at": invoice.expires_at.isoformat() if invoice.expires_at else None,
+        "event": "invoice.expired",
+        "invoice": {
+            "id": str(invoice.id),
+            "public_id": invoice.public_id,
+            "status": invoice.status.value,
+            "amount": str(invoice.amount),
+            "asset": invoice.asset,
+            "expires_at": invoice.expires_at.isoformat() if invoice.expires_at else None,
+            "metadata": invoice.extra_data,
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
