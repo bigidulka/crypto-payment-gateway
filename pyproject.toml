@@ -38,7 +38,7 @@ dependencies = [
     "cryptography>=44.0.0",
 
     # HTTP client
-    "httpx>=0.28.0",
+    "httpx[socks]>=0.28.0",
 
     # Utils
     "python-multipart>=0.0.18",

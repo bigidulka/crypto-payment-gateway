@@ -42,6 +42,7 @@ class OKLinkClientConfig:
     max_pages_per_address: int
     max_log_pages_per_tx: int
     api_key_time_shift_ms: int
+    proxy_url: str = ""  # socks5://... or http://... (empty = direct)
 
 
 class OKLinkFetchMethod(Enum):
@@ -105,10 +106,16 @@ class OKLinkExplorerClient:
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self.config = config
-        self._client = http_client or httpx.AsyncClient(
-            base_url=config.base_url.rstrip("/"),
-            timeout=config.request_timeout_seconds,
-        )
+        if http_client is not None:
+            self._client = http_client
+        else:
+            client_kwargs: dict[str, Any] = {
+                "base_url": config.base_url.rstrip("/"),
+                "timeout": config.request_timeout_seconds,
+            }
+            if config.proxy_url:
+                client_kwargs["proxy"] = config.proxy_url
+            self._client = httpx.AsyncClient(**client_kwargs)
         self._owns_client = http_client is None
 
         self._validate_config()

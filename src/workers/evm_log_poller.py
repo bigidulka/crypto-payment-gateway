@@ -132,10 +132,18 @@ def _topic_to_address(topic) -> str:
 
 def _build_oklink_fetcher(chain: str, config) -> OKLinkTransferLogFetcher:
     """Build OKLink transfer fetcher for active payment checks."""
+    from src.core.proxy_pool import get_proxy_pool
+
     settings = get_settings()
     oklink_chain = str(getattr(config, "oklink_chain", "") or "").strip()
     if not oklink_chain:
         raise RuntimeError(f"[{chain}] oklink_chain is required for OKLink scanner")
+
+    proxy_url = get_proxy_pool().next_proxy()
+    if proxy_url:
+        logger.debug(f"[{chain}] OKLink using proxy: {proxy_url.split('@')[-1]}")
+    else:
+        logger.warning(f"[{chain}] OKLink scanning without proxy (rate-limit risk)")
 
     client = OKLinkExplorerClient(
         OKLinkClientConfig(
@@ -155,6 +163,7 @@ def _build_oklink_fetcher(chain: str, config) -> OKLinkTransferLogFetcher:
             ),
             max_log_pages_per_tx=int(getattr(config, "scanner_max_log_pages_per_tx", 0)),
             api_key_time_shift_ms=settings.oklink_api_key_time_shift_ms,
+            proxy_url=proxy_url or "",
         )
     )
     return OKLinkTransferLogFetcher(oklink_chain, client)
