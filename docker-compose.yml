@@ -24,13 +24,13 @@ services:
     image: redis:7-alpine
     container_name: arbitron-payment-redis
     restart: unless-stopped
-    command: redis-server --appendonly yes
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
     volumes:
       - arbitron_payment_redis_data:/data
     ports:
       - "127.0.0.1:6380:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a $REDIS_PASSWORD ping | grep PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -48,7 +48,7 @@ services:
     environment:
       TZ: UTC
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
     ports:
       - "127.0.0.1:8123:8000"
     volumes:
@@ -78,7 +78,7 @@ services:
     environment:
       TZ: UTC
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       PROXY_FILE: /app/proxies.txt
     volumes:
       - ./data:/data
@@ -108,7 +108,7 @@ services:
     environment:
       TZ: UTC
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       PROXY_FILE: /app/proxies.txt
     volumes:
       - ./data:/data
@@ -136,7 +136,7 @@ services:
     environment:
       TZ: UTC
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/data
     depends_on:
@@ -162,7 +162,7 @@ services:
     environment:
       TZ: UTC
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/data
     depends_on:
@@ -188,7 +188,7 @@ services:
     environment:
       TZ: UTC
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/data
     depends_on:
