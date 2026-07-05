@@ -7,10 +7,13 @@ for each ``httpx.AsyncClient`` instance.
 Used by OKLink scanner to avoid 429 rate-limiting from a single IP.
 """
 
+from __future__ import annotations
+
 import logging
 import itertools
 import threading
 from pathlib import Path
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -30,7 +33,7 @@ class ProxyPool:
     """Thread-safe round-robin proxy rotator."""
 
     _entries: list[ProxyEntry] = field(default_factory=list)
-    _cycle: itertools.cycle[str] | None = None
+    _cycle: Iterator[str] | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __len__(self) -> int:
