@@ -79,8 +79,10 @@ services:
       TZ: UTC
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
       REDIS_URL: redis://redis:6379/0
+      PROXY_FILE: /app/proxies.txt
     volumes:
       - ./data:/data
+      - ./proxies.txt:/app/proxies.txt:ro
     depends_on:
       redis:
         condition: service_healthy
@@ -107,8 +109,10 @@ services:
       TZ: UTC
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
       REDIS_URL: redis://redis:6379/0
+      PROXY_FILE: /app/proxies.txt
     volumes:
       - ./data:/data
+      - ./proxies.txt:/app/proxies.txt:ro
     depends_on:
       redis:
         condition: service_healthy

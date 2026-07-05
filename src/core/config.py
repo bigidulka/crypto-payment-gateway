@@ -73,6 +73,10 @@ class Settings(BaseSettings):
     poll_interval_seconds: int = 5
     scan_window_size: int = 2000
 
+    # === Proxy ===
+    proxy_file: str = ""  # Path to proxies.txt (ip:port:user:pass per line)
+    proxy_default: str = ""  # Single proxy URL (socks5://... or http://...)
+
     # === OKLink Deposit Scanner ===
     oklink_base_url: str = ""
     oklink_api_prefix: str = ""
