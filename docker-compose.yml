@@ -139,6 +139,8 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       redis:
         condition: service_healthy
