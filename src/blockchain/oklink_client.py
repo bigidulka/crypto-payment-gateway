@@ -8,6 +8,7 @@ transactions and optional chain head checks.
 import asyncio
 import base64
 import json
+import logging
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -16,6 +17,8 @@ from secrets import randbelow
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 class OKLinkClientError(RuntimeError):
@@ -141,6 +144,8 @@ class OKLinkExplorerClient:
             raise OKLinkClientError(f"missing OKLink config fields: {', '.join(missing)}")
         if self.config.page_limit <= 0:
             raise OKLinkClientError("OKLink page_limit must be positive")
+        if self.config.request_timeout_seconds <= 0:
+            raise OKLinkClientError("OKLink request_timeout_seconds must be positive")
         if self.config.max_pages_per_address <= 0:
             raise OKLinkClientError("OKLink max_pages_per_address must be positive")
         if self.config.max_log_pages_per_tx <= 0:
@@ -177,21 +182,41 @@ class OKLinkExplorerClient:
         try:
             if upper_method == "POST":
                 body = {key: value for key, value in query.items() if key != "t"}
-                response = await self._client.post(
-                    normalized_path,
-                    params={"t": query["t"]},
-                    json=body,
-                    headers=self._headers(has_body=True),
+                response = await asyncio.wait_for(
+                    self._client.post(
+                        normalized_path,
+                        params={"t": query["t"]},
+                        json=body,
+                        headers=self._headers(has_body=True),
+                    ),
+                    timeout=self.config.request_timeout_seconds,
                 )
             else:
-                response = await self._client.get(
-                    normalized_path,
-                    params=query,
-                    headers=self._headers(),
+                response = await asyncio.wait_for(
+                    self._client.get(
+                        normalized_path,
+                        params=query,
+                        headers=self._headers(),
+                    ),
+                    timeout=self.config.request_timeout_seconds,
                 )
             response.raise_for_status()
+        except TimeoutError as exc:
+            logger.warning(
+                "OKLink request timed out: method=%s path=%s timeout_seconds=%s",
+                upper_method,
+                normalized_path,
+                self.config.request_timeout_seconds,
+            )
+            raise OKLinkClientError("OKLink request timed out") from exc
         except httpx.HTTPError as exc:
-            raise OKLinkClientError(f"OKLink request failed: {exc}") from exc
+            logger.warning(
+                "OKLink request failed: method=%s path=%s error_type=%s",
+                upper_method,
+                normalized_path,
+                type(exc).__name__,
+            )
+            raise OKLinkClientError("OKLink request failed") from exc
 
         try:
             payload = json.loads(response.text, parse_float=Decimal)
@@ -446,12 +471,15 @@ class OKLinkExplorerClient:
         offset = 0
         logs_complete = False
         for _ in range(self.config.max_log_pages_per_tx):
-            page = await self.fetch_transaction_logs(
-                chain,
-                tx_hash,
-                offset=offset,
-                limit=self.config.page_limit,
-            )
+            try:
+                page = await self.fetch_transaction_logs(
+                    chain,
+                    tx_hash,
+                    offset=offset,
+                    limit=self.config.page_limit,
+                )
+            except OKLinkClientError:
+                return logs, False
             logs.extend(page)
             if len(page) < self.config.page_limit:
                 logs_complete = True

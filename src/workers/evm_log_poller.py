@@ -41,6 +41,40 @@ from src.services.payment_service import PaymentService
 
 logger = logging.getLogger(__name__)
 
+_PENDING_OKLINK_CLEANUPS: set[asyncio.Task[None]] = set()
+
+
+def _track_oklink_cleanup(task: asyncio.Task[None]) -> None:
+    _PENDING_OKLINK_CLEANUPS.add(task)
+
+    def _finish(completed: asyncio.Task[None]) -> None:
+        _PENDING_OKLINK_CLEANUPS.discard(completed)
+        if completed.cancelled():
+            return
+        try:
+            error = completed.exception()
+        except Exception as exc:
+            logger.warning("Failed to inspect OKLink cleanup task: %s", exc)
+            return
+        if error is not None:
+            logger.warning("OKLink fetcher cleanup failed: %s", error)
+
+    task.add_done_callback(_finish)
+
+
+async def _close_oklink_fetcher(fetcher, timeout_seconds: float, chain: str) -> None:
+    cleanup_task = asyncio.create_task(fetcher.aclose())
+    _track_oklink_cleanup(cleanup_task)
+    try:
+        await asyncio.wait_for(asyncio.shield(cleanup_task), timeout=timeout_seconds)
+    except TimeoutError:
+        logger.warning(
+            f"[{chain}] OKLink fetcher cleanup still pending; "
+            f"timeout_seconds={timeout_seconds}"
+        )
+    except Exception as exc:
+        logger.warning(f"[{chain}] Failed to close OKLink fetcher: {exc}")
+
 
 @dataclass(frozen=True)
 class TransferLog:
@@ -402,6 +436,7 @@ async def poll_chain(chain: str) -> None:
         try:
             if scanner_provider == "oklink":
                 oklink_fetcher = _build_oklink_fetcher(chain, config)
+                all_transfers = []
                 fetch_result = await oklink_fetcher.fetch_transfer_logs(
                     from_block=from_block,
                     to_block=to_block,
@@ -417,7 +452,6 @@ async def poll_chain(chain: str) -> None:
                         f"failed_address_count={fetch_result.failed_address_count}"
                     )
 
-                all_transfers = []
                 for log in fetch_result.logs:
                     try:
                         transfer = _parse_transfer_log(chain, log)
@@ -481,7 +515,8 @@ async def poll_chain(chain: str) -> None:
             return
         finally:
             if oklink_fetcher is not None:
-                await oklink_fetcher.aclose()
+                timeout_seconds = oklink_fetcher.client.config.request_timeout_seconds
+                await _close_oklink_fetcher(oklink_fetcher, timeout_seconds, chain)
 
         if all_transfers:
             logger.info(
