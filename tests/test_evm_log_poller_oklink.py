@@ -1,11 +1,20 @@
+import asyncio
+import json
+import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 import src.workers.evm_log_poller as poller
+from src.blockchain.oklink_client import (
+    OKLinkClientConfig,
+    OKLinkExplorerClient,
+    OKLinkTransferLogFetcher,
+)
 
 
 class _Session:
@@ -41,15 +50,66 @@ class _FetchResult:
 class _FakeFetcher:
     def __init__(self, result: _FetchResult):
         self.result = result
+        self.chain = "bsc"
         self.closed = False
         self.calls = []
+        self.native_calls = []
+        self.client = SimpleNamespace(
+            config=SimpleNamespace(request_timeout_seconds=0.01),
+            fetch_address_transactions=self.fetch_address_transactions,
+        )
 
     async def fetch_transfer_logs(self, **kwargs):
         self.calls.append(kwargs)
         return self.result
 
+    async def fetch_address_transactions(self, chain, address):
+        self.native_calls.append((chain, address))
+        return []
+
     async def aclose(self):
         self.closed = True
+
+
+class _DelayedCloseFetcher(_FakeFetcher):
+    def __init__(self, result: _FetchResult):
+        super().__init__(result)
+        self.close_started = False
+
+    async def aclose(self):
+        self.close_started = True
+        await asyncio.sleep(0.03)
+        self.closed = True
+
+
+def _oklink_fetcher(
+    handler,
+    *,
+    page_limit: int = 20,
+    request_delay_seconds: float = 0,
+) -> tuple[OKLinkTransferLogFetcher, httpx.AsyncClient]:
+    http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://oklink.test",
+    )
+    client = OKLinkExplorerClient(
+        OKLinkClientConfig(
+            base_url="https://oklink.test",
+            api_prefix="/api/explorer/",
+            referer="https://oklink.test/bsc",
+            user_agent="pytest",
+            web_key="abcdefgh12345678",
+            transfer_event_signature="0x" + "d" * 64,
+            page_limit=page_limit,
+            request_timeout_seconds=0.01,
+            request_delay_seconds=request_delay_seconds,
+            max_pages_per_address=2,
+            max_log_pages_per_tx=2,
+            api_key_time_shift_ms=1111111111111,
+        ),
+        http_client,
+    )
+    return OKLinkTransferLogFetcher("bsc", client), http_client
 
 
 def _chain_config():
@@ -84,21 +144,27 @@ def _chain_config():
     )
 
 
-def _payment_session(token: str = "USDT"):
+def _payment_session(token: str = "USDT", address: str = "0x" + "a" * 40):
     return SimpleNamespace(
         token=token,
         invoice=SimpleNamespace(created_at=datetime(2026, 1, 1, tzinfo=UTC)),
-        deposit_address=SimpleNamespace(address="0x" + "a" * 40),
+        deposit_address=SimpleNamespace(address=address),
     )
 
 
-def _patch_common(monkeypatch, session: _Session, adapter: _Adapter, checkpoint):
+def _patch_common(
+    monkeypatch,
+    session: _Session,
+    adapter: _Adapter,
+    checkpoint,
+    active_addresses=None,
+):
     @asynccontextmanager
     async def _session_context():
         yield session
 
     async def _active_addresses(db_session, chain):
-        return {"0x" + "a" * 40: _payment_session()}
+        return active_addresses or {"0x" + "a" * 40: _payment_session()}
 
     async def _get_checkpoint(db_session, chain, chain_adapter, earliest_invoice_time):
         return 100
@@ -162,3 +228,113 @@ async def test_oklink_active_check_incomplete_scan_does_not_advance_checkpoint(
     assert fetcher.closed is True
     assert checkpoint == {}
     assert session.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_oklink_cleanup_deadline_is_best_effort(monkeypatch, caplog):
+    session = _Session()
+    adapter = _Adapter()
+    checkpoint = {}
+    _patch_common(monkeypatch, session, adapter, checkpoint)
+    fetcher = _DelayedCloseFetcher(
+        _FetchResult(logs=[], is_complete=True, failed_address_count=0)
+    )
+    monkeypatch.setattr(poller, "_build_oklink_fetcher", lambda chain, config: fetcher)
+    caplog.set_level(logging.WARNING, logger="src.workers.evm_log_poller")
+
+    await asyncio.wait_for(poller.poll_chain("bsc"), timeout=0.5)
+
+    assert adapter.batch_called is False
+    assert checkpoint == {"block": 150}
+    assert fetcher.close_started is True
+    await asyncio.sleep(0.04)
+    assert fetcher.closed is True
+    assert "OKLink fetcher cleanup still pending" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_oklink_scan_allows_request_pacing_longer_than_request_timeout(monkeypatch):
+    session = _Session()
+    adapter = _Adapter()
+    checkpoint = {}
+    address = "0x" + "a" * 40
+    offsets = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        offsets.append(body["offset"])
+        if body["offset"] == "0":
+            hits = [
+                {
+                    "txhash": "0x" + "1" * 64,
+                    "blockHeight": 100,
+                    "from": "0x" + "2" * 40,
+                    "to": address,
+                    "tokenContractAddress": "0x" + "f" * 40,
+                    "value": 1,
+                }
+            ]
+        else:
+            hits = []
+        return httpx.Response(200, json={"code": 0, "data": {"hits": hits}})
+
+    _patch_common(monkeypatch, session, adapter, checkpoint)
+    fetcher, http_client = _oklink_fetcher(
+        handler,
+        page_limit=1,
+        request_delay_seconds=0.02,
+    )
+    monkeypatch.setattr(poller, "_build_oklink_fetcher", lambda chain, config: fetcher)
+
+    await asyncio.wait_for(poller.poll_chain("bsc"), timeout=0.5)
+    await http_client.aclose()
+
+    assert checkpoint == {"block": 150}
+    assert offsets == ["0", "1"]
+
+
+@pytest.mark.asyncio
+async def test_oklink_native_request_timeout_continues_other_native_scans_without_checkpoint_advance(
+    monkeypatch,
+    caplog,
+):
+    session = _Session()
+    adapter = _Adapter()
+    checkpoint = {}
+    first_native_address = "0x" + "d" * 40
+    second_native_address = "0x" + "e" * 40
+    native_requests = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        native_requests.append(request.url.path)
+        if request.url.path.endswith(
+            f"/addresses/{first_native_address}/transactionsByClassfy/condition"
+        ):
+            await asyncio.Event().wait()
+        return httpx.Response(200, json={"code": 0, "data": {"hits": []}})
+
+    _patch_common(
+        monkeypatch,
+        session,
+        adapter,
+        checkpoint,
+        {
+            first_native_address: _payment_session("BNB", first_native_address),
+            second_native_address: _payment_session("BNB", second_native_address),
+        },
+    )
+    fetcher, http_client = _oklink_fetcher(handler)
+    monkeypatch.setattr(poller, "_build_oklink_fetcher", lambda chain, config: fetcher)
+    caplog.set_level(logging.WARNING)
+
+    await asyncio.wait_for(poller.poll_chain("bsc"), timeout=0.5)
+    await http_client.aclose()
+
+    assert adapter.batch_called is False
+    assert checkpoint == {}
+    assert native_requests == [
+        f"/api/explorer/v2/bsc/addresses/{first_native_address}/transactionsByClassfy/condition",
+        f"/api/explorer/v2/bsc/addresses/{second_native_address}/transactionsByClassfy/condition",
+    ]
+    assert "OKLink request timed out" in caplog.text
+    assert "Failed to fetch native OKLink txs" in caplog.text

@@ -1,5 +1,7 @@
+import asyncio
 import base64
 import json
+import logging
 from decimal import Decimal
 
 import httpx
@@ -7,6 +9,7 @@ import pytest
 
 from src.blockchain.oklink_client import (
     OKLinkClientConfig,
+    OKLinkClientError,
     OKLinkExplorerClient,
     OKLinkTransferLogFetcher,
     generate_oklink_web_api_key,
@@ -134,6 +137,50 @@ async def test_oklink_incoming_scan_converts_logs() -> None:
     assert all(request.method == "POST" for request in address_requests)
     assert all(json.loads(request.content)["address"] == address for request in address_requests)
     assert all(request.method == "GET" for request in log_requests)
+
+
+@pytest.mark.asyncio
+async def test_oklink_request_timeout_returns_client_error_without_secret_logging(caplog) -> None:
+    address = "0x" + "a" * 40
+    web_key = "secret-web-key-12345678"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://oklink.test",
+    )
+    client = OKLinkExplorerClient(
+        OKLinkClientConfig(
+            base_url="https://oklink.test",
+            api_prefix="/api/explorer/",
+            referer="https://oklink.test/bsc",
+            user_agent="pytest",
+            web_key=web_key,
+            transfer_event_signature="0x" + "d" * 64,
+            page_limit=10,
+            request_timeout_seconds=0.01,
+            request_delay_seconds=0,
+            max_pages_per_address=2,
+            max_log_pages_per_tx=2,
+            api_key_time_shift_ms=1111111111111,
+        ),
+        http_client,
+    )
+    caplog.set_level(logging.WARNING, logger="src.blockchain.oklink_client")
+
+    with pytest.raises(OKLinkClientError, match="OKLink request timed out"):
+        await asyncio.wait_for(
+            client.fetch_address_token_transfers("bsc", address),
+            timeout=0.5,
+        )
+    await http_client.aclose()
+
+    assert "OKLink request timed out" in caplog.text
+    assert "method=POST" in caplog.text
+    assert "secret-web-key" not in caplog.text
 
 
 @pytest.mark.asyncio
