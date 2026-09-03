@@ -393,16 +393,37 @@ async def poll_chain(chain: str) -> None:
         scanner_provider = str(getattr(config, "scanner_provider", "rpc")).lower()
         last_scanned: int | None = None
 
-        if scanner_provider in ("oklink", "rpc"):
-            # Invoice-flow сканирует active addresses напрямую. Stale checkpoint
-            # не должен скрывать свежий payment, поэтому lower bound считается
-            # от возраста active invoice, а не от chain_checkpoints.
+        if scanner_provider == "oklink":
+            # OKLink сканирует адреса напрямую, диапазон блоков — только
+            # пост-фильтр, поэтому его ширина ничего не стоит.
             from_block = _active_invoice_from_block(
-                safe_block,
-                config,
-                earliest_invoice_time,
+                safe_block, config, earliest_invoice_time
             )
             to_block = safe_block
+        elif scanner_provider == "rpc":
+            # Stale checkpoint не должен скрывать свежий payment, поэтому нижняя
+            # граница берётся по возрасту самого старого активного инвойса.
+            # Но from_block уходит прямо в eth_getLogs, и узлы ограничивают
+            # ширину диапазона, поэтому за круг сканируется не больше
+            # scan_window блоков, а checkpoint двигает окно вперёд.
+            invoice_lower_bound = _active_invoice_from_block(
+                safe_block, config, earliest_invoice_time
+            )
+            last_scanned = await get_or_create_checkpoint(
+                session, chain, adapter, earliest_invoice_time
+            )
+            from_block = max(invoice_lower_bound, last_scanned + 1)
+            if safe_block < from_block:
+                logger.debug(
+                    f"[{chain}] No new blocks to scan "
+                    f"(from={from_block}, safe={safe_block})"
+                )
+                return
+            to_block = min(safe_block, from_block + config.scan_window)
+            if to_block < safe_block:
+                logger.info(
+                    f"[{chain}] Catching up: {safe_block - to_block} blocks behind head"
+                )
         else:
             # Legacy path остаётся checkpoint-based.
             last_scanned = await get_or_create_checkpoint(

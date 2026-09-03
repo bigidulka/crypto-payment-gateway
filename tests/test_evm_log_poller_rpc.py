@@ -115,7 +115,14 @@ def _payment_session(token: str = "USDT", address: str = ADDRESS):
     )
 
 
-def _patch_common(monkeypatch, session, adapter, checkpoint, active_addresses=None):
+def _patch_common(
+    monkeypatch,
+    session,
+    adapter,
+    checkpoint,
+    active_addresses=None,
+    last_scanned: int = 100,
+):
     @asynccontextmanager
     async def _session_context():
         yield session
@@ -124,7 +131,7 @@ def _patch_common(monkeypatch, session, adapter, checkpoint, active_addresses=No
         return active_addresses or {ADDRESS: _payment_session()}
 
     async def _get_checkpoint(db_session, chain, chain_adapter, earliest_invoice_time):
-        raise AssertionError("invoice flow must not depend on the chain checkpoint")
+        return last_scanned
 
     async def _update_checkpoint(db_session, chain, block_number):
         checkpoint["block"] = block_number
@@ -165,10 +172,70 @@ async def test_rpc_scan_uses_one_or_topics_request(monkeypatch):
     assert len(fetcher.calls) == 1
     call = fetcher.calls[0]
     assert sorted(call["to_addresses"]) == sorted([ADDRESS, second])
-    assert call["from_block"] == 0
+    # checkpoint 100 -> from 101; scan_window 100 keeps to_block at head 150
+    assert call["from_block"] == 101
     assert call["to_block"] == 150
     assert checkpoint == {"block": 150}
     assert session.rollback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_rpc_scan_window_is_capped_when_far_behind(monkeypatch):
+    """A stuck invoice must not produce a multi-million-block eth_getLogs."""
+    session = _Session()
+    adapter = _Adapter()
+    checkpoint: dict = {}
+    _patch_common(monkeypatch, session, adapter, checkpoint, last_scanned=0)
+    fetcher = _FakeResilientFetcher(
+        _FetchResult(logs=[], is_complete=True, failed_address_count=0)
+    )
+    monkeypatch.setattr(poller, "get_resilient_fetcher", lambda chain: fetcher)
+
+    await poller.poll_chain("bsc")
+
+    call = fetcher.calls[0]
+    assert call["from_block"] == 1
+    # scan_window is 100 in the test config, head is 150
+    assert call["to_block"] == 101
+    assert call["to_block"] - call["from_block"] <= 100
+    # checkpoint moved forward so the next cycle continues from here
+    assert checkpoint == {"block": 101}
+
+
+@pytest.mark.asyncio
+async def test_rpc_stale_checkpoint_does_not_hide_fresh_invoice(monkeypatch):
+    """A fresh invoice is scanned near head even with an ancient checkpoint."""
+    session = _Session()
+    adapter = _Adapter()
+    checkpoint: dict = {}
+
+    def _fresh_session(token="USDT", address=ADDRESS):
+        return SimpleNamespace(
+            token=token,
+            invoice=SimpleNamespace(created_at=datetime.now(UTC)),
+            deposit_address=SimpleNamespace(address=address),
+        )
+
+    _patch_common(
+        monkeypatch,
+        session,
+        adapter,
+        checkpoint,
+        active_addresses={ADDRESS: _fresh_session()},
+        last_scanned=0,
+    )
+    fetcher = _FakeResilientFetcher(
+        _FetchResult(logs=[], is_complete=True, failed_address_count=0)
+    )
+    monkeypatch.setattr(poller, "get_resilient_fetcher", lambda chain: fetcher)
+
+    await poller.poll_chain("bsc")
+
+    call = fetcher.calls[0]
+    # Checkpoint 0 alone would start at block 1. The invoice is seconds old, so
+    # its lower bound (120s of buffer / 2s blocks = 60 back from head 150) wins.
+    assert call["from_block"] == 90
+    assert call["to_block"] == 150
 
 
 @pytest.mark.asyncio
@@ -232,7 +299,7 @@ async def test_rpc_scan_collects_native_transfers(monkeypatch):
     await poller.poll_chain("bsc")
 
     assert fetcher.native_calls == [
-        {"from_block": 0, "to_block": 150, "to_addresses": [NATIVE_ADDRESS]}
+        {"from_block": 101, "to_block": 150, "to_addresses": [NATIVE_ADDRESS]}
     ]
 
 
