@@ -61,6 +61,8 @@ class ChainConfig:
     # Deposit scanner configuration
     scanner_provider: str = "rpc"
     oklink_chain: str = ""
+    # Chain alias on the keyed scanner RPC plane (empty = chain name)
+    scanner_rpc_chain: str = ""
     scanner_page_limit: int = 20
     scanner_max_pages_per_address: int = 5
     scanner_max_log_pages_per_tx: int = 20
@@ -234,6 +236,7 @@ def _load_config() -> None:
             tokens=tokens,
             scanner_provider=chain_data.get("scanner_provider", "rpc"),
             oklink_chain=chain_data.get("oklink_chain", chain_name),
+            scanner_rpc_chain=chain_data.get("scanner_rpc_chain", chain_name),
             scanner_page_limit=chain_data.get("scanner_page_limit", 20),
             scanner_max_pages_per_address=chain_data.get(
                 "scanner_max_pages_per_address", 5

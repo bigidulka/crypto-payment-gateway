@@ -99,6 +99,22 @@ class CircuitBreaker:
             )
 
 
+@dataclass(frozen=True)
+class RpcEndpointSpec:
+    """Описание одного RPC endpoint до создания web3."""
+
+    url: str
+    priority: int = 1  # 1 = primary, 2 = secondary
+    headers: dict[str, str] = field(default_factory=dict)
+
+    def build_web3(self, timeout: float) -> AsyncWeb3:
+        """Создать web3 клиент, пробросив заголовки авторизации."""
+        request_kwargs: dict[str, Any] = {"timeout": timeout}
+        if self.headers:
+            request_kwargs["headers"] = dict(self.headers)
+        return AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(self.url, request_kwargs=request_kwargs))
+
+
 @dataclass
 class RpcEndpointState:
     """Состояние RPC endpoint для log fetcher."""
@@ -142,6 +158,34 @@ class TransferLogResult:
     failed_address_count: int
 
 
+def _hex_str(value: Any) -> str:
+    """Привести hash из web3 к строке с 0x-префиксом."""
+    text = value.hex() if isinstance(value, bytes) else str(value)
+    return text if text.startswith("0x") else f"0x{text}"
+
+
+@dataclass(frozen=True)
+class NativeTransfer:
+    """Входящий перевод нативной монеты, найденный по балансу адреса."""
+
+    tx_hash: str
+    block_number: int
+    from_address: str
+    to_address: str
+    value_wei: int
+
+
+@dataclass
+class NativeScanResult:
+    """Результат поиска нативных депозитов."""
+
+    transfers: list[NativeTransfer]
+    rpc_used: str
+    latency_ms: float
+    is_complete: bool
+    failed_address_count: int
+
+
 class ResilientLogFetcher:
     """
     Высокоотказоустойчивый fetcher для Transfer логов.
@@ -160,23 +204,23 @@ class ResilientLogFetcher:
     DEFAULT_TIMEOUT = 30.0
     PARALLEL_TIMEOUT = 15.0  # Меньше таймаут для параллельных
 
-    def __init__(self, chain: str, rpc_endpoints: list[tuple[str, int]]):
+    def __init__(self, chain: str, rpc_endpoints: list[RpcEndpointSpec]):
         """
         Args:
             chain: Имя сети
-            rpc_endpoints: Список (url, priority) - priority 1 = primary
+            rpc_endpoints: Список endpoint spec - priority 1 = primary
         """
         self.chain = chain
         self.config = get_chain_config(chain)
 
         # Инициализируем endpoints
         self.endpoints: list[RpcEndpointState] = []
-        for url, priority in sorted(rpc_endpoints, key=lambda x: x[1]):
+        for spec in sorted(rpc_endpoints, key=lambda item: item.priority):
             self.endpoints.append(
                 RpcEndpointState(
-                    url=url,
-                    web3=AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(url)),
-                    priority=priority,
+                    url=spec.url,
+                    web3=spec.build_web3(self.DEFAULT_TIMEOUT),
+                    priority=spec.priority,
                 )
             )
 
@@ -606,6 +650,151 @@ class ResilientLogFetcher:
         logger.error(f"[{self.chain}] All fetch methods failed!")
         raise RuntimeError(f"All RPC methods failed. Last error: {last_error}")
 
+    async def _native_balance(
+        self, endpoint: RpcEndpointState, address: str, block: int
+    ) -> int:
+        """Баланс нативной монеты на конкретной высоте."""
+        return await endpoint.web3.eth.get_balance(
+            endpoint.web3.to_checksum_address(address),
+            block_identifier=block,
+        )
+
+    async def _find_native_transfers_for_address(
+        self,
+        endpoint: RpcEndpointState,
+        address: str,
+        from_block: int,
+        to_block: int,
+    ) -> list[NativeTransfer]:
+        """
+        Найти входящие нативные переводы на адрес в диапазоне блоков.
+
+        Логов у нативных переводов нет, поэтому баланс на границах диапазона
+        сравнивается напрямую, а точный блок поступления находится бинарным
+        поиском. Так стоимость не зависит от ширины окна: ~log2(window)
+        запросов на адрес вместо полного обхода каждого блока.
+        """
+        baseline_block = max(from_block - 1, 0)
+        baseline = await self._native_balance(endpoint, address, baseline_block)
+        latest = await self._native_balance(endpoint, address, to_block)
+        if latest <= baseline:
+            return []
+
+        transfers: list[NativeTransfer] = []
+        checksum = endpoint.web3.to_checksum_address(address)
+        cursor_block = baseline_block
+        cursor_balance = baseline
+
+        while cursor_balance < latest and cursor_block < to_block:
+            # Наименьший блок, где баланс уже больше cursor_balance.
+            low, high = cursor_block + 1, to_block
+            while low < high:
+                mid = (low + high) // 2
+                if await self._native_balance(endpoint, address, mid) > cursor_balance:
+                    high = mid
+                else:
+                    low = mid + 1
+
+            block = await endpoint.web3.eth.get_block(low, full_transactions=True)
+            found_in_block = False
+            for tx in block.get("transactions", []):
+                if not isinstance(tx, dict):
+                    continue
+                to_field = tx.get("to")
+                value = int(tx.get("value", 0) or 0)
+                if not to_field or value <= 0:
+                    continue
+                if endpoint.web3.to_checksum_address(to_field) != checksum:
+                    continue
+                transfers.append(
+                    NativeTransfer(
+                        tx_hash=_hex_str(tx.get("hash", "")),
+                        block_number=low,
+                        from_address=str(tx.get("from", "")).lower(),
+                        to_address=address.lower(),
+                        value_wei=value,
+                    )
+                )
+                found_in_block = True
+
+            cursor_block = low
+            cursor_balance = await self._native_balance(endpoint, address, low)
+            if not found_in_block:
+                # Баланс вырос без внешней транзакции (internal call, coinbase).
+                # Двигаем курсор, чтобы не зациклиться.
+                logger.debug(
+                    f"[{self.chain}] Native balance of {address} changed in block "
+                    f"{low} without a matching top-level transaction"
+                )
+
+        return transfers
+
+    async def fetch_native_transfers(
+        self,
+        from_block: int,
+        to_block: int,
+        to_addresses: list[str],
+    ) -> NativeScanResult:
+        """
+        Найти входящие нативные депозиты для списка адресов.
+
+        Args:
+            from_block: Первый блок диапазона (включительно)
+            to_block: Последний блок диапазона (включительно)
+            to_addresses: Адреса получателей
+
+        Returns:
+            NativeScanResult; is_complete=False если часть адресов не проверена
+        """
+        started = time.monotonic()
+        if not to_addresses:
+            return NativeScanResult(
+                transfers=[],
+                rpc_used="",
+                latency_ms=0.0,
+                is_complete=True,
+                failed_address_count=0,
+            )
+
+        last_error: Exception | None = None
+        for endpoint in self.endpoints:
+            transfers: list[NativeTransfer] = []
+            failed = 0
+            for address in to_addresses:
+                try:
+                    transfers.extend(
+                        await self._find_native_transfers_for_address(
+                            endpoint, address, from_block, to_block
+                        )
+                    )
+                except Exception as e:
+                    failed += 1
+                    last_error = e
+                    logger.warning(
+                        f"[{self.chain}] Native scan failed for {address} "
+                        f"on {endpoint.url}: {e}"
+                    )
+
+            if failed < len(to_addresses):
+                return NativeScanResult(
+                    transfers=transfers,
+                    rpc_used=endpoint.url,
+                    latency_ms=(time.monotonic() - started) * 1000,
+                    is_complete=failed == 0,
+                    failed_address_count=failed,
+                )
+
+        logger.error(
+            f"[{self.chain}] Native scan failed on every endpoint: {last_error}"
+        )
+        return NativeScanResult(
+            transfers=[],
+            rpc_used="",
+            latency_ms=(time.monotonic() - started) * 1000,
+            is_complete=False,
+            failed_address_count=len(to_addresses),
+        )
+
     def get_stats(self) -> dict:
         """Получить статистику по endpoints."""
         return {
@@ -636,30 +825,104 @@ def get_resilient_fetcher(chain: str) -> ResilientLogFetcher | None:
     return _fetchers.get(chain)
 
 
-async def init_resilient_fetchers(rpc_config: dict[str, list[str]]) -> None:
+async def init_resilient_fetchers(
+    rpc_config: dict[str, list[RpcEndpointSpec]],
+) -> None:
     """
     Инициализировать fetchers для всех сетей.
 
     Args:
-        rpc_config: {chain: [primary_url, secondary_url, ...]}
+        rpc_config: {chain: [primary_spec, secondary_spec, ...]} в порядке приоритета
     """
     global _fetchers
 
-    for chain, urls in rpc_config.items():
-        if not urls:
+    for chain, specs in rpc_config.items():
+        if not specs:
             continue
 
-        endpoints = []
-        for i, url in enumerate(urls):
-            endpoints.append((url, i + 1))  # priority = index + 1
-
-        _fetchers[chain] = ResilientLogFetcher(chain, endpoints)
+        _fetchers[chain] = ResilientLogFetcher(chain, specs)
         logger.info(
-            f"[{chain}] ResilientLogFetcher initialized with {len(endpoints)} endpoints"
+            f"[{chain}] ResilientLogFetcher initialized with {len(specs)} endpoints"
         )
 
 
-def close_resilient_fetchers() -> None:
-    """Закрыть все fetchers."""
+def build_endpoint_specs(
+    urls: list[str],
+    *,
+    keyed_url: str = "",
+    keyed_headers: dict[str, str] | None = None,
+) -> list[RpcEndpointSpec]:
+    """
+    Собрать список endpoint spec: keyed scanner RPC первым, публичные следом.
+
+    Args:
+        urls: Публичные RPC URLs из chains.toml, в порядке приоритета
+        keyed_url: URL keyed scanner RPC (пусто = не используется)
+        keyed_headers: Заголовки авторизации для keyed_url
+    """
+    specs: list[RpcEndpointSpec] = []
+    if keyed_url:
+        specs.append(
+            RpcEndpointSpec(
+                url=keyed_url,
+                priority=1,
+                headers=dict(keyed_headers or {}),
+            )
+        )
+
+    offset = len(specs)
+    for index, url in enumerate(urls):
+        specs.append(RpcEndpointSpec(url=url, priority=offset + index + 1))
+    return specs
+
+
+async def init_scanner_fetchers(chains: list[str]) -> int:
+    """
+    Инициализировать fetchers для сканера депозитов.
+
+    Keyed scanner RPC (если настроен) становится primary, публичные RPC из
+    chains.toml идут следом как failover.
+
+    Args:
+        chains: Сети, для которых нужен fetcher
+
+    Returns:
+        Количество сетей, для которых fetcher создан
+    """
+    from src.core.config import get_settings
+
+    settings = get_settings()
+    keyed_headers = settings.get_scanner_rpc_headers()
+
+    rpc_config: dict[str, list[RpcEndpointSpec]] = {}
+    for chain in chains:
+        specs = build_endpoint_specs(
+            settings.get_rpc_urls(chain),
+            keyed_url=settings.get_scanner_rpc_url(chain),
+            keyed_headers=keyed_headers,
+        )
+        if specs:
+            rpc_config[chain] = specs
+
+    if rpc_config:
+        await init_resilient_fetchers(rpc_config)
+    return len(rpc_config)
+
+
+async def close_resilient_fetchers() -> None:
+    """Закрыть все fetchers и их HTTP-сессии."""
     global _fetchers
+
+    for fetcher in _fetchers.values():
+        for endpoint in fetcher.endpoints:
+            disconnect = getattr(endpoint.web3.provider, "disconnect", None)
+            if disconnect is None:
+                continue
+            try:
+                result = disconnect()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.warning(f"Failed to close RPC session {endpoint.url}: {e}")
+
     _fetchers = {}
