@@ -38,7 +38,7 @@ from src.blockchain.resilient_fetcher import (
     ResilientLogFetcher,
     close_resilient_fetchers,
     get_resilient_fetcher,
-    init_resilient_fetchers,
+    init_scanner_fetchers,
 )
 from src.blockchain.rpc_manager import RpcEndpoint, RpcManager, RpcManagerConfig
 from src.core.config import get_settings
@@ -708,19 +708,9 @@ async def _init_resilient_fetchers() -> None:
     """Инициализировать ResilientLogFetcher и RpcManager для всех сетей."""
     settings = get_settings()
 
-    rpc_config: dict[str, list[str]] = {}
-
-    for chain in get_all_chains():
-        urls = settings.get_rpc_urls(chain)
-        if urls:
-            rpc_config[chain] = urls
-            logger.info(
-                f"[{chain}] Configured {len(urls)} RPC endpoints for resilient fetcher"
-            )
-
-    if rpc_config:
-        await init_resilient_fetchers(rpc_config)
-        logger.info(f"ResilientLogFetcher initialized for {len(rpc_config)} chains")
+    chain_count = await init_scanner_fetchers(get_all_chains())
+    if chain_count:
+        logger.info(f"ResilientLogFetcher initialized for {chain_count} chains")
 
     # Инициализируем RpcManager для EVM адаптеров (для get_latest_block и др.)
     for chain in get_evm_chains():
@@ -828,7 +818,7 @@ async def run_persistent_poller() -> None:
             await asyncio.sleep(settings.poll_interval_seconds)
 
     finally:
-        close_resilient_fetchers()
+        await close_resilient_fetchers()
         await close_all_adapters()
 
 

@@ -77,6 +77,14 @@ class Settings(BaseSettings):
     proxy_file: str = ""  # Path to proxies.txt (ip:port:user:pass per line)
     proxy_default: str = ""  # Single proxy URL (socks5://... or http://...)
 
+    # === Scanner RPC plane ===
+    # Keyed JSON-RPC endpoint used only for reading deposit logs. Kept apart
+    # from chains.toml rpc_urls because those also broadcast sweep transactions
+    # and a read-only plane would refuse them.
+    scanner_rpc_base_url: str = ""  # e.g. https://hub.arbitron.dev/rpc
+    scanner_rpc_api_key: SecretStr = Field(default="")
+    scanner_rpc_api_key_header: str = "X-Hub-Key"
+
     # === OKLink Deposit Scanner ===
     oklink_base_url: str = ""
     oklink_api_prefix: str = ""
@@ -150,6 +158,28 @@ class Settings(BaseSettings):
         from src.blockchain.chains import get_rpc_urls as get_chain_rpc_urls
 
         return get_chain_rpc_urls(chain)
+
+    def get_scanner_rpc_url(self, chain: str) -> str:
+        """
+        URL keyed scanner RPC для сети, либо "" если plane не настроен.
+
+        Args:
+            chain: Имя сети из chains.toml
+        """
+        if not self.scanner_rpc_base_url:
+            return ""
+
+        from src.blockchain.chains import get_chain_config
+
+        alias = get_chain_config(chain).scanner_rpc_chain or chain
+        return f"{self.scanner_rpc_base_url.rstrip('/')}/{alias}"
+
+    def get_scanner_rpc_headers(self) -> dict[str, str]:
+        """Заголовки авторизации для scanner RPC (пусто если ключ не задан)."""
+        key = self.scanner_rpc_api_key.get_secret_value()
+        if not key:
+            return {}
+        return {self.scanner_rpc_api_key_header: key}
 
 
 @lru_cache

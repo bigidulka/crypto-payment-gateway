@@ -24,6 +24,11 @@ from src.blockchain.oklink_client import (
     OKLinkExplorerClient,
     OKLinkTransferLogFetcher,
 )
+from src.blockchain.resilient_fetcher import (
+    close_resilient_fetchers,
+    get_resilient_fetcher,
+    init_scanner_fetchers,
+)
 from src.core.config import get_settings
 from src.db.models import (
     ChainCheckpoint,
@@ -388,7 +393,7 @@ async def poll_chain(chain: str) -> None:
         scanner_provider = str(getattr(config, "scanner_provider", "rpc")).lower()
         last_scanned: int | None = None
 
-        if scanner_provider == "oklink":
+        if scanner_provider in ("oklink", "rpc"):
             # Invoice-flow сканирует active addresses напрямую. Stale checkpoint
             # не должен скрывать свежий payment, поэтому lower bound считается
             # от возраста active invoice, а не от chain_checkpoints.
@@ -399,7 +404,7 @@ async def poll_chain(chain: str) -> None:
             )
             to_block = safe_block
         else:
-            # Legacy/RPC path остаётся checkpoint-based.
+            # Legacy path остаётся checkpoint-based.
             last_scanned = await get_or_create_checkpoint(
                 session, chain, adapter, earliest_invoice_time
             )
@@ -491,21 +496,87 @@ async def poll_chain(chain: str) -> None:
                         failed_address_count += 1
                         logger.warning(f"[{chain}] Failed to fetch native OKLink txs: {e}")
             elif scanner_provider == "rpc":
-                batch_result = await adapter.get_transfer_logs_batch(
-                    from_block=from_block,
-                    to_block=to_block,
-                    to_addresses=erc20_addresses,
-                    token_contracts=erc20_token_contracts,
-                )
-                all_transfers = batch_result.transfers
-                if not batch_result.is_complete:
-                    scan_complete = False
-                    failed_address_count = batch_result.failed_address_count
-                    logger.warning(
-                        f"[{chain}] RPC active-check scan incomplete; "
-                        f"processing partial results without checkpoint advance: "
-                        f"failed_address_count={batch_result.failed_address_count}"
+                # ResilientLogFetcher закрывает все активные адреса одним
+                # запросом с OR по topics, поэтому стоимость круга не растёт
+                # вместе с количеством активных инвойсов.
+                fetcher = get_resilient_fetcher(chain)
+                if fetcher is not None:
+                    all_transfers = []
+                    fetch_result = await fetcher.fetch_transfer_logs(
+                        from_block=from_block,
+                        to_block=to_block,
+                        to_addresses=erc20_addresses,
+                        token_contracts=erc20_token_contracts,
                     )
+                    logger.debug(
+                        f"[{chain}] Fetched {len(fetch_result.logs)} logs via "
+                        f"{fetch_result.method_used.value} on {fetch_result.rpc_used} "
+                        f"in {fetch_result.latency_ms:.0f}ms"
+                    )
+                    if not fetch_result.is_complete:
+                        scan_complete = False
+                        failed_address_count = fetch_result.failed_address_count
+                        logger.warning(
+                            f"[{chain}] RPC active-check scan incomplete; "
+                            f"processing partial results without checkpoint advance: "
+                            f"failed_address_count={fetch_result.failed_address_count}"
+                        )
+
+                    for log in fetch_result.logs:
+                        try:
+                            transfer = _parse_transfer_log(chain, log)
+                            if transfer is not None:
+                                all_transfers.append(transfer)
+                        except Exception as e:
+                            logger.warning(f"[{chain}] Failed to parse RPC log: {e}")
+
+                    if native_addresses:
+                        native_result = await fetcher.fetch_native_transfers(
+                            from_block=from_block,
+                            to_block=to_block,
+                            to_addresses=native_addresses,
+                        )
+                        if not native_result.is_complete:
+                            scan_complete = False
+                            failed_address_count += native_result.failed_address_count
+                            logger.warning(
+                                f"[{chain}] Native scan incomplete: "
+                                f"failed_address_count="
+                                f"{native_result.failed_address_count}"
+                            )
+                        native_decimals = Decimal(10**config.native_decimals)
+                        for native in native_result.transfers:
+                            all_transfers.append(
+                                TransferLog(
+                                    tx_hash=native.tx_hash,
+                                    log_index=-1,
+                                    block_number=native.block_number,
+                                    from_address=native.from_address,
+                                    to_address=native.to_address,
+                                    token_contract=NATIVE_TOKEN_CONTRACT,
+                                    amount=Decimal(native.value_wei) / native_decimals,
+                                )
+                            )
+                else:
+                    logger.warning(
+                        f"[{chain}] ResilientLogFetcher not initialized, "
+                        f"falling back to per-address adapter scan"
+                    )
+                    batch_result = await adapter.get_transfer_logs_batch(
+                        from_block=from_block,
+                        to_block=to_block,
+                        to_addresses=erc20_addresses,
+                        token_contracts=erc20_token_contracts,
+                    )
+                    all_transfers = batch_result.transfers
+                    if not batch_result.is_complete:
+                        scan_complete = False
+                        failed_address_count = batch_result.failed_address_count
+                        logger.warning(
+                            f"[{chain}] RPC active-check scan incomplete; "
+                            f"processing partial results without checkpoint advance: "
+                            f"failed_address_count={batch_result.failed_address_count}"
+                        )
             else:
                 raise RuntimeError(
                     f"[{chain}] Unsupported scanner_provider={scanner_provider}"
@@ -703,6 +774,21 @@ async def run_poller() -> None:
 
     logger.info(f"Starting EVM Log Poller for chains: {chains}")
 
+    rpc_chains = [
+        chain
+        for chain in chains
+        if str(getattr(get_chain_config(chain), "scanner_provider", "rpc")).lower()
+        == "rpc"
+    ]
+    if rpc_chains:
+        ready = await init_scanner_fetchers(rpc_chains)
+        logger.info(f"ResilientLogFetcher ready for {ready}/{len(rpc_chains)} chains")
+        if ready < len(rpc_chains):
+            raise RuntimeError(
+                "Scanner RPC endpoints missing for some chains: "
+                f"configured={len(rpc_chains)}, ready={ready}"
+            )
+
     try:
         while True:
             for chain in chains:
@@ -720,6 +806,7 @@ async def run_poller() -> None:
             await asyncio.sleep(settings.poll_interval_seconds)
     finally:
         # Закрываем все adapter sessions при выходе
+        await close_resilient_fetchers()
         await close_all_adapters()
 
 
