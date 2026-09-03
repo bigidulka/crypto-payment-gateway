@@ -1,5 +1,11 @@
 # OKLink Primary Deposit Scanner Migration
 
+> ОТМЕНЕНО. Заменено на `.ralph/rpc-scanner-migration.md`: OKLink стоит один
+> запрос на адрес с паузой 1.5 с, поэтому стоимость круга росла вместе с числом
+> активных инвойсов. Сканер переведён на `eth_getLogs` с OR-фильтром по
+> получателям — один запрос на сеть независимо от числа адресов.
+
+
 Перенос persistent deposit scanner с RPC `eth_getLogs` на OKLink как основной источник входящих ERC-20/BEP-20 депозитов. RPC оставить для head block, balances, gas, signed tx/sweeps.
 
 ## Goals
