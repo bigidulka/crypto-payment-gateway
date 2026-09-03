@@ -79,40 +79,8 @@ services:
       TZ: UTC
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
-      PROXY_FILE: /app/proxies.txt
     volumes:
       - ./data:/data
-      - ./proxies.txt:/app/proxies.txt:ro
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-
-    healthcheck:
-      disable: true
-
-  # ========== Legacy Persistent Deposit Poller (disabled by default) ==========
-  worker-persistent:
-    profiles:
-      - legacy
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: production
-    container_name: arbitron-payment-worker-persistent
-    restart: unless-stopped
-    command: ["python", "-m", "src.workers.persistent_poller"]
-    env_file:
-      - .env
-    environment:
-      TZ: UTC
-      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
-      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
-      PROXY_FILE: /app/proxies.txt
-    volumes:
-      - ./data:/data
-      - ./proxies.txt:/app/proxies.txt:ro
     depends_on:
       redis:
         condition: service_healthy

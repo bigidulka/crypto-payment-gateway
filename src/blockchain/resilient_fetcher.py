@@ -841,9 +841,6 @@ async def init_resilient_fetchers(
             continue
 
         _fetchers[chain] = ResilientLogFetcher(chain, specs)
-        logger.info(
-            f"[{chain}] ResilientLogFetcher initialized with {len(specs)} endpoints"
-        )
 
 
 def build_endpoint_specs(
