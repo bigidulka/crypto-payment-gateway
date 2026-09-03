@@ -43,6 +43,30 @@ RPC-путь с OR-topics уже был реализован в `ResilientLogFet
 - [x] `enabled = true` для arbitron в payment_bot, деплой бота.
 - [x] Чистка: `proxies.txt`/`PROXY_FILE` у поллера, `worker-persistent` из compose,
       OKLINK_* из `.env.example`.
+- [x] Два бага, вскрытых деплоем (см. ниже), исправлены и проверены на проде.
+
+## Баги, которые нашёл деплой
+
+Оба существовали и до миграции, но проявлялись только на RPC-пути, где
+`from_block` уходит прямо в `eth_getLogs`.
+
+1. **Окно скана не было ограничено** (`cbaf117`). `to_block` всегда равнялся
+   head, `from_block` считался от возраста инвойса. На base это дало диапазон в
+   2.6 млн блоков: keyed plane ответил `HTTP 413`, публичный узел — «maximum
+   1000 blocks», скан падал каждый круг и checkpoint не двигался.
+   Теперь `from_block = max(invoice lower bound, checkpoint + 1)`, а `to_block`
+   ограничен `from_block + scan_window`; отставший сканер догоняет по окну за
+   круг, при этом устаревший checkpoint по-прежнему не может скрыть свежий
+   инвойс.
+
+2. **Cooldown воскрешал чужие сессии** (`f385b7c`). Адреса переиспользуются из
+   пула, а late-window матчил любую истёкшую сессию адреса, стоящего в
+   cooldown. Аренда адреса под новый BSC-инвойс поднимала его июльскую сессию на
+   base и июньскую на polygon: каждая сеть видела фиктивный активный адрес, а
+   `from_block` считался от даты того старого инвойса. Теперь доwatchивается
+   только самая свежая сессия адреса.
+   Проверено на проде в момент активного cooldown: старый предикат матчил
+   4 сессии на base/bsc/polygon, новый — одну, ту, что реально держит аренду.
 
 ## Verification
 
@@ -60,9 +84,16 @@ RPC-путь с OR-topics уже был реализован в `ResilientLogFet
   (bsc/USDT) выдан из свежего пула, просканирован, истёк в 23:26:30, webhook
   outbox создан, пул вернулся к 199 available + 1 cooldown.
 - Логи поллера: 0 упоминаний OKLink, 0 ошибок.
-- Gateway HEAD `51b4f3e`; сервисы: `api` healthy, `worker-poller`,
+- После обоих фиксов, второй smoke `PAY_P06nSWw_1QBmljTn`, адрес
+  `0xa03d3a2511e98da2691e9f90bc19481c3802801b`: сканируется только `bsc`,
+  окна по 12 блоков идут за головой, base/polygon/остальные простаивают,
+  0 ошибок и 0 catch-up.
+- Gateway HEAD `f385b7c`; сервисы: `api` healthy, `worker-poller`,
   `worker-webhook`, `worker-expirer`, `worker-sweeper`, `postgres`, `redis`.
 - payment_bot HEAD `b688526`; `manager_bot` и `bot_runner` пересобраны.
+- Ответы шлюза за 20 минут: 42×200, 1×201, 1×422 (мой кривой payload в smoke).
+  10×401 — это тестовый бот из ветки `new_design`, остановленный в 23:20;
+  после его удаления 401 больше нет.
 
 ## Осталось вручную
 
