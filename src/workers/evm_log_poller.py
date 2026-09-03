@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import and_, or_, select
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 
 from src.blockchain.chains import (
     NATIVE_TOKEN_CONTRACT,
@@ -288,6 +288,20 @@ async def get_active_deposit_addresses(
         ),
         PaymentSession.expires_at > now,
     )
+    # Адреса переиспользуются из пула, поэтому у одного адреса накапливается
+    # история сессий за месяцы. Cooldown относится только к последней аренде,
+    # поэтому доwatchиваем лишь самую свежую сессию адреса. Иначе свежий
+    # cooldown воскрешает давно истёкшие сессии — в том числе на других сетях —
+    # и растягивает окно скана на миллионы блоков.
+    newer_session = aliased(PaymentSession)
+    has_newer_session = (
+        select(newer_session.id)
+        .where(
+            newer_session.deposit_address_id == PaymentSession.deposit_address_id,
+            newer_session.expires_at > PaymentSession.expires_at,
+        )
+        .exists()
+    )
     late_window = and_(
         PaymentSession.status.in_(
             [
@@ -297,6 +311,7 @@ async def get_active_deposit_addresses(
         ),
         DepositAddress.lease_status == DepositAddressLeaseStatus.COOLDOWN,
         DepositAddress.cooldown_until > now,
+        ~has_newer_session,
     )
 
     stmt = (
