@@ -93,7 +93,7 @@ async def admin_login(request: LoginRequest, settings: SettingsDep) -> LoginResp
     
     # Проверяем логин/пароль
     if request.username == "admin" and verify_admin_key(request.password, settings):
-        token = create_admin_session()
+        token = create_admin_session(settings)
         return LoginResponse(success=True, token=token)
     
     return LoginResponse(success=False, message="Неверный логин или пароль")

@@ -26,10 +26,12 @@ SettingsDep = Annotated[Settings, Depends(get_settings)]
 
 # === Admin Authentication ===
 
-# В памяти храним валидные сессии (токен -> время создания)
-# В продакшене лучше использовать Redis
-_admin_sessions: dict[str, datetime] = {}
+# Токен сессии - подписанный, без состояния: "<expires_ts>.<nonce>.<hmac>".
+# Подпись на ADMIN_SECRET_KEY, поэтому токен переживает рестарт процесса и
+# одинаково валиден на любой реплике API. Раньше сессии жили в dict в памяти
+# и каждый деплой выбрасывал всех админов из панели.
 _SESSION_TTL_HOURS = 24
+_TOKEN_DERIVATION_TAG = b"arbitron-admin-session-v1"
 
 
 def verify_admin_key(provided_key: str, settings: Settings) -> bool:
@@ -40,33 +42,43 @@ def verify_admin_key(provided_key: str, settings: Settings) -> bool:
     return hmac.compare_digest(provided_key, admin_key)
 
 
-def create_admin_session() -> str:
-    """Создать новую админ-сессию."""
-    token = secrets.token_urlsafe(48)
-    _admin_sessions[token] = datetime.now(timezone.utc)
-    # Очищаем старые сессии
-    _cleanup_old_sessions()
-    return token
+def _session_signing_key(settings: Settings) -> bytes:
+    """
+    Ключ подписи выводится из админ-ключа, а не равен ему: утечка подписи
+    токена не должна отдавать сам ADMIN_SECRET_KEY.
+    """
+    admin_key = settings.admin_secret_key.get_secret_value().encode()
+    return hmac.new(admin_key, _TOKEN_DERIVATION_TAG, hashlib.sha256).digest()
 
 
-def _cleanup_old_sessions() -> None:
-    """Удалить истёкшие сессии."""
-    now = datetime.now(timezone.utc)
-    expired = [
-        token for token, created_at in _admin_sessions.items()
-        if (now - created_at).total_seconds() > _SESSION_TTL_HOURS * 3600
-    ]
-    for token in expired:
-        _admin_sessions.pop(token, None)
+def _sign_session(payload: str, settings: Settings) -> str:
+    return hmac.new(
+        _session_signing_key(settings), payload.encode(), hashlib.sha256
+    ).hexdigest()
 
 
-def validate_admin_session(token: str) -> bool:
-    """Проверить валидность сессии."""
-    if token not in _admin_sessions:
+def create_admin_session(settings: Settings) -> str:
+    """Выпустить админ-токен на _SESSION_TTL_HOURS."""
+    expires = int(datetime.now(timezone.utc).timestamp()) + _SESSION_TTL_HOURS * 3600
+    nonce = secrets.token_urlsafe(16)
+    payload = f"{expires}.{nonce}"
+    return f"{payload}.{_sign_session(payload, settings)}"
+
+
+def validate_admin_session(token: str, settings: Settings) -> bool:
+    """Проверить подпись и срок токена."""
+    parts = token.split(".")
+    if len(parts) != 3:
         return False
-    created_at = _admin_sessions[token]
-    age_hours = (datetime.now(timezone.utc) - created_at).total_seconds() / 3600
-    return age_hours < _SESSION_TTL_HOURS
+    expires_raw, nonce, signature = parts
+    try:
+        expires = int(expires_raw)
+    except ValueError:
+        return False
+    if int(datetime.now(timezone.utc).timestamp()) >= expires:
+        return False
+    expected = _sign_session(f"{expires_raw}.{nonce}", settings)
+    return hmac.compare_digest(expected, signature)
 
 
 async def require_admin_auth(
@@ -106,7 +118,7 @@ async def require_admin_auth(
     # Способ 2: Session token
     if authorization and authorization.startswith("Bearer "):
         token = authorization[7:]
-        if validate_admin_session(token):
+        if validate_admin_session(token, settings):
             return True
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
