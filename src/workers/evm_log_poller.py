@@ -5,7 +5,7 @@ EVM Log Poller Worker.
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -375,6 +375,30 @@ def _underpayment_tolerance(invoice_amount: Decimal) -> Decimal:
     return max(relative, absolute).quantize(Decimal("0.000001"))
 
 
+async def _deposit_address_balance(
+    adapter, config, address: str, token: str
+) -> Decimal | None:
+    """
+    Фактический баланс депозитного адреса по активу инвойса.
+
+    Адрес одноразовый и на время аренды принадлежит одному инвойсу, поэтому
+    баланс — это накопленная сумма всех переводов, включая доплату отдельной
+    транзакцией. Возвращает None, если узел не ответил: тогда решение
+    принимается по одному переводу, как раньше.
+    """
+    try:
+        if config.is_native_asset(token):
+            return (await adapter.get_native_balance(address)).quantize(
+                Decimal("0.000001")
+            )
+        contract = config.get_asset_contract(token)
+        balance = await adapter.get_erc20_balance(address, contract)
+        return balance.quantize(Decimal("0.000001"))
+    except Exception as e:
+        logger.warning(f"Failed to read balance of {address} for {token}: {e}")
+        return None
+
+
 def _token_symbol_for_contract(config, token_contract: str) -> str:
     """Символ токена по адресу контракта, иначе сам адрес."""
     contract = (token_contract or "").lower()
@@ -730,6 +754,26 @@ async def poll_chain(chain: str) -> None:
                 # прислать ровно столько, сколько показал бот.
                 shortfall = invoice_amount_normalized - transfer_amount_normalized
                 tolerance = _underpayment_tolerance(invoice_amount_normalized)
+
+                if shortfall > tolerance:
+                    # Пользователь мог дослать остаток отдельным переводом.
+                    # Сравнивать каждый перевод в отдельности нельзя: тогда
+                    # доплата никогда не закроет счёт. Смотрим фактический
+                    # баланс адреса — он и есть накопленная сумма.
+                    balance = await _deposit_address_balance(
+                        adapter, config, to_addr, payment_session.token
+                    )
+                    if (
+                        balance is not None
+                        and invoice_amount_normalized - balance <= tolerance
+                    ):
+                        logger.info(
+                            f"[{chain}] Top-up completes {to_addr}: "
+                            f"balance={balance} covers {invoice_amount_normalized}"
+                        )
+                        transfer_amount_normalized = balance
+                        transfer = replace(transfer, amount=balance)
+                        shortfall = invoice_amount_normalized - balance
 
                 if shortfall > tolerance:
                     logger.warning(
