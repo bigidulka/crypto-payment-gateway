@@ -30,11 +30,28 @@ class _Session:
 
 
 class _Adapter:
+    def __init__(self, erc20_balance: Decimal | None = None):
+        # None -> узел не ответил
+        self.erc20_balance = erc20_balance
+        self.balance_calls = 0
+
     async def get_latest_block_number(self):
         return 150
 
     async def get_transfer_logs_batch(self, *args, **kwargs):
         raise AssertionError("resilient fetcher must be used")
+
+    async def get_erc20_balance(self, address, contract):
+        self.balance_calls += 1
+        if self.erc20_balance is None:
+            raise RuntimeError("node unavailable")
+        return self.erc20_balance
+
+    async def get_native_balance(self, address):
+        self.balance_calls += 1
+        if self.erc20_balance is None:
+            raise RuntimeError("node unavailable")
+        return self.erc20_balance
 
 
 @dataclass
@@ -118,7 +135,9 @@ def _payment_session():
     )
 
 
-def _patch(monkeypatch, session, payment_session, logs):
+def _patch(monkeypatch, session, payment_session, logs, adapter=None):
+    adapter = adapter or _Adapter()
+
     @asynccontextmanager
     async def _session_context():
         yield session
@@ -126,7 +145,7 @@ def _patch(monkeypatch, session, payment_session, logs):
     async def _active_addresses(db_session, chain):
         return {ADDRESS: payment_session}
 
-    async def _checkpoint(db_session, chain, adapter, earliest):
+    async def _checkpoint(db_session, chain, chain_adapter, earliest):
         return 100
 
     async def _update_checkpoint(db_session, chain, block_number):
@@ -135,7 +154,7 @@ def _patch(monkeypatch, session, payment_session, logs):
     monkeypatch.setattr(poller, "get_session_context", _session_context)
     monkeypatch.setattr(poller, "get_active_deposit_addresses", _active_addresses)
     monkeypatch.setattr(poller, "get_chain_config", lambda chain: _chain_config())
-    monkeypatch.setattr(poller, "get_evm_adapter", lambda chain: _Adapter())
+    monkeypatch.setattr(poller, "get_evm_adapter", lambda chain: adapter)
     monkeypatch.setattr(poller, "get_or_create_checkpoint", _checkpoint)
     monkeypatch.setattr(poller, "update_checkpoint", _update_checkpoint)
     monkeypatch.setattr(poller, "get_resilient_fetcher", lambda chain: _FakeFetcher(logs))
@@ -199,12 +218,42 @@ async def test_underpayment_within_tolerance_is_accepted(monkeypatch):
 @pytest.mark.asyncio
 async def test_underpayment_beyond_tolerance_is_recorded_not_dropped(monkeypatch):
     session, ps = _Session(), _payment_session()
-    _patch(monkeypatch, session, ps, [_transfer_log(Decimal("80"))])
+    # Баланс адреса тоже 80 — доплаты не было
+    adapter = _Adapter(erc20_balance=Decimal("80"))
+    _patch(monkeypatch, session, ps, [_transfer_log(Decimal("80"))], adapter=adapter)
 
     await poller.poll_chain("bsc")
 
     assert ps.mismatch_reason == poller.MISMATCH_UNDERPAID
     assert ps.received_amount == Decimal("80")
+
+
+@pytest.mark.asyncio
+async def test_top_up_transfer_closes_the_invoice(monkeypatch):
+    """Дослали остаток вторым переводом: считать надо баланс, не один перевод."""
+    session, ps = _Session(), _payment_session()
+    # Второй перевод на 20, на адресе уже накопилось 100
+    adapter = _Adapter(erc20_balance=Decimal("100"))
+    _patch(monkeypatch, session, ps, [_transfer_log(Decimal("20"))], adapter=adapter)
+
+    await poller.poll_chain("bsc")
+
+    assert adapter.balance_calls == 1
+    assert ps.mismatch_reason is None
+    assert ps.received_amount == Decimal("100")
+
+
+@pytest.mark.asyncio
+async def test_unreachable_node_falls_back_to_single_transfer(monkeypatch):
+    """Если баланс не прочитался, решение принимается по переводу, как раньше."""
+    session, ps = _Session(), _payment_session()
+    adapter = _Adapter(erc20_balance=None)
+    _patch(monkeypatch, session, ps, [_transfer_log(Decimal("20"))], adapter=adapter)
+
+    await poller.poll_chain("bsc")
+
+    assert ps.mismatch_reason == poller.MISMATCH_UNDERPAID
+    assert ps.received_amount == Decimal("20")
 
 
 @pytest.mark.asyncio
