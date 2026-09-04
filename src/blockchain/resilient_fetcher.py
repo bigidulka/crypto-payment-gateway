@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from web3 import AsyncWeb3
+from web3 import AsyncWeb3, Web3
 from web3.exceptions import Web3RPCError
 
 from src.blockchain.chains import get_chain_config, get_transfer_event_signature
@@ -311,9 +311,14 @@ class ResilientLogFetcher:
         if not endpoint.circuit_or_topics.can_execute():
             raise RuntimeError("Circuit breaker open for OR topics")
 
+        # web3 отвергает не-checksum адреса в параметре address: lowercase
+        # из конфига роняет запрос целиком, скан уходит в incomplete и
+        # fail-closed блокирует зачисления сети. Нормализуем.
+        contracts = [
+            Web3.to_checksum_address(contract) for contract in token_contracts
+        ]
         # Паддинг адресов
         padded_addresses = ["0x" + addr[2:].lower().zfill(64) for addr in to_addresses]
-
         try:
             start = time.time()
 
@@ -322,7 +327,7 @@ class ResilientLogFetcher:
                     {
                         "fromBlock": from_block,
                         "toBlock": to_block,
-                        "address": token_contracts,
+                        "address": contracts,
                         "topics": [
                             get_transfer_event_signature(),
                             None,  # from - любой
@@ -357,12 +362,15 @@ class ResilientLogFetcher:
         """Получить логи для одного адреса."""
         padded = "0x" + to_address[2:].lower().zfill(64)
 
+        contracts = [
+            Web3.to_checksum_address(contract) for contract in token_contracts
+        ]
         logs = await asyncio.wait_for(
             endpoint.web3.eth.get_logs(
                 {
                     "fromBlock": from_block,
                     "toBlock": to_block,
-                    "address": token_contracts,
+                    "address": contracts,
                     "topics": [
                         get_transfer_event_signature(),
                         None,
