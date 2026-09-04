@@ -94,6 +94,13 @@ class Settings(BaseSettings):
     oklink_api_key_time_shift_ms: int = 0
     oklink_request_timeout_seconds: float = 20.0
 
+    # === Underpayment tolerance ===
+    # Биржи удерживают комиссию с суммы вывода, поэтому пользователь физически
+    # не может прислать ровно ту сумму, что показал бот. Засчитываем платёж,
+    # если недостача не превышает max(процент, абсолютный минимум).
+    underpayment_tolerance_percent: str = "1.0"
+    underpayment_tolerance_absolute: str = "0.02"
+
     # === Security / Anti-Phishing ===
     # Минимальная сумма депозита (защита от dust/poison attacks)
     min_deposit_usdt: str = "0.01"  # $0.01 минимум

@@ -172,6 +172,24 @@ class PaymentSession(Base, UUIDMixin):
         nullable=True,
     )
 
+    # Сколько реально пришло на адрес. Раньше несовпадение суммы приводило к
+    # молчаливому пропуску перевода: пользователь видел «не оплачено» и не знал,
+    # что деньги ушли. Теперь факт фиксируется даже когда сумма не подошла.
+    received_amount: Mapped[Decimal | None] = mapped_column(
+        Numeric(36, 18),
+        nullable=True,
+    )
+    # underpaid | wrong_token — почему перевод не закрыл инвойс
+    mismatch_reason: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+    )
+    # Символ токена, который реально пришёл (для wrong_token)
+    mismatch_token: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+    )
+
     # Relationships
     invoice: Mapped["Invoice"] = relationship(
         "Invoice", back_populates="payment_sessions"

@@ -60,6 +60,17 @@ class PaymentStatusResponse(BaseModel):
     required_confirmations: int = 0
     explorer_tx_url: str | None = None
 
+    # Сколько реально пришло на адрес. Для оплаченного инвойса это фактическая
+    # сумма перевода: при переплате она больше запрошенной, и начислять надо
+    # именно её.
+    received_amount: Decimal | None = None
+    # underpaid | wrong_token — перевод пришёл, но инвойс не закрыл
+    mismatch_reason: str | None = None
+    # Символ токена, который прислали вместо ожидаемого
+    mismatch_token: str | None = None
+    # Сколько не хватает до суммы инвойса при недоплате
+    missing_amount: Decimal | None = None
+
 
 class InvoiceInfoResponse(BaseModel):
     """Информация об инвойсе для hosted страницы."""

@@ -223,6 +223,14 @@ async def get_payment_status(
             response.confirmations = tx.confirmations
             response.explorer_tx_url = chain_config.get_explorer_tx_url(tx.tx_hash)
 
+        # Что реально пришло на адрес: при переплате начислять надо эту сумму,
+        # при недоплате или чужом токене — объяснить пользователю, что не так.
+        response.received_amount = ps.received_amount
+        response.mismatch_reason = ps.mismatch_reason
+        response.mismatch_token = ps.mismatch_token
+        if ps.mismatch_reason == "underpaid" and ps.received_amount is not None:
+            response.missing_amount = invoice.amount - ps.received_amount
+
     return response
 
 

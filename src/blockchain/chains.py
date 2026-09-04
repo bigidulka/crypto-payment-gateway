@@ -82,6 +82,18 @@ class ChainConfig:
         """Получить конфигурацию токена по символу."""
         return self.tokens.get(symbol.upper())
 
+    def estimated_credit_seconds(self, poll_interval_seconds: float = 0.0) -> float:
+        """
+        Сколько реально ждать зачисления в этой сети.
+
+        Сканер видит блок только на глубине max(confirmations, reorg_buffer):
+        верхняя граница окна — head минус reorg_buffer, а зачисление требует
+        confirmations. Плюс интервал опроса. Оценка по confirmations *
+        block_time занижала ожидание ровно на разницу с reorg_buffer.
+        """
+        depth_blocks = max(self.confirmations, self.reorg_buffer)
+        return depth_blocks * self.block_time_sec + poll_interval_seconds
+
     def is_native_asset(self, symbol: str) -> bool:
         """Проверить, является ли asset нативной монетой сети."""
         return symbol.upper() == self.native_symbol.upper()

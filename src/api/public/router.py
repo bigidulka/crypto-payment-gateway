@@ -8,6 +8,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from src.blockchain.chains import get_all_chains, get_chain_config, is_chain_supported
+from src.core.config import get_settings
 
 router = APIRouter(prefix="/public", tags=["Public"])
 
@@ -33,6 +34,10 @@ class ChainInfo(BaseModel):
     explorer_url: str
     confirmations: int
     block_time_sec: float
+    # Сколько реально ждать зачисления: сканер видит блок только на глубине
+    # max(confirmations, reorg_buffer), плюс интервал опроса. Считать по
+    # confirmations * block_time занижало ожидание на величину reorg_buffer.
+    estimated_credit_seconds: float
     tokens: list[TokenInfo]
 
 
@@ -86,6 +91,7 @@ async def get_supported_chains() -> SupportedChainsResponse:
     """
     chains = {}
     total_tokens = 0
+    poll_interval = get_settings().poll_interval_seconds
 
     for chain_key in get_all_chains():
         config = get_chain_config(chain_key)
@@ -108,6 +114,9 @@ async def get_supported_chains() -> SupportedChainsResponse:
             explorer_url=config.explorer_url,
             confirmations=config.confirmations,
             block_time_sec=config.block_time_sec,
+            estimated_credit_seconds=config.estimated_credit_seconds(
+                poll_interval
+            ),
             tokens=tokens,
         )
 
@@ -194,6 +203,9 @@ async def get_chain_info_by_name(chain: str) -> ChainInfo:
         explorer_url=config.explorer_url,
         confirmations=config.confirmations,
         block_time_sec=config.block_time_sec,
+        estimated_credit_seconds=config.estimated_credit_seconds(
+            get_settings().poll_interval_seconds
+        ),
         tokens=tokens,
     )
 
