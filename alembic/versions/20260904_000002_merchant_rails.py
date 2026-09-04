@@ -28,6 +28,8 @@ def upgrade() -> None:
             sa.ForeignKey("merchants.id", ondelete="CASCADE"),
             nullable=False,
         ),
+        sa.Column("rail_type", sa.String(32), nullable=False),
+        sa.Column("network", sa.String(64), nullable=True),
         sa.Column("encrypted_credentials", sa.Text(), nullable=True),
         sa.Column("assets", sa.JSON(), nullable=False, server_default="[]"),
         sa.Column("label", sa.String(255), nullable=True),
