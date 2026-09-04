@@ -19,6 +19,7 @@ from src.db.models.enums import (
 )
 from src.db.models.invoice import Invoice, InvoiceEvent
 from src.db.models.merchant import ApiKey, Merchant, Webhook
+from src.db.models.rail import Rail
 from src.db.models.payment import (
     AddressLeaseEvent,
     DepositAddress,
