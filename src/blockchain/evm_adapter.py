@@ -1398,14 +1398,36 @@ def get_evm_adapter(chain: str) -> EvmAdapter:
 
     adapter = _adapter_cache[normalized]
     if adapter._rpc_manager is None:
-        try:
-            from src.blockchain.rpc_manager import get_rpc_manager
-
-            adapter.set_rpc_manager(get_rpc_manager(normalized))
-        except Exception:
-            pass
+        _attach_rpc_rotation(adapter, normalized)
 
     return adapter
+
+
+def _attach_rpc_rotation(adapter: EvmAdapter, chain: str) -> None:
+    """
+    Включить ротацию endpoint'ов из chains.toml.
+
+    chains.toml объявляет rpc_urls как список «for failover», но менеджер
+    ротации настраивал только persistent_poller и только себе. Все остальные
+    потребители адаптера - sweeper, admin API, merchant API - молча работали
+    в один rpc_urls[0]. Пока первый endpoint сети жив, это незаметно; когда
+    он начинает отвечать 403 на один метод, ветка умирает целиком.
+    """
+    from src.blockchain.rpc_manager import configure_rpc_endpoints, get_rpc_manager
+
+    try:
+        manager = get_rpc_manager(chain)
+    except ValueError:
+        urls = [u for u in (adapter.config.rpc_urls or []) if u]
+        if len(urls) < 2:
+            # Одному endpoint'у ротация не поможет: оставляем прямой клиент.
+            return
+        manager = configure_rpc_endpoints(chain, urls)
+    except Exception as e:
+        logger.warning(f"[{chain}] RPC rotation unavailable: {e}")
+        return
+
+    adapter.set_rpc_manager(manager)
 
 
 async def close_all_adapters() -> None:
