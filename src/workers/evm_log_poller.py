@@ -355,6 +355,60 @@ def _session_recency(payment_session: PaymentSession) -> datetime:
     return recency
 
 
+MISMATCH_UNDERPAID = "underpaid"
+MISMATCH_WRONG_TOKEN = "wrong_token"
+
+
+def _underpayment_tolerance(invoice_amount: Decimal) -> Decimal:
+    """
+    Насколько меньше можно прислать, чтобы платёж всё равно засчитался.
+
+    Берётся максимум из относительного и абсолютного допуска: процент спасает
+    крупные платежи, абсолютный минимум — мелкие, где комиссия биржи съедает
+    заметную долю суммы.
+    """
+    settings = get_settings()
+    relative = invoice_amount * (
+        Decimal(str(settings.underpayment_tolerance_percent)) / Decimal("100")
+    )
+    absolute = Decimal(str(settings.underpayment_tolerance_absolute))
+    return max(relative, absolute).quantize(Decimal("0.000001"))
+
+
+def _token_symbol_for_contract(config, token_contract: str) -> str:
+    """Символ токена по адресу контракта, иначе сам адрес."""
+    contract = (token_contract or "").lower()
+    if contract == NATIVE_TOKEN_CONTRACT.lower():
+        return config.native_symbol
+    for token in config.tokens.values():
+        if token.contract_address.lower() == contract:
+            return token.symbol
+    return token_contract
+
+
+async def _record_mismatch(
+    session,
+    payment_session: PaymentSession,
+    *,
+    reason: str,
+    amount: Decimal,
+    token_contract: str,
+    config,
+) -> None:
+    """
+    Зафиксировать перевод, который не закрыл инвойс.
+
+    Без этого недоплата и чужой токен исчезали бесследно: сканер делал
+    continue, инвойс истекал как неоплаченный, а пользователь оставался без
+    объяснения. Статус-эндпоинт отдаёт эти поля боту, чтобы тот показал
+    конкретные цифры.
+    """
+    payment_session.received_amount = amount
+    payment_session.mismatch_reason = reason
+    payment_session.mismatch_token = _token_symbol_for_contract(config, token_contract)
+    await session.commit()
+
+
 def _active_invoice_from_block(
     head_block: int,
     config,
@@ -643,32 +697,71 @@ async def poll_chain(chain: str) -> None:
                 continue
 
             try:
-                # Проверяем asset: ERC20 contract или native marker
+                invoice = payment_session.invoice
+
+                # Чужой токен на верный адрес: типовая ошибка — прислать USDC
+                # по инвойсу на USDT. Молча игнорировать нельзя, пользователь
+                # останется с «не оплачено» и без объяснения, куда ушли деньги.
                 expected_token_contract = config.get_asset_contract(payment_session.token)
                 if transfer.token_contract.lower() != expected_token_contract.lower():
+                    logger.warning(
+                        f"[{chain}] Wrong token for {to_addr}: "
+                        f"expected={payment_session.token} "
+                        f"({expected_token_contract}), got={transfer.token_contract}"
+                    )
+                    await _record_mismatch(
+                        session,
+                        payment_session,
+                        reason=MISMATCH_WRONG_TOKEN,
+                        amount=transfer.amount,
+                        token_contract=transfer.token_contract,
+                        config=config,
+                    )
                     continue
 
-                # Проверяем сумму (с учётом разной точности Decimal)
-                # Invoice amount может иметь больше знаков после запятой
-                invoice = payment_session.invoice
                 # Нормализуем до 6 знаков (USDT/USDC decimals)
                 transfer_amount_normalized = transfer.amount.quantize(
                     Decimal("0.000001")
                 )
                 invoice_amount_normalized = invoice.amount.quantize(Decimal("0.000001"))
 
-                if transfer_amount_normalized != invoice_amount_normalized:
+                # Недоплата в пределах допуска принимается: биржи удерживают
+                # комиссию с суммы вывода, и пользователь физически не может
+                # прислать ровно столько, сколько показал бот.
+                shortfall = invoice_amount_normalized - transfer_amount_normalized
+                tolerance = _underpayment_tolerance(invoice_amount_normalized)
+
+                if shortfall > tolerance:
                     logger.warning(
-                        f"[{chain}] Amount mismatch for {to_addr}: "
-                        f"expected={invoice.amount} ({invoice_amount_normalized}), "
-                        f"got={transfer.amount} ({transfer_amount_normalized})"
+                        f"[{chain}] Underpaid {to_addr}: "
+                        f"expected={invoice_amount_normalized}, "
+                        f"got={transfer_amount_normalized}, "
+                        f"shortfall={shortfall}, tolerance={tolerance}"
+                    )
+                    await _record_mismatch(
+                        session,
+                        payment_session,
+                        reason=MISMATCH_UNDERPAID,
+                        amount=transfer.amount,
+                        token_contract=transfer.token_contract,
+                        config=config,
                     )
                     continue
+
+                if transfer_amount_normalized > invoice_amount_normalized:
+                    logger.info(
+                        f"[{chain}] Overpaid {to_addr}: "
+                        f"expected={invoice_amount_normalized}, "
+                        f"got={transfer_amount_normalized}. Crediting what arrived."
+                    )
 
                 logger.info(
                     f"[{chain}] Found matching transfer for {to_addr}: "
                     f"amount={transfer.amount}, tx={transfer.tx_hash}"
                 )
+                payment_session.received_amount = transfer.amount
+                payment_session.mismatch_reason = None
+                payment_session.mismatch_token = None
 
                 # Записываем транзакцию
                 payment_service = PaymentService(session)
@@ -825,18 +918,19 @@ async def run_poller() -> None:
                 f"configured={len(rpc_chains)}, ready={ready}"
             )
 
+    async def poll_one(chain: str) -> None:
+        try:
+            await poll_chain(chain)
+            await update_confirmations(chain)
+        except Exception as e:
+            logger.error(f"Error polling {chain}: {e}")
+
     try:
         while True:
-            for chain in chains:
-                try:
-                    # Сканируем новые блоки
-                    await poll_chain(chain)
-
-                    # Обновляем подтверждения
-                    await update_confirmations(chain)
-
-                except Exception as e:
-                    logger.error(f"Error polling {chain}: {e}")
+            # Сети сканируются параллельно: последовательный обход делал
+            # задержку зачисления суммой по всем сетям, а не временем самой
+            # медленной из них.
+            await asyncio.gather(*(poll_one(chain) for chain in chains))
 
             # Пауза между итерациями
             await asyncio.sleep(settings.poll_interval_seconds)
