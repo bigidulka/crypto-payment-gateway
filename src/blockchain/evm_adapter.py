@@ -184,17 +184,38 @@ class EvmAdapter:
 
     async def get_transaction(self, tx_hash: str) -> TxData | None:
         """Получить транзакцию по хешу."""
-        try:
-            return await self.w3.eth.get_transaction(tx_hash)
-        except TransactionNotFound:
-            return None
+        return await self._fetch_tx(
+            lambda w3: w3.eth.get_transaction(tx_hash)
+        )
 
     async def get_transaction_receipt(self, tx_hash: str) -> TxReceipt | None:
         """Получить receipt транзакции."""
-        try:
-            return await self.w3.eth.get_transaction_receipt(tx_hash)
-        except TransactionNotFound:
-            return None
+        return await self._fetch_tx(
+            lambda w3: w3.eth.get_transaction_receipt(tx_hash)
+        )
+
+    async def _fetch_tx(self, call: Any) -> Any:
+        """
+        Прочитать транзакцию через ротацию endpoint'ов.
+
+        Без ротации запрос уходит в rpc_urls[0], и один запрещённый там метод
+        кладёт всю ветку: BSC-sweep месяц стоял на 403 от publicnode, хотя три
+        остальных endpoint'а сети отвечали.
+
+        TransactionNotFound - это ответ «ещё не в блоке», а не отказ узла.
+        Гасим его до того, как его увидит RpcManager, иначе ротация пометит
+        живой endpoint сломанным и уйдёт перебирать сеть впустую.
+        """
+
+        async def _attempt(w3: AsyncWeb3) -> Any:
+            try:
+                return await call(w3)
+            except TransactionNotFound:
+                return None
+
+        if self._rpc_manager and self._use_rpc_manager:
+            return await self._rpc_manager.execute(_attempt)
+        return await _attempt(self.w3)
 
     async def get_confirmations(self, tx_hash: str) -> int | None:
         """

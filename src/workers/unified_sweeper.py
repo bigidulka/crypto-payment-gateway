@@ -399,9 +399,16 @@ class UnifiedBatchSweeper:
                         # Ещё не подтверждён, пропускаем
                         return SweepResult(job_id=str(job.id), success=False, error="Gas pending")
                 except Exception as e:
-                    logger.warning(f"[{job.chain}] Job {job.id}: gas check error: {e}")
-                    # Retry позже
-                    return SweepResult(job_id=str(job.id), success=False, error="Gas check failed")
+                    # Считаем это попыткой, а не «просто подождём». Без счётчика
+                    # джоб крутится вечно и молча: max_attempts не наступает,
+                    # last_error пуст, и снаружи это неотличимо от «всё хорошо».
+                    # Так BSC-sweep простоял 50 минут на 403 без единого следа.
+                    await self._mark_job_failed(job, f"Gas check failed: {e}")
+                    return SweepResult(
+                        job_id=str(job.id),
+                        success=False,
+                        error=f"Gas check failed: {e}",
+                    )
         
         if job.state == SweepState.SWEEPING:
             # Выполняем sweep
