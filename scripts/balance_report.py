@@ -215,6 +215,9 @@ async def main() -> None:
 
     totals: dict[str, Decimal] = defaultdict(Decimal)
     main_totals: dict[str, Decimal] = defaultdict(Decimal)
+    main_by_chain: dict[str, dict[str, Decimal]] = defaultdict(
+        lambda: defaultdict(Decimal)
+    )
     stuck: list[tuple[str, str, str, Decimal, str]] = []
 
     for outcome in results:
@@ -228,6 +231,7 @@ async def main() -> None:
                     continue
                 if address == main_address:
                     main_totals[symbol] += amount
+                    main_by_chain[chain][symbol] += amount
                 else:
                     totals[symbol] += amount
                     stuck.append(
@@ -238,8 +242,18 @@ async def main() -> None:
         print(f"MAIN {main_address}")
         print("-" * 78)
         if main_totals:
+            # По сетям, потому что суммарная цифра не отвечает на вопрос
+            # «хватит ли газа, чтобы отправить с этой сети».
+            for chain in sorted(main_by_chain):
+                held = main_by_chain[chain]
+                line = "  ".join(
+                    f"{symbol} {amount:.8f}".rstrip("0").rstrip(".")
+                    for symbol, amount in sorted(held.items())
+                )
+                print(f"  {chain:10s} {line}")
+            print()
             for symbol, amount in sorted(main_totals.items()):
-                print(f"  {symbol:6s} {amount:>22.8f}")
+                print(f"  всего {symbol:6s} {amount:>22.8f}")
         else:
             print("  пусто")
         print()
