@@ -24,11 +24,10 @@ class WebhookVerificationError(ValueError):
 
 
 def compute_signature(payload: bytes, secret: str, timestamp: int) -> str:
-    """
-    HMAC-SHA256 над `"{timestamp}." + payload`.
+    """Return HMAC-SHA256 for the exact timestamp and body bytes.
 
-    Timestamp внутри подписанного сообщения - защита от replay: перехваченный
-    вебхук нельзя переиграть позже с другим временем.
+    The timestamp limits the acceptance window only. Receivers must durably
+    deduplicate verified business events to protect their own side effects.
     """
     message = f"{timestamp}.".encode() + payload
     return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
@@ -54,20 +53,24 @@ def verify_webhook(
     """
     Проверить вебхук и вернуть распарсенное событие.
 
-    Args:
         payload: тело запроса ровно теми байтами, что пришли - до любого
             JSON-парсинга. Переформатированный JSON подпись не пройдёт.
         headers: заголовки запроса.
-        secret: секрет вебхука, выданный шлюзом при его создании.
-        max_age_seconds: допуск по времени; ноль отключает проверку.
-
+        secret: непустой секрет webhook, выданный шлюзом при его создании.
+        max_age_seconds: положительный допуск по времени в секундах.
     Raises:
         WebhookVerificationError: если что-то не так. Ответьте 400 и не
             обрабатывайте событие.
     """
+    if not isinstance(secret, str) or not secret:
+        raise WebhookVerificationError("webhook secret is required")
+    if not isinstance(max_age_seconds, int) or isinstance(max_age_seconds, bool):
+        raise WebhookVerificationError("max_age_seconds must be a positive integer")
+    if max_age_seconds <= 0:
+        raise WebhookVerificationError("max_age_seconds must be a positive integer")
     signature = _header(headers, HEADER_SIGNATURE)
     raw_timestamp = _header(headers, HEADER_TIMESTAMP)
-    event_type = _header(headers, HEADER_EVENT) or ""
+    header_event = _header(headers, HEADER_EVENT)
 
     if not signature or not raw_timestamp:
         raise WebhookVerificationError("missing signature headers")
@@ -77,10 +80,9 @@ def verify_webhook(
     except ValueError as exc:
         raise WebhookVerificationError("timestamp is not an integer") from exc
 
-    if max_age_seconds:
-        current = int(time.time()) if now is None else now
-        if abs(current - timestamp) > max_age_seconds:
-            raise WebhookVerificationError("signature too old")
+    current = int(time.time()) if now is None else now
+    if abs(current - timestamp) > max_age_seconds:
+        raise WebhookVerificationError("signature too old")
 
     expected = compute_signature(payload, secret, timestamp)
     if not secrets.compare_digest(expected, signature):
@@ -93,8 +95,12 @@ def verify_webhook(
     if not isinstance(data, dict):
         raise WebhookVerificationError("payload must be a JSON object")
 
-    return WebhookEvent(
-        event_type=event_type or str(data.get("event", "")),
-        timestamp=timestamp,
-        data=data,
-    )
+    event_type = data.get("event")
+    if not isinstance(event_type, str) or not event_type:
+        raise WebhookVerificationError("signed payload is missing event")
+    # The header is not covered by the HMAC, so it is informational only and
+    # must never override the signed body.
+    if header_event is not None and header_event != event_type:
+        raise WebhookVerificationError("event header does not match signed payload")
+
+    return WebhookEvent(event_type=event_type, timestamp=timestamp, data=data)

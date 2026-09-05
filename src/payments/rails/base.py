@@ -97,13 +97,26 @@ class RailPayout:
 
 
 class RailError(Exception):
-    """Рельс не смог выполнить операцию."""
+    """A rail request failed with retry and outcome-safety metadata."""
 
-    def __init__(self, rail: str, message: str, *, permanent: bool = False):
+    def __init__(
+        self,
+        rail: str,
+        message: str,
+        *,
+        permanent: bool = False,
+        retry_after_seconds: int | None = None,
+        outcome_unknown: bool = False,
+    ):
         super().__init__(f"[{rail}] {message}")
         self.rail = rail
-        # permanent=True: ретраи бессмысленны (креды, лимиты, 4xx от API)
+        # permanent=True: retrying is not useful (validated credentials/4xx).
         self.permanent = permanent
+        # Provider-supplied bounded delay for a retryable response, if parseable.
+        self.retry_after_seconds = retry_after_seconds
+        # A mutating provider call may have succeeded despite no trustworthy
+        # response. Orchestration must reconcile; it must not blindly retry.
+        self.outcome_unknown = outcome_unknown
 
 
 class Rail(ABC):

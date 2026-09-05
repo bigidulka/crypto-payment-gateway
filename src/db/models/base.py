@@ -5,13 +5,12 @@
 import json
 import uuid as uuid_module
 from datetime import datetime
-from typing import Any, List
+from typing import Any
 
 from sqlalchemy import DateTime, LargeBinary, String, Text, TypeDecorator, func
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-
 
 # ============================================================================
 # Универсальные типы для совместимости PostgreSQL и SQLite
@@ -35,32 +34,38 @@ class UniversalBytes(TypeDecorator):
 
 
 class UniversalJSON(TypeDecorator):
-    """
-    Тип для хранения JSON.
-    - PostgreSQL: JSONB (индексируемый)
-    - SQLite: TEXT с JSON сериализацией
+    """Portable JSON with an explicit PostgreSQL storage type.
+
+    Existing gateway models use the default JSONB to match their migrations.
+    Migration 0009's ``rails.assets`` is PostgreSQL JSON, so that model passes
+    ``postgres_jsonb=False`` and is tested against the actual catalog type.
     """
 
     impl = Text
     cache_ok = True
 
+    def __init__(self, *, postgres_jsonb: bool = True):
+        super().__init__()
+        self.postgres_jsonb = postgres_jsonb
+
     def load_dialect_impl(self, dialect: Dialect):
         if dialect.name == "postgresql":
-            return dialect.type_descriptor(postgresql.JSONB())
+            type_ = postgresql.JSONB() if self.postgres_jsonb else postgresql.JSON()
+            return dialect.type_descriptor(type_)
         return dialect.type_descriptor(Text())
 
     def process_bind_param(self, value: Any, dialect: Dialect) -> str | None:
         if value is None:
             return None
         if dialect.name == "postgresql":
-            return value  # PostgreSQL обрабатывает JSONB сам
+            return value
         return json.dumps(value, ensure_ascii=False)
 
     def process_result_value(self, value: Any, dialect: Dialect) -> Any:
         if value is None:
             return None
         if dialect.name == "postgresql":
-            return value  # PostgreSQL возвращает dict напрямую
+            return value
         if isinstance(value, str):
             return json.loads(value)
         return value
@@ -86,15 +91,15 @@ class UniversalArray(TypeDecorator):
         return dialect.type_descriptor(Text())
 
     def process_bind_param(
-        self, value: List[str] | None, dialect: Dialect
-    ) -> str | List[str] | None:
+        self, value: list[str] | None, dialect: Dialect
+    ) -> str | list[str] | None:
         if value is None:
             return None
         if dialect.name == "postgresql":
             return value  # PostgreSQL обрабатывает ARRAY сам
         return json.dumps(value, ensure_ascii=False)
 
-    def process_result_value(self, value: Any, dialect: Dialect) -> List[str] | None:
+    def process_result_value(self, value: Any, dialect: Dialect) -> list[str] | None:
         if value is None:
             return None
         if dialect.name == "postgresql":

@@ -8,7 +8,6 @@
 """
 
 import base64
-import os
 import secrets
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -26,8 +25,11 @@ def generate_encryption_key() -> str:
 
 
 def _get_key_bytes(key_base64: str) -> bytes:
-    """Декодировать ключ из base64."""
-    key_bytes = base64.b64decode(key_base64)
+    """Decode and validate an AES-256 key encoded as canonical base64."""
+    try:
+        key_bytes = base64.b64decode(key_base64, validate=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Encryption key must be valid base64") from exc
     if len(key_bytes) != 32:
         raise ValueError(f"Encryption key must be 32 bytes, got {len(key_bytes)}")
     return key_bytes
@@ -119,3 +121,31 @@ def rotate_encryption_key(
     private_key = private_key[2:] if private_key.startswith("0x") else private_key
     # Шифруем новым ключом
     return encrypt_private_key(private_key, new_key)
+
+
+
+def encrypt_secret(secret: str, encryption_key: str) -> bytes:
+    """Encrypt an arbitrary UTF-8 secret with AES-256-GCM.
+
+    Its stored representation is ``nonce (12 bytes) + ciphertext + tag``;
+    callers are responsible for an explicit durable encoding such as hex.
+    """
+    if not isinstance(secret, str):
+        raise TypeError("secret must be a string")
+    nonce = secrets.token_bytes(12)
+    return nonce + AESGCM(_get_key_bytes(encryption_key)).encrypt(
+        nonce, secret.encode("utf-8"), None
+    )
+
+
+def decrypt_secret(encrypted_data: bytes, encryption_key: str) -> str:
+    """Decrypt a value produced by :func:`encrypt_secret`."""
+    if not isinstance(encrypted_data, bytes) or len(encrypted_data) < 12 + 16:
+        raise ValueError("Invalid encrypted data: too short")
+    nonce = encrypted_data[:12]
+    try:
+        return AESGCM(_get_key_bytes(encryption_key)).decrypt(
+            nonce, encrypted_data[12:], None
+        ).decode("utf-8")
+    except Exception as exc:
+        raise ValueError("Decryption failed") from exc

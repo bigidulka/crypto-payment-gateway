@@ -56,14 +56,24 @@ async def on_webhook(request):
     except WebhookVerificationError:
         return Response(status_code=400)
 
+    invoice = event.data["invoice"]
     if event.event_type == "invoice.confirmed":
-        credit_user(event.data["metadata"]["external_user_id"], event.data["amount"])
+        # invoice["amount"] is the requested amount, not a verified received
+        # settlement amount. Do not credit from this webhook payload alone.
+        queue_reconciliation(invoice["id"])
     return Response(status_code=200)
 ```
 
-Подпись — HMAC-SHA256 над `"{timestamp}." + body`, заголовки
-`X-Webhook-Signature`, `X-Webhook-Timestamp`, `X-Webhook-Event`. Окно
-допуска по времени 5 минут (защита от replay).
+Подпись — HMAC-SHA256 над `"{timestamp}." + body`. `event` берётся только из
+подписанного JSON body; `X-Webhook-Event` — информационный header и при
+расхождении с body запрос отклоняется. Заголовки: `X-Webhook-Signature`,
+`X-Webhook-Timestamp`, `X-Webhook-Event`. Окно допуска по времени — 5 минут:
+оно ограничивает возраст подписи, но **не заменяет дедупликацию**. Храните
+обработанный durable ключ (например, `invoice.id` вместе с типом terminal
+event) в своей транзакции. Поле `invoice.amount` — запрошенная сумма: при
+переплате/недоплате оно не является суммой к зачислению. До появления в
+подписанном payload verified received amount сверяйте merchant-scoped
+authoritative payment/ledger record и делайте итоговое credit идемпотентным.
 
 ## Сверка статуса
 

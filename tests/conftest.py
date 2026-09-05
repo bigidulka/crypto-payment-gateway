@@ -4,13 +4,15 @@
 
 import asyncio
 import os
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
+import httpx
 import pytest
 import pytest_asyncio
-import httpx
-from web3 import Web3
-from eth_account import Account
+from sqlalchemy import text
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.core.config import get_settings
 
@@ -63,6 +65,101 @@ async def http_client(api_base_url: str) -> AsyncGenerator[httpx.AsyncClient, No
         timeout=30.0,
     ) as client:
         yield client
+
+
+_DESTRUCTIVE_RESET_TOKEN = "ALLOW_ISOLATED_TEST_DATABASE_RESET"
+_RESET_TABLES = (
+    "address_lease_events",
+    "api_keys",
+    "chain_checkpoints",
+    "deposit_addresses",
+    "deposits",
+    "invoice_events",
+    "invoices",
+    "merchants",
+    "onchain_txs",
+    "outbox_webhooks",
+    "payment_sessions",
+    "rails",
+    "unified_sweep_jobs",
+    "user_balances",
+    "user_wallets",
+    "wallet_addresses",
+    "webhooks",
+)
+
+
+def _require_safe_test_database(database_url: str) -> str:
+    """Refuse destructive cleanup unless all disposable-DB guards are met."""
+    if os.getenv("TEST_ALLOW_DESTRUCTIVE_RESET") != _DESTRUCTIVE_RESET_TOKEN:
+        pytest.fail("set TEST_ALLOW_DESTRUCTIVE_RESET to the documented explicit token")
+
+    url = make_url(database_url)
+    if url.drivername != "postgresql+asyncpg":
+        pytest.fail("TEST_DATABASE_URL must use postgresql+asyncpg")
+    if url.host not in {"127.0.0.1", "::1"}:
+        pytest.fail("TEST_DATABASE_URL host must be an explicit loopback IP")
+    if not url.database or not url.database.startswith("test_"):
+        pytest.fail("TEST_DATABASE_URL database name must start with test_")
+    if url.database == "arbitron_payment":
+        pytest.fail("refusing the production-named arbitron_payment database")
+
+    expected_database = os.getenv("TEST_EXPECTED_DATABASE")
+    if expected_database != url.database:
+        pytest.fail("TEST_EXPECTED_DATABASE must exactly match TEST_DATABASE_URL database")
+    return url.database
+@pytest_asyncio.fixture
+async def test_session(monkeypatch) -> AsyncGenerator[AsyncSession, None]:
+    """Provide one real, guarded disposable PostgreSQL session per DB test.
+
+    The command must pass an explicit loopback URL to a random `test_*`
+    database, the matching `TEST_EXPECTED_DATABASE`, and the destructive-reset
+    token. The fixture never reads ambient `DATABASE_URL` or `.env`; it never
+    truncates `alembic_version` and only clears the explicit table allowlist.
+    """
+    database_url = os.getenv("TEST_DATABASE_URL")
+    if not database_url:
+        pytest.fail("TEST_DATABASE_URL must point to an isolated PostgreSQL database")
+    expected_database = _require_safe_test_database(database_url)
+
+    engine = create_async_engine(database_url, pool_pre_ping=True)
+    try:
+        async with engine.begin() as connection:
+            current_database = await connection.scalar(text("SELECT current_database()"))
+            if current_database != expected_database:
+                pytest.fail("connected database does not match TEST_EXPECTED_DATABASE")
+
+            result = await connection.execute(
+                text(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+                )
+            )
+            actual_tables = set(result.scalars())
+            missing_tables = set(_RESET_TABLES) - actual_tables
+            if missing_tables:
+                pytest.fail(
+                    "TEST_DATABASE_URL is missing migrated tables: "
+                    f"{sorted(missing_tables)}"
+                )
+            quoted_tables = ", ".join(f'"{table_name}"' for table_name in _RESET_TABLES)
+            await connection.execute(
+                text(f"TRUNCATE TABLE {quoted_tables} RESTART IDENTITY CASCADE")
+            )
+
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session:
+            @asynccontextmanager
+            async def _session_context():
+                yield session
+
+            monkeypatch.setattr(
+                "src.workers.persistent_poller.get_session_context", _session_context
+            )
+            yield session
+            await session.rollback()
+    finally:
+        await engine.dispose()
 
 
 # ERC20 ABI для работы с токенами
