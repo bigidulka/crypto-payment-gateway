@@ -4,63 +4,52 @@ Webhook Dispatcher Worker.
 """
 
 import asyncio
+import json
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
-import httpx
+import aiohttp
 from sqlalchemy import and_, select
 from sqlalchemy.orm import selectinload
 
 from src.core.config import get_settings
 from src.core.security import generate_hmac_signature
+from src.core.webhook_egress import (
+    WebhookEgressError,
+    WebhookResolutionError,
+    pinned_webhook_session,
+    resolve_webhook_destination,
+)
 from src.db.models import OutboxStatus, OutboxWebhook, Webhook
 from src.db.session import get_session_context
 
 logger = logging.getLogger(__name__)
 
-# Глобальный httpx client с connection pooling
-_http_client: Optional[httpx.AsyncClient] = None
+_MAX_RESPONSE_BYTES = 4096
 
 
-async def get_http_client() -> httpx.AsyncClient:
-    """Получить httpx client с connection pooling."""
-    global _http_client
-    if _http_client is None:
-        _http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0, connect=10.0),
-            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
-        )
-    return _http_client
+@dataclass(frozen=True)
+class WebhookDeliveryResult:
+    """Non-sensitive delivery outcome for the outbox state machine."""
+
+    success: bool
+    error_code: str = ""
 
 
 async def close_http_client() -> None:
-    """Закрыть httpx client."""
-    global _http_client
-    if _http_client is not None:
-        await _http_client.aclose()
-        _http_client = None
+    """Compatibility hook: delivery sessions are per-request and already closed."""
+    return None
 
 
 async def send_webhook(
     webhook: Webhook,
     outbox: OutboxWebhook,
     timeout: int = 30,
-) -> bool:
-    """
-    Отправить webhook.
-
-    Returns:
-        True если успешно отправлено
-    """
-    # Формируем payload
-    import json
-
+) -> WebhookDeliveryResult:
+    """Deliver one signed webhook through a DNS-pinned no-redirect session."""
     payload_bytes = json.dumps(outbox.payload).encode()
-
-    # Генерируем подпись
     signature, timestamp = generate_hmac_signature(payload_bytes, webhook.secret)
-
     headers = {
         "Content-Type": "application/json",
         "X-Webhook-Signature": signature,
@@ -69,32 +58,46 @@ async def send_webhook(
     }
 
     try:
-        # Используем глобальный client с connection pooling
-        client = await get_http_client()
-        response = await client.post(
-            webhook.url,
-            content=payload_bytes,
-            headers=headers,
-            timeout=timeout,
-        )
-
-        # Считаем успехом любой 2xx ответ
-        if 200 <= response.status_code < 300:
-            logger.info(f"Webhook {outbox.id} sent successfully to {webhook.url}")
-            return True
-        else:
-            logger.warning(
-                f"Webhook {outbox.id} failed: status={response.status_code}, "
-                f"body={response.text[:200]}"
+        # One deadline covers DNS, TLS/connect, request write and bounded read.
+        # DNS itself receives the same remaining budget; it cannot consume an
+        # additional full timeout before the HTTP client starts.
+        async with asyncio.timeout(timeout):
+            destination = await resolve_webhook_destination(
+                webhook.url,
+                timeout_seconds=timeout,
             )
-            return False
-
-    except httpx.TimeoutException:
-        logger.warning(f"Webhook {outbox.id} timed out")
-        return False
-    except Exception as e:
-        logger.error(f"Webhook {outbox.id} error: {e}")
-        return False
+            async with pinned_webhook_session(destination, timeout_seconds=timeout) as client:
+                async with client.post(
+                    destination.url,
+                    data=payload_bytes,
+                    headers=headers,
+                    allow_redirects=False,
+                ) as response:
+                    await response.content.read(_MAX_RESPONSE_BYTES)
+                    if 200 <= response.status < 300:
+                        logger.info("Webhook %s delivered", outbox.id)
+                        return WebhookDeliveryResult(success=True)
+                    logger.warning(
+                        "Webhook %s delivery returned HTTP %s",
+                        outbox.id,
+                        response.status,
+                    )
+                    return WebhookDeliveryResult(
+                        success=False,
+                        error_code=f"http_{response.status}",
+                    )
+    except WebhookResolutionError:
+        logger.warning("Webhook %s DNS resolution unavailable", outbox.id)
+        return WebhookDeliveryResult(success=False, error_code="dns_resolution_failed")
+    except WebhookEgressError:
+        logger.warning("Webhook %s blocked by egress policy", outbox.id)
+        return WebhookDeliveryResult(success=False, error_code="egress_policy_blocked")
+    except TimeoutError:
+        logger.warning("Webhook %s timed out", outbox.id)
+        return WebhookDeliveryResult(success=False, error_code="timeout")
+    except aiohttp.ClientError:
+        logger.warning("Webhook %s transport failed", outbox.id)
+        return WebhookDeliveryResult(success=False, error_code="transport_error")
 
 
 async def process_pending_webhooks() -> int:
@@ -115,7 +118,7 @@ async def process_pending_webhooks() -> int:
             .where(
                 and_(
                     OutboxWebhook.status == OutboxStatus.PENDING,
-                    OutboxWebhook.next_retry_at <= datetime.now(timezone.utc),
+                    OutboxWebhook.next_retry_at <= datetime.now(UTC),
                     OutboxWebhook.attempt < OutboxWebhook.max_attempts,
                 )
             )
@@ -134,8 +137,7 @@ async def process_pending_webhooks() -> int:
                 outbox.last_error = "Webhook is inactive or deleted"
                 continue
 
-            # Отправляем webhook
-            success = await send_webhook(
+            delivery = await send_webhook(
                 webhook,
                 outbox,
                 timeout=settings.webhook_timeout_seconds,
@@ -143,38 +145,35 @@ async def process_pending_webhooks() -> int:
 
             outbox.attempt += 1
 
-            if success:
+            if delivery.success:
                 outbox.status = OutboxStatus.SENT
-                outbox.sent_at = datetime.now(timezone.utc)
+                outbox.sent_at = datetime.now(UTC)
             else:
-                # Экспоненциальный backoff: 1, 2, 4, 8, 16 минут
+                # Exponential backoff: 1, 2, 4, 8, 16 minutes. Existing
+                # legacy/internal records are retained, never replayed by this
+                # patch; a policy block receives a non-sensitive reason.
                 backoff_minutes = 2 ** (outbox.attempt - 1)
-                outbox.next_retry_at = datetime.now(timezone.utc) + timedelta(
+                outbox.next_retry_at = datetime.now(UTC) + timedelta(
                     minutes=backoff_minutes
                 )
-                outbox.last_error = "Delivery failed"
+                outbox.last_error = delivery.error_code or "delivery_failed"
 
-                # Если исчерпаны попытки
                 if outbox.attempt >= outbox.max_attempts:
                     outbox.status = OutboxStatus.FAILED
                     logger.warning(
-                        f"Webhook {outbox.id} failed permanently after {outbox.attempt} attempts"
+                        "Webhook %s failed permanently after %s attempts",
+                        outbox.id,
+                        outbox.attempt,
                     )
-
             processed += 1
-
         await session.commit()
 
     return processed
 
 
 async def run_dispatcher() -> None:
-    """
-    Главный цикл Webhook Dispatcher.
-    """
-    settings = get_settings()
-
-    logger.info("Starting Webhook Dispatcher")
+    """Run the webhook dispatcher until the worker is stopped."""
+    logger.info("Starting webhook dispatcher")
 
     try:
         while True:

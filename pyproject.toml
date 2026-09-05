@@ -37,7 +37,8 @@ dependencies = [
     # Cryptography
     "cryptography>=44.0.0",
 
-    # HTTP client
+    # HTTP clients
+    "aiohttp>=3.9",
     "httpx[socks]>=0.28.0",
 
     # Utils

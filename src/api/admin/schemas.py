@@ -2,12 +2,12 @@
 Pydantic схемы для Admin API.
 """
 
+import re
 from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, Field
-
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # === Auth ===
 
@@ -48,6 +48,48 @@ class MerchantListResponse(BaseModel):
 
     items: list[MerchantListItem]
     total: int
+
+
+class MerchantCreateRequest(BaseModel):
+    """Admin-only merchant onboarding request without raw secret fields."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=255)
+    email: str = Field(..., min_length=3, max_length=255)
+    key_name: str = Field(default="default", min_length=1, max_length=100)
+
+    @field_validator("name", "key_name")
+    @classmethod
+    def strip_required_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("value is required")
+        return value
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        value = value.strip().lower()
+        if not re.fullmatch(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+", value):
+            raise ValueError("valid email is required")
+        return value
+
+
+class MerchantApiKeyCreateRequest(BaseModel):
+    """Name for an additional merchant API key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(default="extra", min_length=1, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("name is required")
+        return value
 
 
 # === System Status ===
