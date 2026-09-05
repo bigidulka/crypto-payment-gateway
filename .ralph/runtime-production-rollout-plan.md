@@ -17,6 +17,15 @@ Guarded, read-only inspection of `/home/server/Projects/arbitron-payment` found:
 - candidate secret-delivery paths `/etc/arbitron`, `/etc/arbitron-payment`, `/run/secrets`, and `/home/server/.config/arbitron-payment` were absent. No path was created and no permissions were changed;
 - pre-change API/worker image IDs were read and recorded during inventory. Preserve them in the approved rollback record before any replacement; do not delete old images.
 
+## Director decisions recorded after inventory
+
+- Existing privileged `arbitron` remains unchanged and is migration-admin only; it must never enter API/worker runtime environment.
+- New `arbitron_runtime` is the future application login role.
+- Leave `PUBLIC TEMPORARY` unchanged. Reconfirm `PUBLIC CREATE=false` and empty public SECURITY DEFINER inventory immediately before rollout. No global `PUBLIC` revoke is authorized or proposed.
+- Approved external secret base path is `/home/server/.config/arbitron-payment`, owned by verified deploy user `server` (uid/gid `1000/1000`), not root. The base and `backups/` directory were created because absent, both mode `0700`; no runtime env/credential was created. A later runtime env must be mode `0600` under this directory.
+- `0010_ledger_foundation` remains unused additive schema: no ledger calls, backfill, fees, payouts, or provider features are enabled by the migration.
+- Backup preparation and isolated restore evidence is in `.ralph/runtime-backup-preparation.md`. It is an approved backup checkpoint, not approval for migration/deploy.
+
 ## Required director inputs before any command
 
 1. Approved final local `security(runtime): isolate limited-role deployment` commit (no push), signed/verified release provenance, and final clean checkout test record.
