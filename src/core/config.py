@@ -3,6 +3,7 @@
 Все настройки загружаются из переменных окружения.
 """
 
+import os
 from functools import lru_cache
 from typing import Literal
 
@@ -14,8 +15,7 @@ class Settings(BaseSettings):
     """Главные настройки приложения."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
+        env_file=None,
         case_sensitive=False,
         extra="ignore",
     )
@@ -28,9 +28,11 @@ class Settings(BaseSettings):
     secret_key: SecretStr = Field(..., min_length=32)
 
     # === Database ===
-    database_url: str = (
-        "postgresql+asyncpg://postgres:postgres@localhost:5432/arbitron_payment"
-    )
+    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/arbitron_payment"
+    # Runtime keeps DATABASE_URL. Alembic may use a distinct migration-owner
+    # connection via MIGRATION_DATABASE_URL after a reviewed role rollout.
+    migration_database_url: str | None = None
+    database_runtime_role_enabled: bool = False
 
     # === Redis ===
     redis_url: str = "redis://localhost:6379/0"
@@ -114,7 +116,6 @@ class Settings(BaseSettings):
     webhook_max_attempts: int = 5
     webhook_timeout_seconds: int = 30
 
-
     # === CORS ===
     # В production укажите конкретные домены через запятую
     # Пример: "https://example.com,https://api.example.com"
@@ -131,10 +132,7 @@ class Settings(BaseSettings):
         """Получить список разрешённых CORS origins."""
         if self.cors_origins == "*":
             return ["*"]
-        return [
-            origin.strip() for origin in self.cors_origins.split(",") if origin.strip()
-        ]
-
+        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
     def get_treasury_address(self, chain: str) -> str:
         """Получить treasury адрес для сети."""
@@ -189,6 +187,44 @@ class Settings(BaseSettings):
         if not key:
             return {}
         return {self.scanner_rpc_api_key_header: key}
+
+    def get_runtime_database_url(self) -> str:
+        """Return DATABASE_URL; limited mode is verified by startup DB checks."""
+        return self.database_url
+
+    def get_migration_database_url(self) -> str:
+        """Return the owner migration URL; fail closed in limited-runtime mode."""
+        if self.database_runtime_role_enabled and not self.migration_database_url:
+            raise RuntimeError(
+                "MIGRATION_DATABASE_URL is required when DATABASE_RUNTIME_ROLE_ENABLED=true"
+            )
+        return self.migration_database_url or self.database_url
+
+    def validate_limited_runtime_environment(self) -> None:
+        """Reject owner/bootstrap environment keys before limited runtime admission."""
+        if not self.database_runtime_role_enabled:
+            return
+        forbidden = {
+            "POSTGRES_PASSWORD",
+            "POSTGRES_USER",
+            "POSTGRES_DB",
+            "PGPASSWORD",
+            "DATABASE_OWNER_URL",
+            "OWNER_DATABASE_URL",
+        }
+        present = sorted(
+            name
+            for name, value in os.environ.items()
+            if value
+            and (
+                name in forbidden
+                or name.startswith("MIGRATION_")
+                or name.startswith("POSTGRES_")
+                or name.endswith("_OWNER_URL")
+            )
+        )
+        if present:
+            raise RuntimeError("limited runtime environment contains forbidden owner key names")
 
 
 @lru_cache
