@@ -74,15 +74,13 @@ Ledger suites have no pytest skips. The only excluded test is `tests/test_e2e_ch
 
 ## Commit and verification record
 
-Local foundation candidate before this verification-record update: `d28f5aeb9ae951e9844c15e9ef6985ef967949a0` (`feat(ledger): add immutable journal foundation`). It is local only: no push, deploy, production database migration, runtime-role rollout, or financial feature enablement occurred.
+Verified foundation source SHA: `e41349cc5c39cd247644f1eb1e66edfa08671d16` (`feat(ledger): add immutable journal foundation`). This is local only: no push, deploy, production database migration, runtime-role rollout, or financial feature enablement occurred.
 
-Detached clean checkout at that candidate SHA used a fresh `test_ledger_commit_exact` database, migrated zero → `0010_ledger_foundation`, passed install imports (`LEDGER_INSTALL_IMPORTS_OK`), and completed:
+Detached clean checkout at that exact SHA used fresh `test_ledger_final_sha`, migrated zero → `0010_ledger_foundation`, passed install imports (`LEDGER_FINAL_SHA_IMPORTS_OK`), and completed:
 
 ```text
-12 passed in 1.54s
-DETACHED_EXACT_FOCUSED_EXIT=0
-DETACHED_EXACT_POSTED_DOWNGRADE_EXIT=1
-DETACHED_EXACT_EMPTY_DOWNGRADE_EXIT=0
+12 passed in 1.71s
+FINAL_DETACHED_FOCUSED_EXIT=0
 ```
 
-This acceptance-record update is now included in the final local amend; it does not change production code/schema semantics. The amended SHA is rechecked in a new detached checkout before this gate is closed. No local commit is a production approval.
+Earlier exact candidate downgrade evidence remains applicable to the unchanged migration source: posted journal downgrade refused with exit `1`; empty ledger downgrade to `0009_merchant_rails` completed with exit `0`. This final verification-record update is committed separately from the verified foundation source SHA and changes documentation only. No local commit is production approval.
