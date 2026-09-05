@@ -32,6 +32,15 @@ def test_limited_runtime_compose_override_replaces_base_env_file(monkeypatch, tm
     owner_postgres_marker = "OWNER_POSTGRES_PASSWORD_CANARY"
     runtime_database_marker = "RUNTIME_DATABASE_URL_CANARY"
     runtime_redis_marker = "RUNTIME_REDIS_URL_CANARY"
+    raw_literals = {
+        "RAW_DOLLAR": "$foo",
+        "RAW_BRACED": "${foo}",
+        "RAW_HASH": "#value",
+        "RAW_QUOTES": "'\"",
+        "RAW_SPACES": " leading trailing ",
+        "RAW_UNICODE": "ключ-ю",
+        "RAW_BACKSLASH": r"a\b",
+    }
     runtime_env = tmp_path / "curated-runtime.env"
     runtime_env.write_text(
         "\n".join(
@@ -42,6 +51,7 @@ def test_limited_runtime_compose_override_replaces_base_env_file(monkeypatch, tm
                 "SECRET_KEY=runtime-compose-test-secret-at-least-thirty-two-chars",
                 "ENCRYPTION_KEY=hqFLu+kFxLrHJ0GvR5eAWT0DcxSr5FqxJcXmV9GZqMA=",
                 "RUNTIME_ENV_CANARY=present",
+                *(f"{key}={value}" for key, value in raw_literals.items()),
                 "",
             )
         )
@@ -109,6 +119,9 @@ def test_limited_runtime_compose_override_replaces_base_env_file(monkeypatch, tm
         assert environment["SECRET_KEY"].startswith("runtime-compose-test-secret-")
         assert environment["ENCRYPTION_KEY"] == "hqFLu+kFxLrHJ0GvR5eAWT0DcxSr5FqxJcXmV9GZqMA="
         assert environment["RUNTIME_ENV_CANARY"] == "present"
+        for key, value in raw_literals.items():
+            rendered_value = value.replace("$", "$$")
+            assert environment[key] == rendered_value
         assert environment["DATABASE_RUNTIME_ROLE_ENABLED"] == "true"
         assert environment.get("MIGRATION_DATABASE_URL") in (None, "")
         assert "POSTGRES_PASSWORD" not in environment

@@ -28,7 +28,10 @@ target_metadata = Base.metadata
 # Alembic uses MIGRATION_DATABASE_URL when provided, separate from the runtime
 # DATABASE_URL after a reviewed non-owner application-role rollout.
 settings = get_settings()
-config.set_main_option("sqlalchemy.url", settings.get_migration_database_url())
+# ConfigParser interpolation treats a URL percent escape as formatting syntax.
+# Store doubled percent signs; ConfigParser returns the original URL to the
+# SQLAlchemy engine when it reads sqlalchemy.url.
+config.set_main_option("sqlalchemy.url", settings.get_migration_database_url().replace("%", "%%"))
 
 
 def _migration_timeout_ms(name: str) -> int | None:
