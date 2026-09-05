@@ -466,6 +466,7 @@ def check(runner: Runner, config: Config) -> dict[str, Any]:
         "gate": current_gate,
         "source": meta,
         "source_values": source,
+        "phase": Phase.CHECKED,
     }
 
 
