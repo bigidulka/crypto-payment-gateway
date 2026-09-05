@@ -1360,22 +1360,16 @@ class EvmAdapter:
         return await self.w3.is_connected()
 
     async def close(self) -> None:
-        """Закрыть соединение и освободить ресурсы."""
+        """Close Web3 provider sessions using its public disconnect API."""
         try:
-            # AsyncHTTPProvider хранит session внутри
-            provider = self.w3.provider
-            if hasattr(provider, "_session") and provider._session is not None:
-                if not provider._session.closed:
-                    await provider._session.close()
-            # Также проверяем _request_session (зависит от версии web3)
-            if (
-                hasattr(provider, "_request_session")
-                and provider._request_session is not None
-            ):
-                if not provider._request_session.closed:
-                    await provider._request_session.close()
-        except Exception as e:
-            logger.warning(f"Error closing EvmAdapter for {self.chain}: {e}")
+            disconnect = getattr(self.w3.provider, "disconnect", None)
+            if disconnect is None:
+                return
+            result = disconnect()
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as exc:
+            logger.warning("Error closing EvmAdapter for %s: %s", self.chain, exc)
 
 
 # Глобальный кэш адаптеров (без lru_cache для поддержки async close)

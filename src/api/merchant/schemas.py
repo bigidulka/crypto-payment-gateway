@@ -10,7 +10,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.blockchain.chains import get_all_chains, get_all_tokens, get_chain_config
-
+from src.core.webhook_egress import WebhookEgressError, validate_webhook_url
 
 # === Invoice Schemas ===
 
@@ -144,9 +144,11 @@ class WebhookCreateRequest(BaseModel):
     @field_validator("url")
     @classmethod
     def validate_url(cls, v: str) -> str:
-        if not v.startswith(("http://", "https://")):
-            raise ValueError("URL must start with http:// or https://")
-        return v
+        try:
+            parsed = validate_webhook_url(v)
+        except WebhookEgressError as exc:
+            raise ValueError(str(exc)) from exc
+        return parsed.geturl()
 
     @field_validator("events")
     @classmethod

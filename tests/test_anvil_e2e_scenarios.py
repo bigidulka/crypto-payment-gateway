@@ -16,14 +16,14 @@ fetcher через eth_getLogs, парсит настоящий _parse_transfer_
     pytest tests/test_anvil_e2e_scenarios.py -v
 """
 
+import asyncio
 import json
-import socket
 import subprocess
 import time
 import urllib.request
 from contextlib import asynccontextmanager
-from decimal import Decimal
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,7 +32,6 @@ from web3 import Web3
 
 import src.workers.evm_log_poller as poller
 from src.blockchain.resilient_fetcher import ResilientLogFetcher, RpcEndpointSpec
-
 
 ANVIL_PORT = 18545
 ANVIL_URL = f"http://127.0.0.1:{ANVIL_PORT}"
@@ -160,14 +159,14 @@ def _payment_session(deposit: str, token: str = "USDT"):
 
 
 @pytest.fixture
-def wire(chain, monkeypatch):
-    """Подключить настоящий фетчер и адаптер к anvil, БД оставить фейковой."""
+async def wire(chain, monkeypatch):
+    """Connect real fetcher/adapter to Anvil and close their aiohttp clients."""
+    resources = []
 
     def _wire(payment_session, deposit: str):
         from src.blockchain.evm_adapter import EvmAdapter
 
         adapter = EvmAdapter("bsc", rpc_url=chain.w3.provider.endpoint_uri)
-
         tokens = {
             "USDT": SimpleNamespace(symbol="USDT", contract_address=chain.usdt, decimals=18),
             "USDC": SimpleNamespace(symbol="USDC", contract_address=chain.usdc, decimals=18),
@@ -180,15 +179,15 @@ def wire(chain, monkeypatch):
             native_symbol="BNB",
             native_decimals=18,
             tokens=tokens,
-            is_native_asset=lambda s: s.upper() == "BNB",
-            get_asset_contract=lambda s: (
-                poller.NATIVE_TOKEN_CONTRACT if s.upper() == "BNB" else tokens[s.upper()].contract_address
+            is_native_asset=lambda symbol: symbol.upper() == "BNB",
+            get_asset_contract=lambda symbol: (
+                poller.NATIVE_TOKEN_CONTRACT
+                if symbol.upper() == "BNB"
+                else tokens[symbol.upper()].contract_address
             ),
         )
 
-        async def _active_addresses(db_session, ch):
-            # Реальный слой БД хранит адреса lowercase; матчинг в поллере
-            # сравнивает тоже lowercase. anvil отдаёт checksummed.
+        async def _active_addresses(_db_session, _chain):
             return {deposit.lower(): payment_session}
 
         session = type("S", (), {"commits": 0, "rollbacks": 0})()
@@ -197,27 +196,39 @@ def wire(chain, monkeypatch):
         async def _session_context():
             yield session
 
-        async def _checkpoint(db_session, ch, chain_adapter, earliest):
-            # окно в три блока назад: переводы этого сценария уже намайнены
+        async def _checkpoint(_db_session, _chain, chain_adapter, _earliest):
             return max(1, await chain_adapter.get_latest_block_number() - 3)
 
-        async def _update_checkpoint(db_session, ch, block_number):
+        async def _update_checkpoint(_db_session, _chain, _block_number):
             return None
-        fetcher = ResilientLogFetcher("bsc", [RpcEndpointSpec(url=ANVIL_URL)])
 
+        fetcher = ResilientLogFetcher("bsc", [RpcEndpointSpec(url=ANVIL_URL)])
+        resources.append((adapter, fetcher))
         monkeypatch.setattr(poller, "get_session_context", _session_context)
         monkeypatch.setattr(poller, "get_active_deposit_addresses", _active_addresses)
-        monkeypatch.setattr(poller, "get_chain_config", lambda ch: config)
-        monkeypatch.setattr(poller, "get_evm_adapter", lambda ch: adapter)
+        monkeypatch.setattr(poller, "get_chain_config", lambda _chain: config)
+        monkeypatch.setattr(poller, "get_evm_adapter", lambda _chain: adapter)
         monkeypatch.setattr(poller, "get_or_create_checkpoint", _checkpoint)
         monkeypatch.setattr(poller, "update_checkpoint", _update_checkpoint)
-        monkeypatch.setattr(poller, "get_resilient_fetcher", lambda ch: fetcher)
-        # _parse_transfer_log НЕ трогаем: настоящие логи anvil должен парсить
-        # настоящий парсер - в этом смысл теста.
-
+        monkeypatch.setattr(poller, "get_resilient_fetcher", lambda _chain: fetcher)
         return payment_session
 
-    return _wire
+    yield _wire
+    for adapter, fetcher in resources:
+        await adapter.close()
+        for endpoint in fetcher.endpoints:
+            disconnect = getattr(endpoint.web3.provider, "disconnect", None)
+            if disconnect is None:
+                continue
+            result = disconnect()
+            if asyncio.iscoroutine(result):
+                await result
+
+    from src.blockchain.evm_adapter import close_all_adapters
+    from src.blockchain.resilient_fetcher import close_resilient_fetchers
+
+    await close_resilient_fetchers()
+    await close_all_adapters()
 
 
 # === сценарии ===

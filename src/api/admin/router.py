@@ -5,13 +5,14 @@ Admin API Router.
 """
 
 import asyncio
-import uuid
 import math
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select, desc, and_
+from sqlalchemy import and_, desc, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from src.api.admin.schemas import (
@@ -39,6 +40,7 @@ from src.api.admin.schemas import (
     WithdrawResponse,
     WorkerStatus,
 )
+from src.api.admin.schemas import MerchantApiKeyCreateRequest, MerchantCreateRequest
 from src.api.deps import (
     SessionDep,
     SettingsDep,
@@ -46,6 +48,7 @@ from src.api.deps import (
     verify_admin_key,
     create_admin_session,
 )
+from src.api.merchant.schemas import WebhookCreateRequest
 from src.blockchain.chains import get_all_chains, get_chain_config, ChainType
 from src.blockchain.evm_adapter import get_evm_adapter
 from src.core.config import get_settings
@@ -1748,36 +1751,24 @@ async def get_treasury_balances(
     
     return result
 
+
 @router.post("/merchants", summary="Создать мерчанта с первым API-ключом")
 async def create_merchant(
     _: AdminAuthDep,
     session: SessionDep,
-    payload: dict,
+    payload: MerchantCreateRequest,
 ):
-    """
-    Онбординг мерчанта: запись + ключ одним вызовом.
-
-    Сырой ключ и его префикс возвращаются один раз - дальше в БД только хеш.
-    """
+    """Create a merchant and first API key; return the raw key exactly once."""
     from src.core.security import create_api_key
     from src.db.models import ApiKey, Merchant
 
-    name = str(payload.get("name", "")).strip()
-    email = str(payload.get("email", "")).strip().lower()
-    if not name:
-        raise HTTPException(status_code=422, detail="name is required")
-    if "@" not in email:
-        raise HTTPException(status_code=422, detail="valid email is required")
-
-    exists = await session.scalar(
-        select(Merchant).where(Merchant.email == email)
-    )
-    if exists:
-        raise HTTPException(status_code=409, detail="merchant with this email exists")
-
-    merchant = Merchant(name=name, email=email)
+    merchant = Merchant(name=payload.name, email=payload.email)
     session.add(merchant)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="merchant with this email exists") from exc
 
     raw_key, key_prefix, key_hash = create_api_key()
     session.add(
@@ -1785,16 +1776,20 @@ async def create_merchant(
             merchant_id=merchant.id,
             key_hash=key_hash,
             key_prefix=key_prefix,
-            name=str(payload.get("key_name", "default")),
+            name=payload.key_name,
         )
     )
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="merchant onboarding conflict") from exc
 
     return {
         "merchant_id": str(merchant.id),
         "name": merchant.name,
         "email": merchant.email,
-        "api_key": raw_key,  # показывается один раз
+        "api_key": raw_key,
         "key_prefix": key_prefix,
     }
 
@@ -1807,7 +1802,7 @@ async def create_merchant_api_key(
     _: AdminAuthDep,
     session: SessionDep,
     merchant_id: uuid.UUID,
-    payload: dict,
+    payload: MerchantApiKeyCreateRequest,
 ):
     from src.core.security import create_api_key
     from src.db.models import ApiKey, Merchant
@@ -1822,11 +1817,10 @@ async def create_merchant_api_key(
             merchant_id=merchant.id,
             key_hash=key_hash,
             key_prefix=key_prefix,
-            name=str(payload.get("name", "extra")),
+            name=payload.name,
         )
     )
     await session.commit()
-
     return {"api_key": raw_key, "key_prefix": key_prefix}
 
 
@@ -1838,35 +1832,27 @@ async def create_merchant_webhook(
     _: AdminAuthDep,
     session: SessionDep,
     merchant_id: uuid.UUID,
-    payload: dict,
+    payload: WebhookCreateRequest,
 ):
-    from src.core.security import generate_webhook_secret
-    from src.db.models import Merchant, Webhook
+    """Create a webhook under the same egress policy as merchant self-service."""
+    from src.services.webhook_service import WebhookService
 
     merchant = await session.get(Merchant, merchant_id)
     if not merchant:
         raise HTTPException(status_code=404, detail="merchant not found")
-
-    url = str(payload.get("url", "")).strip()
-    if not url.startswith(("http://", "https://")):
-        raise HTTPException(status_code=422, detail="url must be http(s)")
-
-    secret = generate_webhook_secret()
-    webhook = Webhook(
-        merchant_id=merchant.id,
-        url=url,
-        secret=secret,
-        events=list(
-            payload.get("events")
-            or ["invoice.created", "invoice.seen_onchain", "invoice.confirmed", "invoice.expired"]
-        ),
-    )
-    session.add(webhook)
-    await session.commit()
-
+    try:
+        webhook = await WebhookService(session).create_webhook(
+            merchant=merchant,
+            url=payload.url,
+            events=payload.events,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail="webhook destination resolution unavailable") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="webhook destination is not permitted") from exc
     return {
         "webhook_id": str(webhook.id),
         "url": webhook.url,
         "events": webhook.events,
-        "secret": secret,  # показывается один раз
+        "secret": webhook.secret,
     }

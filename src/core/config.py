@@ -114,6 +114,7 @@ class Settings(BaseSettings):
     webhook_max_attempts: int = 5
     webhook_timeout_seconds: int = 30
 
+
     # === CORS ===
     # В production укажите конкретные домены через запятую
     # Пример: "https://example.com,https://api.example.com"
@@ -133,6 +134,7 @@ class Settings(BaseSettings):
         return [
             origin.strip() for origin in self.cors_origins.split(",") if origin.strip()
         ]
+
 
     def get_treasury_address(self, chain: str) -> str:
         """Получить treasury адрес для сети."""

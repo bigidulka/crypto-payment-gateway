@@ -284,12 +284,16 @@ async def create_webhook(
     Сохраните его для проверки подписей входящих событий.
     """
     service = WebhookService(session)
-
-    webhook = await service.create_webhook(
-        merchant=merchant,
-        url=request.url,
-        events=request.events,
-    )
+    try:
+        webhook = await service.create_webhook(
+            merchant=merchant,
+            url=request.url,
+            events=request.events,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail="webhook destination resolution unavailable") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="webhook destination is not permitted") from exc
 
     return WebhookResponse(
         id=webhook.id,

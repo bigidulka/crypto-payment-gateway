@@ -4,13 +4,18 @@
 
 import logging
 import uuid
-from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import get_settings
 from src.core.exceptions import NotFoundError
 from src.core.security import generate_webhook_secret
+from src.core.webhook_egress import (
+    WebhookEgressError,
+    WebhookResolutionError,
+    resolve_webhook_destination,
+)
 from src.db.models import Merchant, Webhook
 
 logger = logging.getLogger(__name__)
@@ -39,13 +44,25 @@ class WebhookService:
         Returns:
             Созданный webhook
         """
-        # Генерируем секрет для подписи
+        # Revalidate DNS at registration as well as at every delivery. The
+        # delivery path pins fresh validated answers; this check prevents
+        # storing an immediately known private/mixed DNS destination.
+        try:
+            destination = await resolve_webhook_destination(
+                url,
+                timeout_seconds=get_settings().webhook_timeout_seconds,
+            )
+        except WebhookResolutionError as exc:
+            raise RuntimeError("webhook DNS resolution temporarily failed") from exc
+        except WebhookEgressError as exc:
+            raise ValueError("webhook destination is not permitted") from exc
+
         secret = generate_webhook_secret()
 
         webhook = Webhook(
             id=uuid.uuid4(),
             merchant_id=merchant.id,
-            url=url,
+            url=destination.url,
             secret=secret,
             events=events,
             is_active=True,
