@@ -51,3 +51,13 @@ Thus there is no partial schema, role, credential, runtime file, service, PUBLIC
 Do not retry this complex inline orchestration command. A purpose-built local operational script must first be written, reviewed, tested against disposable PostgreSQL, and committed/pushed before a new director-authorized production schema-role attempt. The script must avoid shell interpolation of secret-bearing values, use secure ephemeral files only, preserve all already-approved gates, and retain the current no-service-switch boundary.
 
 No API or worker canary is authorized until that reviewed script completes schema/role/runtime-env preparation and all postchecks.
+
+## Later approved operational check — blocked before prepare
+
+The reviewed operational commit `02dd4316084452a6454563ce3417311626865832` was pushed and the remote repository fast-forwarded to it. API preflight passed; immutable migration/runtime images were built without service recreation; a fresh protected pre-DDL custom backup was created; and a new `0600` source manifest was written under the approved external directory.
+
+The committed script's read-only `check` was then invoked with all five live service container mappings, exact image IDs, the current PostgreSQL network alias, migration owner `arbitron`, and the new backup hash. It exited `1` with an uncaught `KeyError` (the safe wrapper emitted only the exception class, not any key/value, traceback, stderr, source env, URL, or credential). Therefore `check` did not produce its expected safe phase JSON and `prepare --confirm-prepare` was **not** executed.
+
+No DDL, ledger table, `arbitron_runtime` role, password, pending credential, curated runtime file, PUBLIC privilege, existing `arbitron` credential, image switch, service restart, or financial action followed this block. The remote database remains at `0009_merchant_rails` with ledger absent and `arbitron_runtime` absent as confirmed by the preceding gate. The fresh backup is retained; the external source manifest is `0600` and contains no secret values.
+
+This is an operational script check bug/blocker. It requires a local-only diagnostic and corrected committed script before any later director-authorized production preparation retry; no automatic retry or cleanup is authorized.

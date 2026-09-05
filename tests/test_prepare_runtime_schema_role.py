@@ -323,3 +323,75 @@ def test_structured_catalog_verifier_rejects_wrong_guard_search_path():
     state = valid_migration_snapshot()
     state["functions"][0]["config"] = ["search_path=public"]
     assert "function_properties:ledger_assert_final_state" in prepare.migration_problems(state)
+
+
+def test_main_check_safe_output_uses_real_check_return_shape(monkeypatch, tmp_path, capsys):
+    configured = config(tmp_path)
+    monkeypatch.setattr(prepare, "verify_source_manifest", lambda *_args: None)
+    monkeypatch.setattr(
+        prepare,
+        "_image_id",
+        lambda _runner, image: configured.migration_image_id
+        if image == configured.migration_image
+        else configured.runtime_image_id,
+    )
+    monkeypatch.setattr(prepare, "_container_network", lambda *_args: configured.postgres_network)
+    monkeypatch.setattr(
+        prepare,
+        "gate",
+        lambda *_args: {
+            "revision": "0009_merchant_rails",
+            "role_absent": True,
+            "ledger_absent": True,
+            "public_create": False,
+            "public_temp": True,
+            "public_secdef_count": 0,
+            "sequence_count": 0,
+        },
+    )
+    monkeypatch.setattr(
+        prepare,
+        "source_runtime_config",
+        lambda *_args: (
+            {"SECRET_KEY": "secret", "ENCRYPTION_KEY": "key", "REDIS_URL": "redis://x"},
+            {"keys": ["SECRET_KEY", "ENCRYPTION_KEY", "REDIS_URL"]},
+        ),
+    )
+    monkeypatch.setattr(prepare, "verify_backup", lambda *_args: {"path": "safe", "sha256": "safe"})
+    monkeypatch.setattr(prepare, "run_checked", lambda *_args, **_kwargs: configured.expected_sha)
+    real_result = prepare.check(prepare.Runner(), configured)
+    assert real_result["phase"] == prepare.Phase.CHECKED
+    assert "source_values" in real_result
+
+    monkeypatch.setattr(
+        prepare,
+        "arguments",
+        lambda _argv: type(
+            "Args",
+            (),
+            {
+                "mode": "check",
+                "confirm_prepare": False,
+                "root": configured.root,
+                "expected_sha": configured.expected_sha,
+                "source_manifest": configured.source_manifest,
+                "migration_image": configured.migration_image,
+                "migration_image_id": configured.migration_image_id,
+                "runtime_image": configured.runtime_image,
+                "runtime_image_id": configured.runtime_image_id,
+                "postgres_container": configured.postgres_container,
+                "postgres_network": configured.postgres_network,
+                "external_dir": configured.external_dir,
+                "backup_path": configured.backup_path,
+                "backup_sha256": configured.backup_sha256,
+                "migration_owner": configured.migration_owner,
+                "service_container": [
+                    f"{name}={container}" for name, container in configured.service_containers
+                ],
+            },
+        )(),
+    )
+    assert prepare.main([]) == 0
+    emitted = capsys.readouterr().out
+    assert json.loads(emitted) == {"phase": "checked", "source_sha": configured.expected_sha}
+    assert "secret" not in emitted
