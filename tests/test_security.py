@@ -116,12 +116,10 @@ class TestDoubleCredit:
         )
         from src.services.user_wallet_service import UserWalletService
 
-        # Создаём мерчанта
         merchant = Merchant(
             id=uuid.uuid4(),
             name="Test Merchant",
-            api_key_hash="test_hash",
-            webhook_url="https://example.com/webhook",
+            email=f"credit-{uuid.uuid4().hex}@example.test",
         )
         test_session.add(merchant)
 
@@ -139,7 +137,8 @@ class TestDoubleCredit:
             user_wallet_id=wallet.id,
             chain="arbitrum",
             address="0x" + "a" * 40,
-            derivation_path="m/44'/60'/0'/0/0",
+            derivation_index=0,
+            encrypted_private_key="encrypted",
         )
         test_session.add(wallet_address)
 
@@ -207,12 +206,10 @@ class TestUniqueConstraints:
             Merchant,
         )
 
-        # Создаём мерчанта
         merchant = Merchant(
             id=uuid.uuid4(),
             name="Test Merchant",
-            api_key_hash="test_hash2",
-            webhook_url="https://example.com/webhook",
+            email=f"unique-{uuid.uuid4().hex}@example.test",
         )
         test_session.add(merchant)
 
@@ -230,7 +227,8 @@ class TestUniqueConstraints:
             user_wallet_id=wallet.id,
             chain="arbitrum",
             address="0x" + "d" * 40,
-            derivation_path="m/44'/60'/0'/0/1",
+            derivation_index=1,
+            encrypted_private_key="encrypted",
         )
         test_session.add(wallet_address)
         await test_session.commit()

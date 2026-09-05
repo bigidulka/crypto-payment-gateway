@@ -252,27 +252,38 @@ class TestModels:
         assert DepositStatus.SWEPT.value == "swept"
 
     def test_sweep_state_enum(self):
-        """Проверка состояний sweep."""
-        from src.db.models.sweep import SweepState
-        
+        """Проверка актуальных состояний unified sweep."""
+        from src.db.models.enums import SweepState
+
         assert SweepState.PENDING_GAS.value == "pending_gas"
         assert SweepState.FUNDING.value == "funding"
         assert SweepState.SWEEPING.value == "sweeping"
         assert SweepState.COMPLETED.value == "completed"
         assert SweepState.FAILED.value == "failed"
 
-    def test_deposit_sweep_job_model(self):
-        """Проверка модели DepositSweepJob."""
-        from src.db.models.sweep import DepositSweepJob, SweepState
-        
-        job = DepositSweepJob(
+    def test_unified_sweep_job_model(self):
+        """Все источники используют одну модель с уникальным source/source_id."""
+        from src.db.models.enums import SweepSource, SweepState
+        from src.db.models.unified_sweep import UnifiedSweepJob
+
+        job = UnifiedSweepJob(
             id=uuid.uuid4(),
-            deposit_id=uuid.uuid4(),
+            source=SweepSource.PERSISTENT,
+            source_id=uuid.uuid4(),
+            chain="arbitrum",
+            token="USDT",
+            token_contract="0x" + "b" * 40,
+            from_address="0x" + "a" * 40,
+            to_address="0x" + "c" * 40,
+            encrypted_private_key="encrypted",
+            amount=Decimal("1"),
+            amount_raw="1000000",
             state=SweepState.PENDING_GAS,
             attempts=0,
             max_attempts=10,
         )
-        
+
+        assert job.source == SweepSource.PERSISTENT
         assert job.state == SweepState.PENDING_GAS
         assert job.attempts == 0
         assert job.max_attempts == 10

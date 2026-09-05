@@ -9,10 +9,9 @@ import json
 import sys
 from decimal import Decimal
 from pathlib import Path
-
-import pytest
 from types import SimpleNamespace
 
+import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
@@ -29,7 +28,6 @@ from arbitron_sdk import (  # noqa: E402
     verify_webhook,
 )
 from arbitron_sdk.webhooks import compute_signature  # noqa: E402
-
 
 # === Вебхуки: контракт с сервером ===
 
@@ -72,6 +70,38 @@ def test_headers_are_case_insensitive():
     payload = b'{"event":"x"}'
     headers = {k.lower(): v for k, v in _headers(payload, "s", 1000, event="x").items()}
     assert verify_webhook(payload, headers, "s", now=1000).event_type == "x"
+
+
+def test_forged_event_header_is_rejected():
+    payload = b'{"event":"invoice.confirmed"}'
+    headers = _headers(payload, "s", 1000, event="invoice.expired")
+    with pytest.raises(WebhookVerificationError, match="event header"):
+        verify_webhook(payload, headers, "s", now=1000)
+
+
+def test_signed_payload_event_is_required():
+    payload = b'{"invoice":{"public_id":"PAY_1"}}'
+    with pytest.raises(WebhookVerificationError, match="missing event"):
+        verify_webhook(payload, _headers(payload, "s", 1000), "s", now=1000)
+
+
+@pytest.mark.parametrize("max_age_seconds", [0, -1, True, 1.5])
+def test_nonpositive_or_noninteger_max_age_is_rejected(max_age_seconds):
+    payload = b'{"event":"invoice.confirmed"}'
+    with pytest.raises(WebhookVerificationError, match="max_age_seconds"):
+        verify_webhook(
+            payload,
+            _headers(payload, "s", 1000),
+            "s",
+            max_age_seconds=max_age_seconds,
+            now=1000,
+        )
+
+
+def test_empty_webhook_secret_is_rejected():
+    payload = b'{"event":"invoice.confirmed"}'
+    with pytest.raises(WebhookVerificationError, match="secret is required"):
+        verify_webhook(payload, _headers(payload, "s", 1000), "", now=1000)
 
 
 def test_tampered_body_is_rejected():
