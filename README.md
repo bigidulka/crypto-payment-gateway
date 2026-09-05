@@ -36,15 +36,17 @@ arq src.workers.webhook_dispatcher.WorkerSettings
 arq src.workers.sweeper.WorkerSettings
 ```
 
-### Docker Compose
+### Docker Compose для локальной разработки
 
 ```bash
 docker compose up -d
 ```
 
-### Ограниченная runtime-роль (только после отдельного review)
+Это локальный development workflow. Он не является production-инструкцией и не должен использоваться для ограниченной runtime-роли.
 
-Для ограниченной runtime-роли требуется актуальный Docker Compose с поддержкой Compose-spec `!override` (проверяйте `docker compose version`; классический `docker-compose` v1 не поддерживается). Приложение не загружает `.env` неявно: оператор явно выбирает curated runtime env и передаёт его через `RUNTIME_ENV_FILE`. Базовый `docker-compose.yml` и override `docker-compose.runtime-role.yml` необходимо рендерить вместе; runtime image не выполняет миграции. Процедура миграции-owner, привилегии и production rollout описаны как кандидатские и не исполняются без отдельного одобрения.
+### Ограниченная runtime-роль в production
+
+Для ограниченной runtime-роли требуется актуальный Docker Compose с поддержкой Compose-spec `!override` (проверяйте `docker compose version`; классический `docker-compose` v1 не поддерживается). Runtime service получает явный защищённый `RUNTIME_ENV_FILE`; базовый `.env`/owner connection не наследуется. Production запуск использует базовый Compose, `docker-compose.runtime-role.yml`, защищённый immutable-image override, точное имя одного сервиса и `--no-build --no-deps`. Runtime image никогда не выполняет миграции. Полная каноническая инструкция: [`docs/runtime-deployment.md`](docs/runtime-deployment.md).
 
 ## Архитектура
 
