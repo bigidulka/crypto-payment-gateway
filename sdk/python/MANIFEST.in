@@ -1,0 +1,5 @@
+prune tests
+prune arbitron_sdk.egg-info
+exclude arbitron_sdk.egg-info/*
+global-exclude *.py[cod]
+global-exclude __pycache__/*

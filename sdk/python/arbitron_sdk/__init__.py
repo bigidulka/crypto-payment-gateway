@@ -26,6 +26,7 @@ from .models import (
     Invoice,
     InvoiceStatus,
     PaymentSelection,
+    PaymentStatus,
     WebhookEvent,
 )
 from .webhooks import WebhookVerificationError, verify_webhook
@@ -39,6 +40,7 @@ __all__ = [
     "Invoice",
     "InvoiceStatus",
     "PaymentSelection",
+    "PaymentStatus",
     "WebhookEvent",
     "WebhookVerificationError",
     "verify_webhook",
