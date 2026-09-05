@@ -11,6 +11,7 @@ x-runtime-env: &runtime-env
   env_file: !override
     - path: ${RUNTIME_ENV_FILE:?RUNTIME_ENV_FILE required for limited role mode}
       required: true
+      format: raw
   environment: !override
     DATABASE_RUNTIME_ROLE_ENABLED: "true"
     MIGRATION_DATABASE_URL: ""
