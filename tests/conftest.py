@@ -4,6 +4,12 @@
 
 import asyncio
 import os
+
+# Tests must not rely on a developer's dotenv file: Settings intentionally has
+# no implicit env_file. Set inert process-local defaults before any module
+# imports call get_settings(); individual tests may still override them.
+os.environ.setdefault("SECRET_KEY", "test-runtime-secret-at-least-thirty-two-characters")
+os.environ.setdefault("ENCRYPTION_KEY", "hqFLu+kFxLrHJ0GvR5eAWT0DcxSr5FqxJcXmV9GZqMA=")
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -108,6 +114,8 @@ def _require_safe_test_database(database_url: str) -> str:
     if expected_database != url.database:
         pytest.fail("TEST_EXPECTED_DATABASE must exactly match TEST_DATABASE_URL database")
     return url.database
+
+
 @pytest_asyncio.fixture
 async def test_session(monkeypatch) -> AsyncGenerator[AsyncSession, None]:
     """Provide one real, guarded disposable PostgreSQL session per DB test.
@@ -139,8 +147,7 @@ async def test_session(monkeypatch) -> AsyncGenerator[AsyncSession, None]:
             missing_tables = set(_RESET_TABLES) - actual_tables
             if missing_tables:
                 pytest.fail(
-                    "TEST_DATABASE_URL is missing migrated tables: "
-                    f"{sorted(missing_tables)}"
+                    f"TEST_DATABASE_URL is missing migrated tables: {sorted(missing_tables)}"
                 )
             quoted_tables = ", ".join(f'"{table_name}"' for table_name in _RESET_TABLES)
             await connection.execute(
@@ -149,6 +156,7 @@ async def test_session(monkeypatch) -> AsyncGenerator[AsyncSession, None]:
 
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
         async with session_factory() as session:
+
             @asynccontextmanager
             async def _session_context():
                 yield session

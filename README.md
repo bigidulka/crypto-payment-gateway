@@ -42,6 +42,10 @@ arq src.workers.sweeper.WorkerSettings
 docker compose up -d
 ```
 
+### Ограниченная runtime-роль (только после отдельного review)
+
+Для ограниченной runtime-роли требуется актуальный Docker Compose с поддержкой Compose-spec `!override` (проверяйте `docker compose version`; классический `docker-compose` v1 не поддерживается). Приложение не загружает `.env` неявно: оператор явно выбирает curated runtime env и передаёт его через `RUNTIME_ENV_FILE`. Базовый `docker-compose.yml` и override `docker-compose.runtime-role.yml` необходимо рендерить вместе; runtime image не выполняет миграции. Процедура миграции-owner, привилегии и production rollout описаны как кандидатские и не исполняются без отдельного одобрения.
+
 ## Архитектура
 
 ```

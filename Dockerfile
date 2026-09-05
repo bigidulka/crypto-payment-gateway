@@ -2,54 +2,62 @@
 
 FROM python:3.12-slim AS base
 
-# Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
 WORKDIR /app
 
-# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
 RUN groupadd --gid 1000 appgroup && \
     useradd --uid 1000 --gid appgroup --shell /bin/bash --create-home appuser
 
-# ========== Builder Stage ==========
 FROM base AS builder
 
-# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip wheel --no-cache-dir --wheel-dir=/app/wheels -r requirements.txt
 
-# ========== Production Stage ==========
-FROM base AS production
+# Migration-owner image: invoked externally with only MIGRATION_DATABASE_URL and
+# owner credentials supplied by the approved secret-delivery mechanism. It is
+# never used by API/worker runtime containers.
+FROM base AS migration
 
-# Copy wheels and install
 COPY --from=builder /app/wheels /wheels
 COPY --from=builder /app/requirements.txt .
 RUN pip install --no-cache-dir /wheels/* && \
     rm -rf /wheels
 
-# Copy application code
-COPY --chown=appuser:appgroup . .
+COPY --chown=appuser:appgroup src ./src
+COPY --chown=appuser:appgroup config/chains.toml ./config/chains.toml
+COPY --chown=appuser:appgroup alembic ./alembic
+COPY --chown=appuser:appgroup alembic.ini ./alembic.ini
 
-# Copy entrypoint script
+USER appuser
+CMD ["alembic", "upgrade", "head"]
+
+# Application runtime image is deliberately the final/default target. Explicit
+# allowlist only: operator env, migrations, scripts, tests, dumps and compose
+# artifacts are absent.
+FROM base AS production
+
+COPY --from=builder /app/wheels /wheels
+COPY --from=builder /app/requirements.txt .
+RUN pip install --no-cache-dir /wheels/* && \
+    rm -rf /wheels
+
+COPY --chown=appuser:appgroup src ./src
+COPY --chown=appuser:appgroup config/chains.toml ./config/chains.toml
 COPY --chown=appuser:appgroup docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
 
-# Switch to non-root user
 USER appuser
-
-# Default command (API server with DB init)
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 

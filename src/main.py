@@ -4,25 +4,28 @@ Arbitron Payment Gateway - Main Application.
 
 import logging
 from contextlib import asynccontextmanager
-from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
-from src.api.merchant.router import router as merchant_router
-from src.api.hosted.router import router as hosted_router
 from src.api.admin.router import router as admin_router
-from src.api.wallet.router import router as wallet_router
+from src.api.hosted.router import router as hosted_router
+from src.api.merchant.router import router as merchant_router
 from src.api.public.router import router as public_router
+from src.api.wallet.router import router as wallet_router
+from src.blockchain.chains import get_all_chains
+from src.blockchain.rpc_manager import close_all_rpc_managers, init_all_rpc_managers
 from src.core.config import get_settings
 from src.core.rate_limit import limiter
-from src.db.session import close_db
-from src.db.redis import get_redis, close_redis
-from src.blockchain.rpc_manager import init_all_rpc_managers, close_all_rpc_managers
-from src.blockchain.chains import get_all_chains
+from src.db.redis import close_redis, get_redis
+from src.db.session import (
+    close_db,
+    require_runtime_database_ready,
+    verify_limited_runtime_database_role,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +38,7 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info(f"Starting {settings.app_name} v{settings.app_version}")
     logger.info(f"Debug mode: {settings.debug}")
+    await verify_limited_runtime_database_role()
 
     # Инициализация Multi-RPC managers для всех сетей
     await init_rpc_managers()
@@ -74,15 +78,14 @@ async def init_rpc_managers():
 async def sync_deposit_address_counter():
     """Синхронизировать Redis счётчик с максимальным индексом в БД."""
     from sqlalchemy import func, select
+
     from src.db.models import DepositAddress
     from src.db.session import get_session_factory
 
     try:
         session_factory = get_session_factory()
         async with session_factory() as session:
-            result = await session.execute(
-                select(func.max(DepositAddress.derivation_index))
-            )
+            result = await session.execute(select(func.max(DepositAddress.derivation_index)))
             max_index = result.scalar()
 
         # Используем Redis пул вместо нового подключения
@@ -177,11 +180,19 @@ def create_app() -> FastAPI:
             "version": settings.app_version,
         }
 
-    # Ready check (включает проверку зависимостей)
+    # Ready check verifies database and Redis connectivity without DDL.
     @app.get("/ready", tags=["Health"])
     async def ready_check():
-        """Readiness check endpoint."""
-        # TODO: Add database and Redis health checks
+        """Return generic 503 when a required runtime dependency is unavailable."""
+        try:
+            await require_runtime_database_ready()
+            redis = await get_redis()
+            await redis.ping()
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="service unavailable",
+            ) from None
         return {
             "status": "ready",
             "version": settings.app_version,
@@ -214,7 +225,6 @@ if __name__ == "__main__":
 
 def _render_admin_panel() -> str:
     """Render admin panel HTML."""
-    from fastapi.responses import HTMLResponse
 
     html = """<!DOCTYPE html>
 <html lang="ru">

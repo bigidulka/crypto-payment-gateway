@@ -48,6 +48,12 @@ services:
     environment:
       TZ: UTC
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
+      # Backward-compatible: disabled mode keeps existing DATABASE_URL. When a
+      # reviewed limited runtime role is enabled, MIGRATION_DATABASE_URL is only
+      # for Alembic outside runtime containers and must not be injected here.
+      DATABASE_RUNTIME_ROLE_ENABLED: ${DATABASE_RUNTIME_ROLE_ENABLED:-false}
+      RUNTIME_DATABASE_URL: ${RUNTIME_DATABASE_URL:-}
+      MIGRATION_DATABASE_URL: ""
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
     ports:
       - "127.0.0.1:8123:8000"
@@ -78,6 +84,9 @@ services:
     environment:
       TZ: UTC
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
+      DATABASE_RUNTIME_ROLE_ENABLED: ${DATABASE_RUNTIME_ROLE_ENABLED:-false}
+      RUNTIME_DATABASE_URL: ${RUNTIME_DATABASE_URL:-}
+      MIGRATION_DATABASE_URL: ""
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/data
@@ -104,6 +113,9 @@ services:
     environment:
       TZ: UTC
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
+      DATABASE_RUNTIME_ROLE_ENABLED: ${DATABASE_RUNTIME_ROLE_ENABLED:-false}
+      RUNTIME_DATABASE_URL: ${RUNTIME_DATABASE_URL:-}
+      MIGRATION_DATABASE_URL: ""
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/data
@@ -132,6 +144,9 @@ services:
     environment:
       TZ: UTC
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
+      DATABASE_RUNTIME_ROLE_ENABLED: ${DATABASE_RUNTIME_ROLE_ENABLED:-false}
+      RUNTIME_DATABASE_URL: ${RUNTIME_DATABASE_URL:-}
+      MIGRATION_DATABASE_URL: ""
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/data
@@ -158,6 +173,9 @@ services:
     environment:
       TZ: UTC
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
+      DATABASE_RUNTIME_ROLE_ENABLED: ${DATABASE_RUNTIME_ROLE_ENABLED:-false}
+      RUNTIME_DATABASE_URL: ${RUNTIME_DATABASE_URL:-}
+      MIGRATION_DATABASE_URL: ""
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/data

@@ -1,48 +1,25 @@
 #!/bin/bash
-# Инициализация БД и запуск приложения
+# Runtime admission and launch. Schema migrations are an external migration-owner
+# operation, never a runtime container action.
 
-set -e
+set -euo pipefail
 
-echo "🔄 Инициализация БД..."
-
-# БД файл примонтирован как volume, просто проверяем доступность
-if [ ! -w /app/arbitron_payment.db ] && [ -f /app/arbitron_payment.db ]; then
-    echo "⚠️  БД файл существует, но не доступен для записи"
+if [ "${DATABASE_RUNTIME_ROLE_ENABLED:-false}" = "true" ] && [ -n "${MIGRATION_DATABASE_URL:-}" ]; then
+    echo "limited runtime must not receive MIGRATION_DATABASE_URL" >&2
+    exit 1
 fi
 
-# Запускаем Python инициализацию БД асинхронно
-python << 'EOF'
+python <<'PY'
 import asyncio
-import os
-from sqlalchemy.ext.asyncio import create_async_engine
 
-async def init_db():
-    """Инициализировать БД"""
-    db_url = os.getenv('DATABASE_URL', 'sqlite+aiosqlite:///./arbitron_payment.db')
-    
-    # Создаем engine для проверки доступности
-    engine = create_async_engine(db_url, echo=False)
-    
-    try:
-        # Пытаемся подключиться
-        async with engine.begin() as conn:
-            pass
-        print("✅ БД доступна")
-    except Exception as e:
-        print(f"⚠️  БД ошибка (это нормально при первом запуске): {e}")
-    finally:
-        await engine.dispose()
+from src.db.session import require_runtime_database_ready
 
-asyncio.run(init_db())
-EOF
 
-echo "✅ БД готова"
+asyncio.run(require_runtime_database_ready())
+PY
 
-# Если передана команда - выполняем её, иначе запускаем uvicorn
-if [ $# -gt 0 ]; then
-    echo "🚀 Запуск команды: $@"
+if [ "$#" -gt 0 ]; then
     exec "$@"
 else
-    echo "🚀 Запуск приложения на порту 8000..."
     exec uvicorn src.main:app --host 0.0.0.0 --port 8000
 fi
