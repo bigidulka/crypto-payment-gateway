@@ -70,7 +70,7 @@ python run_cli.py create-merchant \
 ```
 ✅ Merchant created!
    ID: a1b2c3d4-e5f6-...
-   API Key: ***REMOVED***...
+   API Key: sk_live_xxxxxxxxxxxxxxxx...
 
 ⚠️  Сохраните API Key — он показывается только один раз!
 ```
@@ -80,7 +80,7 @@ python run_cli.py create-merchant \
 ```python
 # .env вашего бота/сайта
 ARBITRON_API_URL=https://pay.yoursite.com
-ARBITRON_API_KEY=***REMOVED***...
+ARBITRON_API_KEY=sk_live_xxxxxxxxxxxxxxxx...
 ```
 
 ---
@@ -165,7 +165,7 @@ Content-Type: application/json
 import httpx
 
 ARBITRON_API = "https://pay.yoursite.com"
-API_KEY = "***REMOVED***"
+API_KEY = "sk_live_xxxxxxxxxxxxxxxx"
 
 async def create_user_wallet(user_id: str, username: str = None) -> dict:
     """Создать кошелёк для пользователя."""
@@ -188,7 +188,7 @@ async def create_user_wallet(user_id: str, username: str = None) -> dict:
 const axios = require("axios");
 
 const ARBITRON_API = "https://pay.yoursite.com";
-const API_KEY = "***REMOVED***";
+const API_KEY = "sk_live_xxxxxxxxxxxxxxxx";
 
 async function createUserWallet(userId, username = null) {
   const response = await axios.post(
@@ -559,7 +559,7 @@ async def balance_command(message: types.Message):
 
 ```python
 # ❌ Плохо
-API_KEY = "***REMOVED***"
+API_KEY = "sk_live_xxxxxxxxxxxxxxxx"
 
 # ✅ Хорошо
 import os
