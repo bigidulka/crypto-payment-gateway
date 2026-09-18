@@ -100,3 +100,7 @@ Thumbs.db
 *.key
 secrets/
 proxies.txt
+
+# Local databases and runtime state must never be published.
+data/*.db
+data/*.sqlite*
