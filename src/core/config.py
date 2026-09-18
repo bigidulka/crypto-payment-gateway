@@ -116,6 +116,11 @@ class Settings(BaseSettings):
     webhook_max_attempts: int = 5
     webhook_timeout_seconds: int = 30
 
+    # === Disabled internal provider-payment ingestion ===
+    # No existing API route, scanner or worker invokes this path in this slice.
+    ledger_rail_orchestration_enabled: bool = False
+    ledger_rail_orchestration_merchants: str = ""
+
     # === CORS ===
     # В production укажите конкретные домены через запятую
     # Пример: "https://example.com,https://api.example.com"
@@ -225,6 +230,14 @@ class Settings(BaseSettings):
         )
         if present:
             raise RuntimeError("limited runtime environment contains forbidden owner key names")
+
+    @property
+    def ledger_rail_orchestration_merchant_ids(self) -> set[str]:
+        return {
+            merchant_id.strip()
+            for merchant_id in self.ledger_rail_orchestration_merchants.split(",")
+            if merchant_id.strip()
+        }
 
 
 @lru_cache

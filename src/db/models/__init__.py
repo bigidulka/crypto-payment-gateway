@@ -26,6 +26,13 @@ from src.db.models.payment import (
     OnchainTx,
     PaymentSession,
 )
+from src.db.models.provider_payment import (
+    ProviderPaymentMapping,
+    ProviderPaymentObservation,
+    ProviderPaymentReceipt,
+    ProviderPaymentRecipientIntent,
+    ProviderVerificationDecision,
+)
 from src.db.models.rail import Rail
 from src.db.models.sweep import (
     ChainCheckpoint,
@@ -82,6 +89,12 @@ __all__ = [
     "Deposit",
     "UserBalance",
     # Ledger foundation
+    # Disabled provider-ingestion source facts
+    "ProviderPaymentMapping",
+    "ProviderPaymentObservation",
+    "ProviderPaymentReceipt",
+    "ProviderPaymentRecipientIntent",
+    "ProviderVerificationDecision",
     "LedgerAsset",
     "LedgerAccount",
     "LedgerTransaction",
