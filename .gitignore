@@ -85,6 +85,10 @@ dmypy.json
 # Ruff
 .ruff_cache/
 
+# Local development plans, scratch output and runtime artifacts.
+.ralph/
+tmp/
+
 # Local development
 *.log
 *.local
