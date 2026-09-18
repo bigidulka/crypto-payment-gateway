@@ -130,10 +130,11 @@ GET  /health                     # живость и зависимости
 | `APP_ROLE_TEMPLATE_DATABASE_URL`, `APP_ROLE_TEMPLATE_CONTAINER` | Проверка шаблона runtime-роли через `docker exec psql` |
 | `FUNDER_PRIVATE_KEY` + `*_RPC_URL` | E2E-платежи в реальных сетях (иначе корректный skip) |
 
-Измерено на одноразовом Postgres 16 (четыре отдельные БД, миграции применены):
-`313 passed, 43 skipped, 10 errors, 4 failed`. Оставшиеся наборы требуют провижининга
-non-owner runtime-роли (`scripts/prepare_runtime_schema_role.py`) и настроенного psql-контейнера
-для шаблона роли — это шаги ревьюируемого rollout'а, а не локального запуска.
+CI прогоняет полный guarded-набор против одноразового Postgres 16 с провижиненной non-owner
+runtime-ролью и Redis: **312 passed, 40 skipped**. Три файла репетиции операторского rollout'а
+(`APP_ROLE_TEMPLATE_CONTAINER` через `docker exec` и pinned-0010 compatibility rehearsal)
+остаются локальными шагами — они задокументированы рядом с
+`scripts/prepare_runtime_schema_role.py`.
 
 ## Структура
 
