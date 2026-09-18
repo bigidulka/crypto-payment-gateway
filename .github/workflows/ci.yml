@@ -22,6 +22,15 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       SECRET_KEY: ci-secret-key-0123456789abcdef0123456789abcdef
       ENCRYPTION_KEY: Y2ktZW5jcnlwdGlvbi1rZXktMDEyMzQ1Njc4OWFiY2Q=
@@ -32,9 +41,10 @@ jobs:
       LEDGER_OWNER_DATABASE_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/test_ledger_owner
       LEDGER_TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/test_ledger_runtime
       LEDGER_SERVICE_DATABASE_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/test_ledger_service
+      LEDGER_API_COMPAT_REDIS_URL: redis://127.0.0.1:6379/0
       LEDGER_API_COMPAT_DATABASE_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/test_ledger_api_compat
       PROVIDER_INGESTION_OWNER_DATABASE_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/test_provider_ingestion
-      PROVIDER_INGESTION_RUNTIME_DATABASE_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/test_provider_ingestion_runtime
+      PROVIDER_INGESTION_RUNTIME_DATABASE_URL: postgresql+asyncpg://provider_ingestion_runtime:ci-runtime-password@127.0.0.1:5432/test_provider_ingestion_runtime
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -59,5 +69,15 @@ jobs:
           done
           # The API-compatibility rehearsal pins the additive 0010 schema on purpose.
           DATABASE_URL="postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/test_ledger_api_compat" alembic upgrade 0010_ledger_foundation
+      - name: Provision the reviewed runtime roles on the disposable databases
+        run: |
+          psql "postgresql://postgres:postgres@127.0.0.1:5432/test_provider_ingestion_runtime" <<'SQL'
+          CREATE ROLE provider_ingestion_runtime LOGIN PASSWORD 'ci-runtime-password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+          GRANT USAGE ON SCHEMA public TO provider_ingestion_runtime;
+          GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO provider_ingestion_runtime;
+          GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO provider_ingestion_runtime;
+          SQL
+        env:
+          PGPASSWORD: postgres
       - name: Run the guarded test suite
         run: pytest -q
