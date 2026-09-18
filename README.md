@@ -1,95 +1,178 @@
-# Arbitron Payment Gateway
+# Crypto Payment Gateway
 
-Криптовалютный платёжный шлюз с поддержкой Base, Arbitrum, BSC и токенов USDT/USDC.
+Backend для приёма криптоплатежей: счета (инвойсы), платёжная страница, merchant API и SDK,
+подписанные вебхуки с ретраями, выдача депозитных адресов с лизами, подтверждение платежей
+по цепочке и автоматический sweep в treasury на неизменяемом двойном леджере.
+
+Инженерно проект интересен не поддержкой сетей, а гарантиями: адрес под платеж не
+переиспользуется, событие вебхука не теряется, леджер нельзя исправить «на месте», а
+рантайм-роль базы не может ни DDL, ни TRUNCATE.
+
+## Что здесь есть
+
+- **Инвойсы и платёжная страница.** Создание счёта через API (или SDK), hosted checkout
+  (Vite + Tailwind), выбор сети и токена, статус в реальном времени.
+- **Merchant API + Python SDK.** `sdk/python/` — клиент с типами и хелпером проверки
+  подписи вебхука.
+- **Вебхуки.** Подписанные события, outbox-таблица, ретраи с настраиваемыми попытками и
+  таймаутами, отдельный воркер-диспетчер.
+- **Приём платежей.** Депозитные адреса выдаются по лизам (пер-чек lifecycle), поллер
+  отслеживает входящие переводы по `chain_checkpoints`, несовпадение суммы фиксируется
+  отдельно (`payment_amount_mismatch`).
+- **Sweep.** Единая очередь `unified_sweep_jobs`, воркер выводит средства на treasury,
+  gas-фандинг через funder-кошелёк.
+- **Леджер.** Append-only двойная запись (счета/транзакции/проводки) с триггерами БД,
+  запрещающими правку, удаление и TRUNCATE.
+- **Мультитенантность и роли.** Мерчанты, API-ключи, rails (подключённые провайдеры),
+  тарифы; рантайм работает под отдельной ролью БД, миграции — под owner-ролью.
+
+## Архитектура
+
+```
+merchant backend ──► FastAPI (src/api) ──► services ──► PostgreSQL
+                        │                                ▲
+checkout (Vite)  ───────┘                                │
+                                                         │
+arq workers:                                             │
+  evm_log_poller      ──► RPC провайдеры ──► chain_checkpoints
+  webhook_dispatcher  ──► outbox_webhooks ──► merchant endpoint
+  sweeper             ──► unified_sweep_jobs ──► treasury
+  expirer             ──► истечение инвойсов и лизин
+```
+
+Поток платежа: счёт → выдача адреса (lease) → входящий перевод → подтверждения в сети →
+фиксация в леджере → подписанный вебхук мерчанту → sweep остатка на treasury.
+
+## Инженерные решения
+
+**Решение: депозитные адреса выдаются по лизам, а не переиспользуются.**
+Зачем: адрес, привязанный к нескольким счетам, делает зачисление неоднозначным; лиза
+гарантирует, что у входящего перевода ровно один владелец.
+Компромисс: нужен воркер, который истекает лизы, и учёт «адрес занят до N».
+
+**Решение: вебхуки через outbox с ретраями.**
+Зачем: подписанное событие должно пережить падение процесса диспетчера; запись события
+идёт в одной транзакции с бизнес-изменением.
+Компромисс: доставка at-least-once, получателю нужна идемпотентность по `event_id`.
+
+**Решение: append-only леджер с защитой на уровне БД.**
+Зачем: правка проводки «по месту» ломает баланс и аудит; ограничения живут в триггерах, а
+не только в сервисе.
+Компромисс: исправления — только компенсирующими проводками; миграции схемы леджера
+требуют отдельного, ревьюируемого owner-доступа.
+
+**Решение: рантайм-роль БД отделена от owner-роли.**
+Зачем: компрометация приложения не должна давать DDL, TRUNCATE и доступ к чужим схемам;
+тесты это проверяют (`test_*_runtime_role_*`).
+Компромисс: деплой сложнее — провижининг роли идёт отдельным шагом с бэкапом и манифестом.
+
+**Решение: поллер хранит checkpoint и не продвигает его при частичном чтении.**
+Зачем: пропущенный блок — потерянный платёж; лучше перечитать диапазон, чем пропустить.
+Компромисс: при нестабильном RPC растёт повторная обработка (защищает идемпотентность).
+
+**Решение: поставка «источник факта» для внешних провайдеров выключена по умолчанию.**
+Зачем: ingestion чужих платежей — отдельный контур с собственными гарантиями; фича
+включается флагом (`ledger_rail_orchestration_enabled`) и мерчант-белым списком.
+Компромисс: пока флаг выключен, путь не используется рантаймом и покрыт только тестами.
+
+## Стек
+
+| Слой | Технологии |
+|---|---|
+| API | Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2 (async), Alembic |
+| Данные | PostgreSQL 16, Redis 7 |
+| Воркеры | arq (poller, webhook dispatcher, sweeper, expirer) |
+| Цепочки | web3.py, eth-account; Base, Arbitrum, BSC, Polygon, Avalanche, Optimism |
+| Фронтенд | Vite + Tailwind (hosted checkout) |
+| SDK | Python-клиент с типами и проверкой подписи |
+| Инфраструктура | Docker Compose, отдельные compose-оверлеи для runtime-роли |
 
 ## Быстрый старт
 
-### Требования
-
-- Python 3.12+
-- PostgreSQL 15+
-- Redis 7+
-- Docker & Docker Compose (опционально)
-
-### Установка
-
 ```bash
-# Клонирование и установка зависимостей
-cd arbitron-payment
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-# Копирование конфига
-cp .env.example .env
-# Отредактируйте .env с вашими настройками
-
-# Миграции БД
+cp .env.example .env          # заполнить POSTGRES_PASSWORD, REDIS_PASSWORD, SECRET_KEY, ENCRYPTION_KEY, RPC URLs
+docker compose up -d postgres redis
 alembic upgrade head
-
-# Запуск API сервера
 uvicorn src.main:app --reload
-
-# Запуск воркеров (в отдельных терминалах)
 arq src.workers.evm_log_poller.WorkerSettings
 arq src.workers.webhook_dispatcher.WorkerSettings
 arq src.workers.sweeper.WorkerSettings
 ```
 
-### Docker Compose для локальной разработки
+Полный compose поднимает API, четыре воркера, Postgres и Redis. Оверлей
+`docker-compose.runtime-role.yml` описывает запуск под non-owner ролью БД.
 
-```bash
-docker compose up -d
-```
+Интеграция мерчанта (создание счёта, вебхуки, проверка подписи) — в
+[`docs/INTEGRATION_GUIDE.md`](docs/INTEGRATION_GUIDE.md), эксплуатация рантайм-роли — в
+[`docs/runtime-deployment.md`](docs/runtime-deployment.md).
 
-Это локальный development workflow. Он не является production-инструкцией и не должен использоваться для ограниченной runtime-роли.
-
-### Ограниченная runtime-роль в production
-
-Для ограниченной runtime-роли требуется актуальный Docker Compose с поддержкой Compose-spec `!override` (проверяйте `docker compose version`; классический `docker-compose` v1 не поддерживается). Runtime service получает явный защищённый `RUNTIME_ENV_FILE`; базовый `.env`/owner connection не наследуется. Production запуск использует базовый Compose, `docker-compose.runtime-role.yml`, защищённый immutable-image override, точное имя одного сервиса и `--no-build --no-deps`. Runtime image никогда не выполняет миграции. Полная каноническая инструкция: [`docs/runtime-deployment.md`](docs/runtime-deployment.md).
-
-## Архитектура
+### API
 
 ```
-┌─────────────────┐     ┌─────────────────┐
-│   FastAPI App   │     │  Worker Service │
-│   (Merchant +   │     │  - Log Poller   │
-│    Hosted API)  │     │  - Webhooks     │
-└────────┬────────┘     │  - Sweeper      │
-         │              └────────┬────────┘
-         │                       │
-    ┌────┴───────────────────────┴────┐
-    │           PostgreSQL            │
-    │              Redis              │
-    └─────────────────────────────────┘
-                   │
-    ┌──────────────┴──────────────┐
-    │   Base / Arbitrum / BSC     │
-    │        (EVM RPC)            │
-    └─────────────────────────────┘
+POST /api/v1/invoices            # создать счёт
+GET  /api/v1/invoices/{id}       # статус
+POST /api/v1/webhooks            # настроить подписку
+GET  /api/v1/wallets             # депозитные адреса
+GET  /health                     # живость и зависимости
 ```
 
-## API Документация
+## Тесты
 
-После запуска доступно:
+Тесты намеренно **fail-closed**: без инфраструктуры они падают с сообщением, что именно
+нужно настроить, а не молча пропускаются. Матрица окружения:
 
-- Swagger UI: http://localhost:8000/docs
-- ReDoc: http://localhost:8000/redoc
+| Переменная | Что открывает |
+|---|---|
+| `TEST_DATABASE_URL`, `TEST_EXPECTED_DATABASE` | Основной набор против одноразовой БД (`test_*` на loopback) |
+| `TEST_ALLOW_DESTRUCTIVE_RESET=ALLOW_ISOLATED_TEST_DATABASE_RESET` | Явное разрешение на очистку таблиц в этой БД |
+| `LEDGER_OWNER_DATABASE_URL`, `LEDGER_TEST_DATABASE_URL`, `LEDGER_SERVICE_DATABASE_URL` | Тесты леджера и его триггеров на выделенных БД |
+| `PROVIDER_INGESTION_OWNER_DATABASE_URL` / `PROVIDER_INGESTION_RUNTIME_DATABASE_URL` | Тесты ingestion внешних провайдеров |
+| `APP_ROLE_TEMPLATE_DATABASE_URL`, `APP_ROLE_TEMPLATE_CONTAINER` | Проверка шаблона runtime-роли через `docker exec psql` |
+| `FUNDER_PRIVATE_KEY` + `*_RPC_URL` | E2E-платежи в реальных сетях (иначе корректный skip) |
 
-## Конфигурация
+Измерено на одноразовом Postgres 16 (четыре отдельные БД, миграции применены):
+`313 passed, 43 skipped, 10 errors, 4 failed`. Оставшиеся наборы требуют провижининга
+non-owner runtime-роли (`scripts/prepare_runtime_schema_role.py`) и настроенного psql-контейнера
+для шаблона роли — это шаги ревьюируемого rollout'а, а не локального запуска.
 
-Все настройки через переменные окружения (см. `.env.example`):
+## Структура
 
-| Переменная       | Описание                                            |
-| ---------------- | --------------------------------------------------- |
-| `DATABASE_URL`   | PostgreSQL connection string                        |
-| `REDIS_URL`      | Redis connection string                             |
-| `ENCRYPTION_KEY` | 32-byte base64 ключ для шифрования приватных ключей |
-| `HD_WALLET_SEED` | BIP39 мнемоника для HD кошелька                     |
-| `BASE_RPC_URL`   | RPC endpoint для Base                               |
-| `ARB_RPC_URL`    | RPC endpoint для Arbitrum                           |
-| `BSC_RPC_URL`    | RPC endpoint для BSC                                |
+```text
+src/
+  api/          # HTTP-контракты: инвойсы, вебхуки, кошельки, служебные ручки
+  services/     # бизнес-логика: платежи, инвойсы, леджер, sweep, вебхуки
+  workers/      # arq: поллер, диспетчер вебхуков, сведер, экспиратор
+  blockchain/   # конфигурация сетей, RPC, работа с токенами
+  payments/     # платёжные сценарии и подтверждения
+  ledger/       # двойная запись, проводки, инварианты
+  db/models/    # ORM: инвойсы, платежи, леджер, sweep, провайдерские факты
+alembic/        # 11 миграций
+sdk/python/     # клиент для мерчантов
+frontend/       # hosted checkout
+backend/        # вспомогательный сервис проверок
+scripts/        # smoke-проверки, backfill, провижининг роли, бенчмарки RPC
+tests/          # регрессия + инфраструктурные проверки (см. матрицу выше)
+```
+
+## Ограничения
+
+- Тесты леджера, runtime-роли и ingestion требуют отдельно провижиненных БД и роли;
+  локальный `pytest` без них падает fail-closed (см. матрицу).
+- E2E-платежи в сетях требуют funder-кошелька с балансом и RPC-доступа; без них — skip.
+- Публичная ветка `public-release` — снимок; рабочие ветки (`main`) содержат более полную
+  историю разработки.
+- Конфигурация сетей и токенов лежит в TOML; новые сети добавляются правкой конфига, а не
+  кода.
+- Проект содержит исторические внутренние планы разработки в git-истории; в текущем дереве
+  они удалены (см. коммит «chore: keep internal development plans out of the tree»).
+
+## Разработка с AI
+
+AI использовался для реализации отдельных модулей и тестов, рефакторинга и разбора
+недокументированных API провайдеров. Проверка: регрессионный набор (313+ тестов на
+одноразовом Postgres), тесты инвариантов леджера на уровне БД, статические проверки
+конфигурации, ревью диффов и ручные прогоны смоук-сценариев (`scripts/payment_smoke.py`).
 
 ## Лицензия
 
-MIT
+MIT.
