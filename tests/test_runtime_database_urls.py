@@ -7,6 +7,14 @@ import pytest
 from src.core.config import Settings
 
 
+@pytest.fixture(autouse=True)
+def _clear_database_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests assert configuration defaults, so ambient DATABASE_* values must not leak in."""
+
+    for name in ("DATABASE_URL", "MIGRATION_DATABASE_URL", "DATABASE_RUNTIME_ROLE_ENABLED"):
+        monkeypatch.delenv(name, raising=False)
+
+
 def settings(**overrides) -> Settings:
     return Settings(
         secret_key="runtime-config-secret-at-least-thirty-two-chars",

@@ -35,6 +35,25 @@ from web3 import Web3
 from web3.exceptions import TransactionNotFound
 
 # Import from TOML config
+def _funder_wallet_configured() -> bool:
+    """E2E payments need a funded funder key; without it the suite is skipped, not failed."""
+
+    if os.getenv("FUNDER_PRIVATE_KEY", "").strip():
+        return True
+    try:
+        from src.core.config import get_settings
+
+        return bool(get_settings().funder_private_key.get_secret_value().strip())
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _funder_wallet_configured(),
+    reason="requires a funded funder wallet (FUNDER_PRIVATE_KEY) and live chain RPC access",
+)
+
+
 from src.blockchain.chains import (
     get_chain_config,
     get_evm_chains,
