@@ -24,7 +24,7 @@ jobs:
           --health-retries 10
     env:
       SECRET_KEY: ci-secret-key-0123456789abcdef0123456789abcdef
-      ENCRYPTION_KEY: ci-encryption-key-0123456789abcdef0123456789abcdef
+      ENCRYPTION_KEY: Y2ktZW5jcnlwdGlvbi1rZXktMDEyMzQ1Njc4OWFiY2Q=
       TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/test_arbitron_payment
       TEST_EXPECTED_DATABASE: test_arbitron_payment
       TEST_ALLOW_DESTRUCTIVE_RESET: ALLOW_ISOLATED_TEST_DATABASE_RESET
@@ -54,8 +54,10 @@ jobs:
           PGPASSWORD: postgres
       - name: Apply migrations to every disposable database
         run: |
-          for db in test_arbitron_payment test_rails test_ledger_owner test_ledger_runtime test_ledger_service test_ledger_api_compat test_provider_ingestion test_provider_ingestion_runtime; do
+          for db in test_arbitron_payment test_rails test_ledger_owner test_ledger_runtime test_ledger_service test_provider_ingestion test_provider_ingestion_runtime; do
             DATABASE_URL="postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/$db" alembic upgrade head
           done
+          # The API-compatibility rehearsal pins the additive 0010 schema on purpose.
+          DATABASE_URL="postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/test_ledger_api_compat" alembic upgrade 0010_ledger_foundation
       - name: Run the guarded test suite
         run: pytest -q
