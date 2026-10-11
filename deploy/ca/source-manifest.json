@@ -1,0 +1,11 @@
+{
+  "source": "Verified running RU application files, not latest main",
+  "gateway_runtime_base": "58dc6db9399ef5a177fe47eabf2751c86cab0fc8",
+  "intentional_changes": [
+    "Pinned Python 3.12.15 base with the exact resolved packages of the five existing roles",
+    "Explicit application-source allowlist and UID1000; external configuration and native state",
+    "Scoped CA profiles; limited database role retained and new internal Redis credential required"
+  ],
+  "source_credential_literal_scan": "PASS_ALL_APPLICATION_MODULES_AND_STATIC_CONFIG",
+  "protected_configuration": "Outside Git, image and source manifest"
+}
