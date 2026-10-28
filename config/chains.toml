@@ -277,60 +277,61 @@ variant = "native"
 
 
 # =============================================================================
-# NON-EVM CHAINS (закомментированы - раскомментируйте для включения)
+# NON-EVM CHAINS (receive requires NON_EVM_ENABLED + explicit start blocks)
 # =============================================================================
 
-# [chains.solana]
-# name = "Solana"
-# chain_id = 0  # Solana doesn't use chain_id
-# chain_type = "solana"
-# rpc_urls = [
-#     "https://api.mainnet-beta.solana.com",
-#     "https://solana-api.projectserum.com",
-# ]
-# confirmations = 31
-# reorg_buffer = 10
-# scan_window = 1000
-# block_time_sec = 0.4
-# native_symbol = "SOL"
-# native_decimals = 9
-# explorer_url = "https://solscan.io"
-# address_length = 44
+[chains.solana]
+name = "Solana"
+chain_id = 0  # Solana doesn't use chain_id
+chain_type = "solana"
+rpc_urls = [
+    "https://api.mainnet-beta.solana.com",
+    "https://api.mainnet-beta.solana.com",
+]
+confirmations = 31
+reorg_buffer = 10
+scan_window = 1000
+block_time_sec = 0.4
+native_symbol = "SOL"
+native_decimals = 9
+explorer_url = "https://solscan.io"
+address_length = 44
 #
-# [chains.solana.tokens.USDT]
-# symbol = "USDT"
-# contract_address = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
-# decimals = 6
-# variant = "native"
+[chains.solana.tokens.USDT]
+symbol = "USDT"
+contract_address = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+decimals = 6
+variant = "native"
 #
-# [chains.solana.tokens.USDC]
-# symbol = "USDC"
-# contract_address = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-# decimals = 6
-# variant = "native"
+[chains.solana.tokens.USDC]
+symbol = "USDC"
+contract_address = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+decimals = 6
+variant = "native"
 
 
-# [chains.ton]
-# name = "The Open Network"
-# chain_id = 0  # TON doesn't use chain_id
-# chain_type = "ton"
-# rpc_urls = [
-#     "https://toncenter.com/api/v2",
-# ]
-# confirmations = 12
-# reorg_buffer = 5
-# scan_window = 100
-# block_time_sec = 5.0
-# native_symbol = "TON"
-# native_decimals = 9
-# explorer_url = "https://tonviewer.com"
-# address_length = 48
+[chains.ton]
+name = "The Open Network"
+chain_id = 0  # TON doesn't use chain_id
+chain_type = "ton"
+rpc_urls = [
+    "https://toncenter.com/api/v2",
+]
+confirmations = 12
+reorg_buffer = 5
+scan_window = 100
+block_time_sec = 5.0
+native_symbol = "TON"
+native_decimals = 9
+explorer_url = "https://tonviewer.com"
+address_length = 48
 #
-# [chains.ton.tokens.USDT]
-# symbol = "USDT"
-# contract_address = "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"
-# decimals = 6
-# variant = "native"
+[chains.ton.tokens.USDT]
+symbol = "USDT"
+contract_address = "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"
+decimals = 6
+variant = "native"
+
 
 
 # =============================================================================

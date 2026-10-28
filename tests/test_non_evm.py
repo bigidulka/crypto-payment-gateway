@@ -39,7 +39,7 @@ class TestChainConfig:
         assert config.native_symbol == "SOL"
         assert config.native_decimals == 9
         assert config.address_length == 44
-        assert config.confirmations == 32
+        assert config.confirmations == 31
 
         # Токены
         usdt = config.get_token("USDT")
@@ -150,7 +150,7 @@ class TestSolanaAdapter:
 
             slot = await adapter.get_latest_block()
             assert slot == 123456789
-            mock.assert_called_once_with("getSlot")
+            mock.assert_called_once_with("getSlot", [{"commitment": "finalized"}])
 
     @pytest.mark.asyncio
     async def test_get_native_balance(self, adapter):
@@ -171,7 +171,7 @@ class TestSolanaAdapter:
         with patch.object(adapter, "_rpc_call", new_callable=AsyncMock) as mock:
             # Finalized transaction
             mock.return_value = {
-                "value": [{"confirmationStatus": "finalized", "confirmations": None}]
+                "value": [{"confirmationStatus": "finalized", "confirmations": None, "err": None}]
             }
 
             confirmed = await adapter.is_tx_confirmed("signature123")
@@ -179,11 +179,17 @@ class TestSolanaAdapter:
 
             # Pending transaction
             mock.return_value = {
-                "value": [{"confirmationStatus": "confirmed", "confirmations": 10}]
+                "value": [{"confirmationStatus": "confirmed", "confirmations": 10, "err": None}]
             }
 
             confirmed = await adapter.is_tx_confirmed("signature123")
             assert confirmed is False  # 10 < 32
+
+            mock.return_value = {
+                "value": [{"confirmationStatus": "finalized", "confirmations": None,
+                           "err": {"InstructionError": [0, "InvalidAccountData"]}}]
+            }
+            assert await adapter.is_tx_confirmed("signature123") is False
 
 
 @pytest.mark.skipif(not is_chain_supported("ton"), reason="TON not configured")
@@ -200,7 +206,7 @@ class TestTonAdapter:
         """Проверить тип сети."""
         assert adapter.chain_type == ChainType.TON
         assert adapter.native_symbol == "TON"
-        assert adapter.address_length == 48
+        assert adapter.address_length == 66
 
     def test_is_valid_address_user_friendly(self, adapter):
         """Проверить валидацию user-friendly адресов."""

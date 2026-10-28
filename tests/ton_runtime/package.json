@@ -1,0 +1,1 @@
+{"private":true,"type":"module","scripts":{"test":"node wallet-boc.mjs"},"devDependencies":{"@ton/core":"0.63.1","@ton/sandbox":"0.45.0","@ton/ton":"16.3.0"}}

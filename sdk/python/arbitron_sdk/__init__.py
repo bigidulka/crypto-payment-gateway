@@ -27,13 +27,17 @@ from .models import (
     InvoiceStatus,
     PaymentSelection,
     PaymentStatus,
+    ProviderBalance,
+    ProviderOperation,
     WebhookEvent,
 )
+from .product import ProductPayments
 from .webhooks import WebhookVerificationError, verify_webhook
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 
 __all__ = [
+    "ProductPayments",
     "ArbitronClient",
     "ArbitronError",
     "ChainInfo",
@@ -41,6 +45,8 @@ __all__ = [
     "InvoiceStatus",
     "PaymentSelection",
     "PaymentStatus",
+    "ProviderBalance",
+    "ProviderOperation",
     "WebhookEvent",
     "WebhookVerificationError",
     "verify_webhook",

@@ -20,6 +20,8 @@ _RUNTIME_COMPOSE_SERVICES = (
     "worker-webhook",
     "worker-sweeper",
     "worker-expirer",
+    "worker-providers",
+    "worker-onchain",
 )
 
 
@@ -94,6 +96,10 @@ def test_limited_runtime_compose_override_replaces_base_env_file(monkeypatch, tm
             str(root / "docker-compose.yml"),
             "-f",
             str(root / "docker-compose.runtime-role.yml"),
+            "--profile",
+            "providers",
+            "--profile",
+            "onchain",
             "config",
             "--format",
             "json",

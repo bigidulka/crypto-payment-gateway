@@ -188,6 +188,57 @@ services:
     healthcheck:
       disable: true
 
+  # Opt-in until reviewed merchant credentials and provider acceptance are ready.
+  worker-providers:
+    profiles: ["providers"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    command: ["python", "-m", "src.workers.provider_poller"]
+    env_file:
+      - .env
+    environment:
+      TZ: UTC
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
+      DATABASE_RUNTIME_ROLE_ENABLED: ${DATABASE_RUNTIME_ROLE_ENABLED:-false}
+      RUNTIME_DATABASE_URL: ${RUNTIME_DATABASE_URL:-}
+      MIGRATION_DATABASE_URL: ""
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
+  worker-onchain:
+    profiles: ["onchain"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    command: ["python", "-m", "src.workers.onchain_gateway"]
+    env_file:
+      - .env
+    environment:
+      TZ: UTC
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
+      DATABASE_RUNTIME_ROLE_ENABLED: ${DATABASE_RUNTIME_ROLE_ENABLED:-false}
+      RUNTIME_DATABASE_URL: ${RUNTIME_DATABASE_URL:-}
+      MIGRATION_DATABASE_URL: ""
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
 volumes:
   arbitron_payment_postgres_data:
   arbitron_payment_redis_data:

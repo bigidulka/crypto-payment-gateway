@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import uuid4
 
 import aiohttp
 
-from .models import ChainInfo, Invoice, PaymentSelection, PaymentStatus
+from .models import (
+    ChainInfo,
+    Invoice,
+    PaymentSelection,
+    PaymentStatus,
+    ProviderBalance,
+    ProviderOperation,
+)
 
 DEFAULT_TIMEOUT_SECONDS = 30
 CHAINS_CACHE_TTL_SECONDS = 300
@@ -19,10 +25,18 @@ CHAINS_CACHE_TTL_SECONDS = 300
 class ArbitronError(Exception):
     """Шлюз ответил ошибкой или недоступен."""
 
-    def __init__(self, message: str, *, status: int | None = None, body: str = ""):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        body: str = "",
+        outcome_unknown: bool = False,
+    ):
         super().__init__(message)
         self.status = status
         self.body = body
+        self.outcome_unknown = outcome_unknown
 
 
 class ArbitronClient:
@@ -54,7 +68,7 @@ class ArbitronClient:
         self._chains_cache: dict[str, ChainInfo] = {}
         self._chains_cached_at = 0.0
 
-    async def __aenter__(self) -> "ArbitronClient":
+    async def __aenter__(self) -> ArbitronClient:
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
@@ -63,6 +77,18 @@ class ArbitronClient:
     async def close(self) -> None:
         if self._owns_session and self._session and not self._session.closed:
             await self._session.close()
+
+    @staticmethod
+    def _exact_amount(value: Decimal | str) -> str:
+        if isinstance(value, (float, bool)) or not isinstance(value, (Decimal, str, int)):
+            raise ValueError("Use an exact decimal amount")
+        try:
+            parsed = Decimal(value)
+        except InvalidOperation:
+            raise ValueError("Use an exact decimal amount") from None
+        if not parsed.is_finite() or parsed <= 0:
+            raise ValueError("Amount must be finite and positive")
+        return str(parsed)
 
     def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -88,20 +114,34 @@ class ArbitronClient:
 
         try:
             async with self._get_session().request(
-                method, f"{self._api_url}{path}", headers=headers, json=json, params=params
+                method,
+                f"{self._api_url}{path}",
+                headers=headers,
+                json=json,
+                params=params,
+                allow_redirects=False,
             ) as response:
                 body = await response.text()
-                if response.status >= 400:
+                if not 200 <= response.status < 300:
                     raise ArbitronError(
                         f"{method} {path} -> HTTP {response.status}",
                         status=response.status,
                         body=body,
+                        outcome_unknown=method == "POST" and response.status >= 500,
                     )
                 return await response.json(content_type=None)
         except aiohttp.ClientError as exc:
-            raise ArbitronError(f"{method} {path} failed: {exc}") from exc
-        except asyncio.TimeoutError as exc:
-            raise ArbitronError(f"{method} {path} timed out") from exc
+            raise ArbitronError(
+                f"{method} request failed", outcome_unknown=method == "POST"
+            ) from exc
+        except TimeoutError as exc:
+            raise ArbitronError(
+                f"{method} request timed out", outcome_unknown=method == "POST"
+            ) from exc
+        except ValueError as exc:
+            raise ArbitronError(
+                "Gateway returned an invalid result", outcome_unknown=method == "POST"
+            ) from exc
 
     # --- Public API (без ключа) ---
 
@@ -132,9 +172,7 @@ class ArbitronClient:
         data = await self._request("GET", f"/pay/{public_id}/status", auth=False)
         return PaymentStatus.from_api(data)
 
-    async def select_payment(
-        self, public_id: str, *, chain: str, token: str
-    ) -> PaymentSelection:
+    async def select_payment(self, public_id: str, *, chain: str, token: str) -> PaymentSelection:
         """Выбрать сеть и токен, получить депозитный адрес под счёт."""
         data = await self._request(
             "POST",
@@ -156,6 +194,8 @@ class ArbitronClient:
         ttl_minutes: int = 60,
         metadata: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
+        allowed_rails: list[str] | None = None,
+        customer_telegram_id: str = "",
     ) -> Invoice:
         """
         Выставить счёт.
@@ -168,17 +208,24 @@ class ArbitronClient:
             raise ValueError("ttl_minutes must be >= 5")
         if not external_user_id:
             raise ValueError("external_user_id is required")
+        if allowed_rails and not idempotency_key:
+            raise ValueError("Provider invoice requires a persistent idempotency key")
 
-        payload_meta = {"external_user_id": external_user_id, **(metadata or {})}
+        payload_meta = dict(metadata or {})
+        if payload_meta.get("external_user_id", external_user_id) != external_user_id:
+            raise ValueError("metadata cannot override external_user_id")
+        payload_meta["external_user_id"] = external_user_id
         data = await self._request(
             "POST",
             "/v1/invoices",
             json={
-                "amount": str(amount),
+                "amount": self._exact_amount(amount),
                 "asset": asset.upper(),
                 "allowed_chains": allowed_chains,
                 "ttl_minutes": ttl_minutes,
                 "metadata": payload_meta,
+                "allowed_rails": allowed_rails or [],
+                "customer_telegram_id": customer_telegram_id,
             },
             idempotency_key=idempotency_key or str(uuid4()),
         )
@@ -197,3 +244,114 @@ class ArbitronClient:
         data = await self._request("GET", "/v1/invoices", params=params)
         items = data.get("items") if isinstance(data, dict) else data
         return [Invoice.from_api(item) for item in (items or [])]
+
+    async def connect_provider(
+        self,
+        *,
+        provider: str,
+        token: str,
+        assets: list[str],
+        network: str = "MAIN_NET",
+        label: str | None = None,
+    ) -> str:
+        data = await self._request(
+            "POST",
+            "/v1/rails",
+            json={
+                "type": provider,
+                "token": token,
+                "network": network,
+                "assets": assets,
+                "label": label,
+            },
+        )
+        return str(data["id"])
+
+    async def payment_methods(self) -> list[dict]:
+        return (await self._request("GET", "/v1/rails"))["items"]
+
+    async def invoice_methods(self, public_id: str) -> dict:
+        return await self._request("GET", f"/pay/{public_id}/methods", auth=False)
+
+    async def select_provider(self, public_id: str, rail_id: str) -> ProviderOperation:
+        data = await self._request(
+            "POST", f"/pay/{public_id}/select-provider", json={"rail_id": rail_id}, auth=False
+        )
+        return ProviderOperation.from_api(data)
+
+    async def invoice_receipt(self, invoice_id: str) -> dict:
+        """Verified gross/net receipt. A missing receipt never confirms payment."""
+        return await self._request("GET", f"/v1/invoices/{invoice_id}/receipt")
+
+    async def provider_balances(self, rail_id: str) -> list[ProviderBalance]:
+        data = await self._request("GET", f"/v1/rails/{rail_id}/balances")
+        return [ProviderBalance.from_api(row) for row in data["items"]]
+
+    async def payout(
+        self,
+        *,
+        rail_id: str,
+        amount: Decimal | str,
+        asset: str,
+        destination: str,
+        idempotency_key: str,
+        destination_type: str = "telegram_user_id",
+    ) -> ProviderOperation:
+        """Persisted payout: replay this key after a lost response; never generate a replacement."""
+        if not idempotency_key:
+            raise ValueError("Persistent payout idempotency key is required")
+        data = await self._request(
+            "POST",
+            "/v1/payouts",
+            json={
+                "rail_id": rail_id,
+                "amount": self._exact_amount(amount),
+                "asset": asset.upper(),
+                "destination": destination,
+                "destination_type": destination_type,
+                "idempotency_key": idempotency_key,
+            },
+        )
+        return ProviderOperation.from_api(data)
+
+    async def get_operation(self, operation_id: str) -> ProviderOperation:
+        return ProviderOperation.from_api(
+            await self._request("GET", f"/v1/operations/{operation_id}")
+        )
+
+    async def reconcile_operation(self, operation_id: str) -> ProviderOperation:
+        return ProviderOperation.from_api(
+            await self._request("POST", f"/v1/operations/{operation_id}/reconcile")
+        )
+
+    async def onchain_balance(self, chain: str, asset: str) -> dict:
+        return await self._request("GET", f"/v1/onchain/balances/{chain}/{asset}")
+
+    async def onchain_payout(
+        self,
+        *,
+        chain: str,
+        asset: str,
+        amount: Decimal | str,
+        destination: str,
+        idempotency_key: str,
+    ) -> dict:
+        if not idempotency_key:
+            raise ValueError("Persistent payout key is required")
+        return await self._request(
+            "POST",
+            "/v1/onchain/payouts",
+            json={
+                "chain": chain,
+                "asset": asset,
+                "amount": self._exact_amount(amount),
+                "destination": destination,
+                "idempotency_key": idempotency_key,
+            },
+        )
+
+    async def onchain_operation(self, operation_id: str, *, reconcile: bool = False) -> dict:
+        return await self._request(
+            "POST" if reconcile else "GET",
+            f"/v1/onchain/operations/{operation_id}" + ("/reconcile" if reconcile else ""),
+        )

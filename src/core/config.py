@@ -51,6 +51,23 @@ class Settings(BaseSettings):
     # === Non-EVM RPC (пока остаются в env, не мигрировали в TOML) ===
     solana_rpc_url: str = "https://api.mainnet-beta.solana.com"
     ton_rpc_url: str = "https://toncenter.com/api/v2"
+    ton_index_url: str = "https://toncenter.com/api/v3"
+    ton_wallet_version: Literal["v3r2", "v4r2"] = "v3r2"
+    ton_workchain: Literal[0, -1] = 0
+    ton_jetton_attach_amount: str = "0.05"
+    ton_forward_amount: str = "0.000000001"
+    non_evm_enabled: bool = False
+    non_evm_start_blocks: str = ""
+    solana_funder_private_key: SecretStr = Field(default="")
+    ton_funder_private_key: SecretStr = Field(default="")
+    onchain_payout_enabled: bool = False
+    onchain_gateway_enabled: bool = False
+    onchain_rebroadcast_interval_seconds: int = Field(default=60, ge=15, le=3600)
+    evm_treasury_private_key: SecretStr = Field(default="")
+    solana_treasury_private_key: SecretStr = Field(default="")
+    ton_treasury_private_key: SecretStr = Field(default="")
+    ton_deposit_gas_budget: str = "0.1"
+    non_evm_poll_interval_seconds: int = Field(default=15, ge=5, le=3600)
     ton_api_key: str = ""  # TON Center API key (опционально)
 
     # === Treasury & Funding ===
@@ -120,6 +137,8 @@ class Settings(BaseSettings):
     # No existing API route, scanner or worker invokes this path in this slice.
     ledger_rail_orchestration_enabled: bool = False
     ledger_rail_orchestration_merchants: str = ""
+    gateway_provider_poll_interval_seconds: int = Field(default=30, ge=5, le=3600)
+    gateway_provider_poll_batch_size: int = Field(default=10, ge=1, le=50)
 
     # === CORS ===
     # В production укажите конкретные домены через запятую
@@ -145,9 +164,9 @@ class Settings(BaseSettings):
 
         # Non-EVM сети имеют свои treasury
         if chain == "solana":
-            return self.solana_treasury_address or self.treasury_address
+            return self.solana_treasury_address
         if chain == "ton":
-            return self.ton_treasury_address or self.treasury_address
+            return self.ton_treasury_address
 
         # EVM treasury
         if self.treasury_address:

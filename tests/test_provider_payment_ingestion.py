@@ -650,7 +650,7 @@ async def test_runtime_role_posts_once_and_cannot_ddl_or_truncate(
         assert observation is not None
 
     async with runtime_app_session_factory() as runtime:
-        assert (await runtime.scalar(text("SELECT current_user"))) == "provider_ingestion_runtime"
+        assert (await runtime.scalar(text("SELECT current_user"))) == make_url(os.environ[RUNTIME_DATABASE_ENV]).username
         await runtime.rollback()
         service = ProviderPaymentIngestionService(
             runtime, settings=settings(enabled=True, merchant_id=merchant_id)

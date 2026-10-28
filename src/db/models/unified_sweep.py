@@ -67,11 +67,11 @@ class UnifiedSweepJob(Base):
     # === Blockchain Info ===
     chain: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     token: Mapped[str] = mapped_column(String(10), nullable=False)  # USDT, USDC
-    token_contract: Mapped[str] = mapped_column(String(66), nullable=False)
+    token_contract: Mapped[str] = mapped_column(String(128), nullable=False)
     
     # === Wallet Info ===
-    from_address: Mapped[str] = mapped_column(String(66), nullable=False, index=True)
-    to_address: Mapped[str] = mapped_column(String(66), nullable=False)  # treasury
+    from_address: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    to_address: Mapped[str] = mapped_column(String(128), nullable=False)  # treasury
     
     # Зашифрованный приватный ключ (берём при создании job)
     encrypted_private_key: Mapped[str] = mapped_column(String(512), nullable=False)
@@ -89,8 +89,8 @@ class UnifiedSweepJob(Base):
     )
 
     # === Transaction Hashes ===
-    gas_tx_hash: Mapped[Optional[str]] = mapped_column(String(66), nullable=True)
-    sweep_tx_hash: Mapped[Optional[str]] = mapped_column(String(66), nullable=True)
+    gas_tx_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    sweep_tx_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
 
     # === Gas Info (для оптимизации) ===
     estimated_gas_wei: Mapped[Optional[str]] = mapped_column(String(78), nullable=True)

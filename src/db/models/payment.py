@@ -275,18 +275,18 @@ class OnchainTx(Base, UUIDMixin):
     chain: Mapped[str] = mapped_column(String(20), nullable=False)
 
     # Данные транзакции
-    tx_hash: Mapped[str] = mapped_column(String(66), nullable=False)
+    tx_hash: Mapped[str] = mapped_column(String(128), nullable=False)
     block_number: Mapped[int] = mapped_column(BigInteger, nullable=False)
     log_index: Mapped[int] = mapped_column(
         Integer, nullable=False
     )  # Индекс лога в транзакции
 
     # Адреса
-    from_address: Mapped[str] = mapped_column(String(42), nullable=False)
-    to_address: Mapped[str] = mapped_column(String(42), nullable=False, index=True)
+    from_address: Mapped[str] = mapped_column(String(128), nullable=False)
+    to_address: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
 
     # Токен и сумма
-    token_contract: Mapped[str] = mapped_column(String(42), nullable=False)
+    token_contract: Mapped[str] = mapped_column(String(128), nullable=False)
     amount: Mapped[Decimal] = mapped_column(Numeric(36, 18), nullable=False)
 
     # Связь с сессией оплаты

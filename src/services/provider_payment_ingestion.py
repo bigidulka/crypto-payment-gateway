@@ -38,6 +38,8 @@ from src.db.models import (
 from src.db.models.ledger import LedgerDirection, LedgerEntry, LedgerTransaction
 from src.ledger.amounts import ATOMIC_AMOUNT_UPPER_BOUND, decimal_to_atomic
 from src.payments.rails.base import RailPayment
+from src.payments.policy import CUSTODIAL_RAIL_TYPES
+from src.db.models.gateway_operation import ProviderSettlement
 from src.services.ledger_posting_service import LedgerLine, LedgerPostingService
 
 
@@ -90,6 +92,7 @@ class VerifiedProviderObservation:
     source_kind: str
     economic_digest: str
     evidence_digest: str
+    settled_amount_atomic: int | None = None
 
 
 def _digest(value: object) -> str:
@@ -186,10 +189,10 @@ def _economic_digest(
     provider_invoice_id: str,
     provider_asset_code: str,
     amount_atomic: int,
+    settled_amount_atomic: int | None = None,
 ) -> str:
     """Stable economic identity; provider timestamps are noncanonical audit metadata here."""
-    return _digest(
-        {
+    identity = {
             "v": 1,
             "provider_account_identity": binding.provider_account_identity,
             "provider_network": binding.provider_network,
@@ -198,7 +201,10 @@ def _economic_digest(
             "provider_asset_code": provider_asset_code,
             "amount_atomic": str(amount_atomic),
         }
-    )
+    if settled_amount_atomic is not None:
+        identity["v"] = 2
+        identity["settled_amount_atomic"] = str(settled_amount_atomic)
+    return _digest(identity)
 
 
 def _redacted_evidence(value: object) -> object:
@@ -221,6 +227,8 @@ def _redacted_evidence(value: object) -> object:
         }
     if isinstance(value, list):
         return [_redacted_evidence(item) for item in value]
+    if isinstance(value, Decimal):
+        return str(value)
     return value
 
 
@@ -246,9 +254,15 @@ async def verify_cryptobot_payment(
     if payment_asset != provider_asset_code:
         raise ProviderReconciliationConflict("provider asset code mismatch")
     observed_atomic = _atomic(payment.amount, atomic_decimals)
+    settled_atomic = (
+        _atomic(payment.settled_amount, atomic_decimals)
+        if payment.settled_amount is not None else None
+    )
+    if settled_atomic is not None and settled_atomic > observed_atomic:
+        raise ProviderReconciliationConflict("net settlement exceeds gross payment")
     paid_at = _optional_timestamp(payment.paid_at)
     raw = payment.raw if isinstance(payment.raw, dict) else {}
-    economic_digest = _economic_digest(binding, payment_invoice_id, payment_asset, observed_atomic)
+    economic_digest = _economic_digest(binding, payment_invoice_id, payment_asset, observed_atomic, settled_atomic)
     return VerifiedProviderObservation(
         merchant_id=binding.merchant_id,
         mapping_id=binding.mapping_id,
@@ -263,6 +277,7 @@ async def verify_cryptobot_payment(
         source_kind="provider_poll",
         economic_digest=economic_digest,
         evidence_digest=_digest(_redacted_evidence(raw)),
+        settled_amount_atomic=settled_atomic,
     )
 
 
@@ -324,11 +339,11 @@ class ProviderPaymentIngestionService:
             )
             if (
                 not rail.is_active
-                or rail.rail_type != "cryptobot"
+                or rail.rail_type not in CUSTODIAL_RAIL_TYPES
                 or rail.network != network
                 or mapping.provider_asset_code not in rail.assets
                 or asset.network_kind != "custodial"
-                or asset.network_identifier != f"cryptobot:{network}"
+                or asset.network_identifier != f"{rail.rail_type}:{network}"
                 or asset.canonical_identifier != mapping.provider_asset_code
                 or asset.is_native
             ):
@@ -385,11 +400,16 @@ class ProviderPaymentIngestionService:
         if provider_asset_code != provider_asset_code.upper():
             raise ProviderIngestionError("provider asset code must be uppercase")
         amount = _atomic_int(observation.observed_amount_atomic, "observed atomic amount")
+        settled_amount = observation.settled_amount_atomic
+        if settled_amount is not None:
+            settled_amount = _atomic_int(settled_amount, "settled atomic amount")
+            if settled_amount > amount:
+                raise ProviderReconciliationConflict("net settlement exceeds gross payment")
         _optional_timestamp(observation.provider_paid_at)
         if observation.source_kind not in {"provider_poll", "provider_webhook"}:
             raise ProviderIngestionError("unsupported verified provider source")
         if _digest_hex(observation.economic_digest, "economic digest") != _economic_digest(
-            binding, provider_invoice_id, provider_asset_code, amount
+            binding, provider_invoice_id, provider_asset_code, amount, settled_amount
         ):
             raise ProviderReconciliationConflict(
                 "verified observation economic digest does not match binding"
@@ -480,6 +500,15 @@ class ProviderPaymentIngestionService:
                 "existing provider observation asset proof missing"
             )
         expected_payload["observed"]["atomic_decimals"] = asset.atomic_decimals
+        expected_payload["observed"]["network_identifier"] = asset.network_identifier
+        ledger_amount = observation.observed_amount_atomic
+        if observation.settled_amount_atomic is not None:
+            settlement = await self.session.get(ProviderSettlement, fact.id)
+            if (settlement is None or settlement.merchant_id != merchant_id
+                    or int(settlement.settled_amount_atomic) != observation.settled_amount_atomic):
+                raise ProviderReconciliationConflict("net settlement proof mismatch")
+            ledger_amount = observation.settled_amount_atomic
+            expected_payload["observed"]["settled_amount_atomic"] = str(ledger_amount)
         if event.payload != expected_payload:
             raise ProviderReconciliationConflict(
                 "existing provider observation event payload proof mismatch"
@@ -494,13 +523,13 @@ class ProviderPaymentIngestionService:
                 mapping.receivable_account_id,
                 mapping.ledger_asset_id,
                 "debit",
-                observation.observed_amount_atomic,
+                ledger_amount,
             ),
             (
                 mapping.payable_account_id,
                 mapping.ledger_asset_id,
                 "credit",
-                observation.observed_amount_atomic,
+                ledger_amount,
             ),
         }
         actual_lines = {
@@ -617,11 +646,11 @@ class ProviderPaymentIngestionService:
             raise ProviderReconciliationConflict("invoice no longer matches exact mapped payment")
         if (
             not rail.is_active
-            or rail.rail_type != "cryptobot"
+            or rail.rail_type not in CUSTODIAL_RAIL_TYPES
             or rail.network != mapping.provider_network
             or mapping.provider_asset_code not in rail.assets
             or asset.network_kind != "custodial"
-            or asset.network_identifier != f"cryptobot:{mapping.provider_network}"
+            or asset.network_identifier != f"{rail.rail_type}:{mapping.provider_network}"
             or asset.canonical_identifier != mapping.provider_asset_code
             or asset.is_native
         ):
@@ -645,6 +674,14 @@ class ProviderPaymentIngestionService:
         )
         self.session.add(fact)
         await self.session.flush()
+        ledger_amount = observation.observed_amount_atomic
+        if observation.settled_amount_atomic is not None:
+            ledger_amount = observation.settled_amount_atomic
+            self.session.add(ProviderSettlement(
+                observation_id=fact.id, merchant_id=actor_merchant_id,
+                settled_amount_atomic=ledger_amount,
+            ))
+            await self.session.flush()
         decision_digest = _digest({"observation_id": str(fact.id), "decision": "verified"})
         decision = ProviderVerificationDecision(
             merchant_id=actor_merchant_id,
@@ -664,13 +701,13 @@ class ProviderPaymentIngestionService:
                     mapping.receivable_account_id,
                     mapping.ledger_asset_id,
                     LedgerDirection.DEBIT,
-                    observation.observed_amount_atomic,
+                    ledger_amount,
                 ),
                 LedgerLine(
                     mapping.payable_account_id,
                     mapping.ledger_asset_id,
                     LedgerDirection.CREDIT,
-                    observation.observed_amount_atomic,
+                    ledger_amount,
                 ),
             ),
         )
@@ -695,6 +732,8 @@ class ProviderPaymentIngestionService:
                 "amount_atomic": str(observation.observed_amount_atomic),
             },
         }
+        if observation.settled_amount_atomic is not None:
+            payload["observed"]["settled_amount_atomic"] = str(ledger_amount)
         invoice_event = InvoiceEvent(
             invoice_id=invoice.id,
             event_id=event_id,

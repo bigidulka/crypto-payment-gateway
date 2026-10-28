@@ -27,6 +27,8 @@ ALLOWED_SERVICES = (
     "worker-webhook",
     "worker-sweeper",
     "worker-expirer",
+    "worker-providers",
+    "worker-onchain",
 )
 FORBIDDEN_PREFIXES = ("POSTGRES_", "OWNER_")
 FORBIDDEN_NAMES = {"PGPASSWORD", "DATABASE_OWNER_URL", "OWNER_DATABASE_URL"}
@@ -36,6 +38,8 @@ EXPECTED_COMMANDS = {
     "worker-webhook": ["python", "-m", "src.workers.webhook_dispatcher"],
     "worker-sweeper": ["python", "-m", "src.workers.unified_sweeper_runner"],
     "worker-expirer": ["python", "-m", "src.workers.invoice_expirer"],
+    "worker-providers": ["python", "-m", "src.workers.provider_poller"],
+    "worker-onchain": ["python", "-m", "src.workers.onchain_gateway"],
 }
 IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 PROJECT = "arbitron-payment"
@@ -189,6 +193,8 @@ def validate(plan: Plan, runner: Runner) -> dict[str, object]:
             str(plan.runtime_override),
             "-f",
             str(plan.image_override),
+            *(["--profile", "providers"] if plan.service == "worker-providers" else []),
+            *(["--profile", "onchain"] if plan.service == "worker-onchain" else []),
             "config",
             "--format",
             "json",

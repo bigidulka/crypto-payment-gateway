@@ -26,6 +26,8 @@ COMMANDS = {
     "worker-webhook": ["python", "-m", "src.workers.webhook_dispatcher"],
     "worker-sweeper": ["python", "-m", "src.workers.unified_sweeper_runner"],
     "worker-expirer": ["python", "-m", "src.workers.invoice_expirer"],
+    "worker-providers": ["python", "-m", "src.workers.provider_poller"],
+    "worker-onchain": ["python", "-m", "src.workers.onchain_gateway"],
 }
 
 
@@ -95,13 +97,15 @@ def rendered_environment(planned):
     return environment
 
 
-def test_allowlist_is_exact_five_runtime_services():
+def test_allowlist_contains_only_reviewed_runtime_services():
     assert planner.ALLOWED_SERVICES == (
         "api",
         "worker-poller",
         "worker-webhook",
         "worker-sweeper",
         "worker-expirer",
+        "worker-providers",
+        "worker-onchain",
     )
 
 

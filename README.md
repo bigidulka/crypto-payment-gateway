@@ -87,6 +87,11 @@ arq workers:                                             │
 | SDK | Python-клиент с типами и проверкой подписи |
 | Инфраструктура | Docker Compose, отдельные compose-оверлеи для runtime-роли |
 
+## Подключение своих ботов
+
+Единый merchant API и SDK без provider credentials в продукте:
+[руководство подключения](docs/BOT_INTEGRATION.md).
+
 ## Быстрый старт
 
 ```bash
@@ -105,6 +110,9 @@ arq src.workers.sweeper.WorkerSettings
 Интеграция мерчанта (создание счёта, вебхуки, проверка подписи) — в
 [`docs/INTEGRATION_GUIDE.md`](docs/INTEGRATION_GUIDE.md), эксплуатация рантайм-роли — в
 [`docs/runtime-deployment.md`](docs/runtime-deployment.md).
+Provider checkout, verified available, резервы и payout/readback описаны в
+[`docs/provider-payments.md`](docs/provider-payments.md). Эта реализация локально
+проверена; новые финансовые пути выключены по умолчанию и ещё не развёрнуты.
 
 ### API
 

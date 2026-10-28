@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM python:3.12-slim AS base
+FROM python:3.12.12-slim-bookworm AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
@@ -8,8 +8,8 @@ ENV PYTHONPATH=/app
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -17,6 +17,9 @@ RUN groupadd --gid 1000 appgroup && \
     useradd --uid 1000 --gid appgroup --shell /bin/bash --create-home appuser
 
 FROM base AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
@@ -34,6 +37,7 @@ RUN pip install --no-cache-dir /wheels/* && \
 
 COPY --chown=appuser:appgroup src ./src
 COPY --chown=appuser:appgroup config/chains.toml ./config/chains.toml
+COPY --chown=appuser:appgroup config/providers.toml ./config/providers.toml
 COPY --chown=appuser:appgroup alembic ./alembic
 COPY --chown=appuser:appgroup alembic.ini ./alembic.ini
 
@@ -52,6 +56,7 @@ RUN pip install --no-cache-dir /wheels/* && \
 
 COPY --chown=appuser:appgroup src ./src
 COPY --chown=appuser:appgroup config/chains.toml ./config/chains.toml
+COPY --chown=appuser:appgroup config/providers.toml ./config/providers.toml
 COPY --chown=appuser:appgroup docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
 

@@ -342,7 +342,10 @@ def get_chain_config(chain: str) -> ChainConfig:
 def get_all_chains() -> list[str]:
     """Получить список всех поддерживаемых сетей."""
     _load_config()
-    return list(_CHAINS_CONFIG.keys())
+    from src.core.config import get_settings
+    enabled = get_settings().non_evm_enabled
+    return [name for name, config in _CHAINS_CONFIG.items()
+            if config.chain_type == ChainType.EVM or enabled]
 
 
 def get_evm_chains() -> list[str]:
@@ -362,7 +365,7 @@ def is_chain_supported(chain: str) -> bool:
     _load_config()
     chain_lower = chain.lower()
     normalized = _ALIASES.get(chain_lower, chain_lower)
-    return normalized in _CHAINS_CONFIG
+    return normalized in get_all_chains()
 
 
 def is_evm_chain(chain: str) -> bool:

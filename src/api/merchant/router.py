@@ -88,6 +88,8 @@ async def create_invoice(
         ttl_minutes=body.ttl_minutes,
         metadata=body.metadata,
         idempotency_key=idempotency_key,
+        allowed_rails=body.allowed_rails,
+        customer_telegram_id=body.customer_telegram_id,
     )
 
     return InvoiceResponse(
@@ -96,6 +98,7 @@ async def create_invoice(
         amount=invoice.amount,
         asset=invoice.asset,
         allowed_chains=invoice.allowed_chains,
+        allowed_rails=body.allowed_rails,
         status=invoice.status.value,
         ttl_minutes=invoice.ttl_minutes,
         expires_at=invoice.expires_at,
@@ -162,6 +165,7 @@ async def get_invoice(
         asset=invoice.asset,
         allowed_chains=invoice.allowed_chains,
         status=invoice.status.value,
+        allowed_rails=await service.provider_rail_ids(invoice),
         ttl_minutes=invoice.ttl_minutes,
         expires_at=invoice.expires_at,
         metadata=invoice.extra_data,
@@ -212,6 +216,7 @@ async def list_invoices(
                 asset=invoice.asset,
                 allowed_chains=invoice.allowed_chains,
                 status=invoice.status.value,
+                allowed_rails=await service.provider_rail_ids(invoice),
                 ttl_minutes=invoice.ttl_minutes,
                 expires_at=invoice.expires_at,
                 metadata=invoice.extra_data,
@@ -254,6 +259,7 @@ async def expire_invoice(
         asset=invoice.asset,
         allowed_chains=invoice.allowed_chains,
         status=invoice.status.value,
+        allowed_rails=await service.provider_rail_ids(invoice),
         ttl_minutes=invoice.ttl_minutes,
         expires_at=invoice.expires_at,
         metadata=invoice.extra_data,

@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.blockchain.chains import get_all_chains, get_all_tokens, get_chain_config
 from src.core.webhook_egress import WebhookEgressError, validate_webhook_url
+from src.payments.policy import provider_assets
 
 # === Invoice Schemas ===
 
@@ -21,6 +22,8 @@ class InvoiceCreateRequest(BaseModel):
     amount: Decimal = Field(
         ...,
         gt=0,
+        max_digits=36,
+        decimal_places=18,
         description="Сумма платежа в USDT/USDC",
         examples=["100.50"],
     )
@@ -39,6 +42,15 @@ class InvoiceCreateRequest(BaseModel):
         le=1440,  # Максимум 24 часа
         description="Время жизни инвойса в минутах",
     )
+    allowed_rails: list[UUID] = Field(default_factory=list, max_length=20)
+    customer_telegram_id: str = Field(default="", max_length=32, description="Trusted customer ID supplied by the merchant")
+
+    @model_validator(mode="before")
+    @classmethod
+    def provider_only_default(cls, value):
+        if isinstance(value, dict) and value.get("allowed_rails") and "allowed_chains" not in value:
+            return {**value, "allowed_chains": []}
+        return value
     metadata: dict[str, Any] | None = Field(
         default=None,
         description="Произвольные метаданные (order_id, comment и т.д.)",
@@ -51,9 +63,16 @@ class InvoiceCreateRequest(BaseModel):
         asset = v.upper().strip()
         if not asset:
             raise ValueError("Asset is required")
-        if asset not in get_all_tokens():
+        if asset not in set(get_all_tokens()) | provider_assets():
             raise ValueError(f"Invalid asset: {asset}. Supported: {get_all_tokens()}")
         return asset
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def exact_amount(cls, value):
+        if isinstance(value, (float, bool)):
+            raise ValueError("Amount must be an exact decimal string or integer")
+        return value
 
     @field_validator("allowed_chains")
     @classmethod
@@ -73,6 +92,11 @@ class InvoiceCreateRequest(BaseModel):
         ]
         if invalid:
             raise ValueError(f"Asset {self.asset} is not supported on chains: {invalid}")
+        from src.ledger.amounts import decimal_to_atomic
+        for chain in self.allowed_chains:
+            decimal_to_atomic(self.amount, get_chain_config(chain).get_asset_decimals(self.asset))
+        if not self.allowed_chains and not self.allowed_rails:
+            raise ValueError("At least one payment method is required")
         return self
 
 
@@ -96,6 +120,7 @@ class InvoiceResponse(BaseModel):
     amount: Decimal
     asset: str
     allowed_chains: list[str]
+    allowed_rails: list[UUID] = Field(default_factory=list)
     status: str
     ttl_minutes: int
     expires_at: datetime

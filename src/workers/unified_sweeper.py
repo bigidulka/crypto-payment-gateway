@@ -28,8 +28,8 @@ from src.blockchain.chains import NATIVE_TOKEN_CONTRACT, get_chain_config, get_e
 from src.blockchain.evm_adapter import get_evm_adapter, EvmAdapter
 from src.core.config import get_settings
 from src.crypto.encryption import decrypt_private_key
-from src.db.models import UnifiedSweepJob, SweepState
-from src.db.session import get_session_context
+from src.db.models import UnifiedSweepJob, SweepState, OnchainScanCursor
+from src.db.session import get_session_context, has_onchain_scan_schema
 from src.db.redis import redis_lock
 
 logger = logging.getLogger(__name__)
@@ -136,11 +136,15 @@ class UnifiedBatchSweeper:
     ) -> dict[str, list[UnifiedSweepJob]]:
         """Получить pending jobs сгруппированные по chain."""
         now = datetime.now(timezone.utc)
+        enrolled_schema = await has_onchain_scan_schema(session)
         
         stmt = (
             select(UnifiedSweepJob)
             .where(
                 and_(
+                    UnifiedSweepJob.chain.in_(get_evm_chains()),
+                    (~select(OnchainScanCursor.session_id).where(OnchainScanCursor.session_id == UnifiedSweepJob.source_id).exists()
+                     if enrolled_schema else True),
                     UnifiedSweepJob.state.in_([
                         SweepState.PENDING_GAS,
                         SweepState.FUNDING,

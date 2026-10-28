@@ -1,0 +1,21 @@
+# Gateway ledger precision for exact custodial amounts. These are internal
+# accounting units, not a claim about a blockchain token's decimals.
+# Values with greater precision are rejected for reconciliation, never rounded.
+[cryptobot.assets]
+USDT = 8
+USDC = 8
+TON = 9
+BTC = 8
+ETH = 18
+
+[xrocket.assets]
+USDT = 8
+USDC = 8
+TON = 9
+BTC = 8
+ETH = 18
+
+[tgwallet.assets]
+USDT = 6
+TON = 9
+BTC = 8

@@ -51,6 +51,7 @@ class RailInvoiceRequest:
     expires_in_minutes: int = 60
     # opaque-строка шлюза (обычно invoice public id): вернётся в статусе
     external_id: str = ""
+    customer_telegram_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,9 @@ class RailPayment:
     paid_at: str = ""            # ISO-строка от провайдера, если есть
     external_id: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
+    # Actual settlement in the same canonical asset, after provider fees.
+    # None means that settlement evidence is unavailable, not zero fees.
+    settled_amount: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +89,9 @@ class RailPayoutRequest:
     # Для CryptoBot - пользователь активирует чек сам; адрес не нужен
     destination: str = ""
     external_user_id: str = ""
+    # Durable gateway operation ID, never generated afresh for a retry.
+    operation_id: str = ""
+    destination_type: str = "telegram_user_id"
 
 
 @dataclass(frozen=True)
@@ -94,6 +101,28 @@ class RailPayout:
     check_url: str = ""
     message: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
+    status: str = "completed"
+    amount: Decimal | None = None
+    asset: str = ""
+    destination: str = ""
+    destination_type: str = ""
+
+
+@dataclass(frozen=True)
+class RailBalance:
+    asset: str
+    available: Decimal
+    held: Decimal = Decimal("0")
+
+
+@dataclass(frozen=True)
+class RailCapabilities:
+    payout_mode: str = "unsupported"
+    balances: bool = False
+    invoice_lookup_by_client_id: bool = False
+    payout_lookup_by_client_id: bool = False
+    requires_telegram_customer: bool = False
+    settlement_hold_seconds: int = 0
 
 
 class RailError(Exception):
@@ -128,6 +157,22 @@ class Rail(ABC):
     """
 
     rail_type: RailType
+
+    @property
+    def capabilities(self) -> RailCapabilities:
+        return RailCapabilities()
+
+    async def account_identity(self) -> str:
+        raise RailError(self.rail_type.value, "account identity lookup is unsupported", permanent=True)
+
+    async def get_balances(self) -> tuple[RailBalance, ...]:
+        raise RailError(self.rail_type.value, "authoritative balance lookup is unsupported", permanent=True)
+
+    async def find_invoice(self, external_id: str) -> RailInvoice | None:
+        raise RailError(self.rail_type.value, "client invoice lookup is unsupported", permanent=True)
+
+    async def get_payout(self, operation_id: str, provider_payout_id: str = "") -> RailPayout:
+        raise RailError(self.rail_type.value, "payout reconciliation is unsupported", permanent=True)
 
     @abstractmethod
     def supported_assets(self) -> tuple[str, ...]:

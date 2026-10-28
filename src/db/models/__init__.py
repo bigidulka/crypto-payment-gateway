@@ -18,6 +18,7 @@ from src.db.models.enums import (
     enum_values,
 )
 from src.db.models.invoice import Invoice, InvoiceEvent
+from src.db.models.gateway_operation import GatewayInvoiceOptions, GatewayOperation, GatewayRailConnection, GatewayPayoutReceipt, ProviderSettlement
 from src.db.models.ledger import LedgerAccount, LedgerAsset, LedgerEntry, LedgerTransaction
 from src.db.models.merchant import ApiKey, Merchant, Webhook
 from src.db.models.payment import (
@@ -48,6 +49,10 @@ from src.db.models.user_wallet import (
 )
 
 __all__ = [
+    "GatewayInvoiceOptions",
+    "GatewayOperation",
+    "GatewayRailConnection",
+    "ProviderSettlement",
     # Base
     "Base",
     "TimestampMixin",
@@ -100,3 +105,5 @@ __all__ = [
     "LedgerTransaction",
     "LedgerEntry",
 ]
+
+from src.db.models.onchain_gateway import OnchainOperation, OnchainReceipt, OnchainScanCursor

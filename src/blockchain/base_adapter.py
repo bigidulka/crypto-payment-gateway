@@ -52,6 +52,8 @@ class TransferEvent:
     chain: str  # Имя сети (base, solana, ton)
     chain_type: ChainType  # Тип сети
     timestamp: int | None = None  # Unix timestamp блока
+    reference: str | None = None
+    scan_block_number: int | None = None
 
 
 @dataclass

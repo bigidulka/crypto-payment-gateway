@@ -11,7 +11,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, desc, func, select
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from sqlalchemy import and_, desc, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
@@ -527,6 +528,24 @@ async def list_sweeps(
     )
 
 
+async def guard_gateway_sweep_retry(session, sweep):
+    from src.db.session import has_onchain_scan_schema
+    if not await has_onchain_scan_schema(session):
+        return False
+    from src.db.models import OnchainOperation, OnchainScanCursor
+    from src.services.onchain_gateway_service import ACTIVE
+    if not await session.get(OnchainScanCursor, sweep.source_id):
+        return False
+    if sweep.state != SweepState.FAILED:
+        raise HTTPException(409, 'Gateway sweep must have a verified failed attempt')
+    active = await session.scalar(select(OnchainOperation.id).where(
+        OnchainOperation.status.in_(ACTIVE),
+        (OnchainOperation.key.like(f'fund:{sweep.id}%')) | (OnchainOperation.key.like(f'sweep:{sweep.id}%'))))
+    if active:
+        raise HTTPException(409, 'Unresolved signed/unsigned operation must be reconciled first')
+    return True
+
+
 @router.post(
     "/sweeps/retry",
     response_model=ActionResponse,
@@ -548,6 +567,7 @@ async def retry_sweep(
     if sweep.state == SweepState.COMPLETED:
         return ActionResponse(success=False, message="Sweep already completed")
 
+    await guard_gateway_sweep_retry(session, sweep)
     sweep.attempts = 0
     sweep.state = SweepState.PENDING_GAS
     sweep.next_retry_at = None
@@ -578,6 +598,8 @@ async def reset_sweep(
     if not sweep:
         raise HTTPException(status_code=404, detail="Sweep not found")
 
+    if await guard_gateway_sweep_retry(session, sweep) and request.reset_to_state != SweepState.PENDING_GAS.value:
+        raise HTTPException(409, 'Gateway retry must retain the original financial attempts')
     sweep.attempts = 0
     sweep.state = SweepState(request.reset_to_state)
     sweep.next_retry_at = None
@@ -1856,3 +1878,37 @@ async def create_merchant_webhook(
         "events": webhook.events,
         "secret": webhook.secret,
     }
+
+
+# Trusted manager persists a generated key before calling this idempotent endpoint.
+# Replays recover the same merchant; the gateway never returns raw credentials.
+
+
+class ManagedMerchantCreate(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    merchant_id: uuid.UUID
+    name: str = Field(min_length=1, max_length=100)
+    api_key: SecretStr = Field(min_length=32, max_length=256)
+
+
+@router.post('/gateway/merchants', status_code=201)
+async def create_managed_merchant(body: ManagedMerchantCreate, session: SessionDep, auth: AdminAuthDep):
+    from src.core.security import hash_api_key
+    key_hash = hash_api_key(body.api_key.get_secret_value())
+    await session.execute(text('SELECT pg_advisory_xact_lock(:id)'),
+        {'id': int.from_bytes(body.merchant_id.bytes[:8], 'big', signed=True)})
+    merchant = await session.get(Merchant, body.merchant_id)
+    if merchant:
+        key = await session.scalar(select(ApiKey).where(ApiKey.merchant_id == merchant.id,
+            ApiKey.key_hash == key_hash, ApiKey.is_active.is_(True)))
+        if merchant.name != body.name or key is None:
+            raise HTTPException(status_code=409, detail='Managed merchant identity conflicts')
+    else:
+        merchant = Merchant(id=body.merchant_id, name=body.name,
+            email=f'{body.merchant_id}@managed.invalid')
+        session.add(merchant)
+        await session.flush()
+        session.add(ApiKey(merchant_id=merchant.id, key_hash=key_hash,
+            key_prefix=body.api_key.get_secret_value()[:8], name='manager'))
+    await session.commit()
+    return {'merchant_id': str(merchant.id)}

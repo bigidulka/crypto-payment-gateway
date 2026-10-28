@@ -24,7 +24,7 @@ from src.core.exceptions import (
     PaymentError,
     ValidationError,
 )
-from src.crypto.encryption import encrypt_private_key
+from src.crypto.encryption import encrypt_private_key, encrypt_secret
 from src.crypto.hd_wallet import HDWallet
 from src.db.models import (
     DepositAddress,
@@ -72,14 +72,14 @@ class PaymentService:
                 from src.crypto.solana_wallet import SolanaHDWallet
                 seed = self.settings.solana_wallet_seed.get_secret_value()
                 if not seed:
-                    seed = self.settings.hd_wallet_seed.get_secret_value()
+                    raise ValidationError(f"Separate {chain_group} wallet seed is required")
                 self._hd_wallets[chain_group] = SolanaHDWallet(seed)
             elif chain_group == "ton":
                 from src.crypto.ton_wallet import TonHDWallet
                 seed = self.settings.ton_wallet_seed.get_secret_value()
                 if not seed:
-                    seed = self.settings.hd_wallet_seed.get_secret_value()
-                self._hd_wallets[chain_group] = TonHDWallet(seed)
+                    raise ValidationError(f"Separate {chain_group} wallet seed is required")
+                self._hd_wallets[chain_group] = TonHDWallet(seed, self.settings.ton_wallet_version, self.settings.ton_workchain)
             else:
                 raise ValueError(f"Unknown chain_group: {chain_group}")
         return self._hd_wallets[chain_group]
@@ -123,6 +123,16 @@ class PaymentService:
             InvoiceExpiredError: Если инвойс истёк
             ValidationError: Если сеть/токен не разрешены
         """
+        # Provider selection takes the same invoice lock before creating its
+        # durable operation. Prevent concurrent custodial/on-chain allocation.
+        if self.settings.ledger_rail_orchestration_enabled:
+            from src.db.models import GatewayOperation
+            invoice = await self.session.scalar(select(Invoice).where(Invoice.id == invoice.id)
+                .with_for_update().execution_options(populate_existing=True))
+            selected_provider = await self.session.scalar(select(GatewayOperation.id).where(
+                GatewayOperation.invoice_id == invoice.id))
+            if selected_provider is not None:
+                raise ValidationError("Invoice already has a provider payment method")
         # Проверяем статус инвойса
         if invoice.status not in (
             InvoiceStatus.CREATED,
@@ -155,9 +165,22 @@ class PaymentService:
                 f"Token {token} does not match invoice asset {invoice.asset}",
             )
         chain_config = get_chain_config(chain)
+        if chain_config.chain_type != ChainType.EVM and not self.settings.non_evm_enabled:
+            raise ValidationError("Non-EVM acceptance is disabled")
         if not chain_config.supports_asset(token):
             raise ValidationError(f"Asset {token} is not supported on {chain}")
 
+        from src.payments.policy import gateway_onchain_enabled
+        modern = gateway_onchain_enabled(invoice.merchant_id, self.settings)
+        if (invoice.extra_data or {}).get("gateway_receipt_required") is True and not modern:
+            raise ValidationError("On-chain payment is temporarily unavailable")
+        if chain_config.chain_type != ChainType.EVM and not modern:
+            raise ValidationError("Non-EVM ledger acceptance is not enabled for this merchant")
+        if modern:
+            import json
+            blocks = json.loads(self.settings.non_evm_start_blocks)
+            if chain not in blocks or isinstance(blocks[chain], bool) or not isinstance(blocks[chain], int) or blocks[chain] < 1:
+                raise ValidationError("Explicit gateway scan start block is required")
         # Проверяем, нет ли уже сессии для этой комбинации
         existing = await self._get_existing_session(invoice.id, chain, token)
         if existing:
@@ -171,6 +194,7 @@ class PaymentService:
         deposit_address = await self._acquire_deposit_address_lease(
             chain_group,
             invoice.expires_at,
+            dedicated=modern,
         )
 
         # Создаём payment session
@@ -185,6 +209,9 @@ class PaymentService:
         )
         self.session.add(session)
         await self.session.flush()
+        if modern:
+            from src.db.models import OnchainScanCursor
+            self.session.add(OnchainScanCursor(session_id=session.id, chain=chain, last_block=blocks[chain]-1))
         await self.address_leases.bind_payment_session(
             deposit_address,
             session.id,
@@ -232,7 +259,7 @@ class PaymentService:
             Созданная запись OnchainTx
         """
         # Normalize tx_hash to always have 0x prefix
-        if tx_hash and not tx_hash.startswith("0x"):
+        if self._get_chain_group(payment_session.chain) == "evm" and tx_hash and not tx_hash.startswith("0x"):
             tx_hash = "0x" + tx_hash
 
         # Проверяем, не записана ли уже эта транзакция
@@ -458,15 +485,16 @@ class PaymentService:
         self,
         chain_group: str,
         leased_until: datetime,
+        *, dedicated: bool = False,
     ) -> DepositAddress:
         """
         Получить lease на свободный или новый deposit address.
         Использует SELECT FOR UPDATE SKIP LOCKED внутри AddressLeaseService.
         """
-        address = await self.address_leases.acquire_available_address(
-            chain_group,
-            leased_until,
-        )
+        # A non-EVM address is dedicated to one invoice permanently. This also
+        # prevents reusing historical TON addresses from the old approximate derivation.
+        address = (await self.address_leases.acquire_available_address(chain_group, leased_until)
+                   if chain_group == "evm" and not dedicated else None)
         if address:
             logger.info(f"Leased existing deposit address {address.address}")
             return address
@@ -523,13 +551,11 @@ class PaymentService:
             address = derived.address.lower()
         else:
             # Solana/TON — адреса case-sensitive
-            address = derived.address
+            address = derived.address_raw if chain_group == "ton" else derived.address
 
         # Шифруем приватный ключ
-        encrypted_privkey = encrypt_private_key(
-            derived.private_key,
-            self.settings.encryption_key.get_secret_value(),
-        )
+        encryptor = encrypt_private_key if chain_group == "evm" else encrypt_secret
+        encrypted_privkey = encryptor(derived.private_key, self.settings.encryption_key.get_secret_value())
 
         # Создаём запись в изолированной сессии с немедленным commit
         async with session_factory() as isolated_session:
