@@ -232,8 +232,15 @@ async def sweep_once(factory):
                     # configured per-invoice cap for a one-time gas topup, then exact RPC fee.
                     gas = config.max_gas_cost_wei
                 needed = gas + (int(job.amount_raw) if native else 0)
+                # TON deducts inbound forwarding fees from a gas top-up, so the funded
+                # wallet lands a few nanotons short of the exact budget it was sent.
+                shortfall_allowed = (
+                    decimal_to_atomic(Decimal(settings.ton_funding_tolerance), 9)
+                    if config.chain_type == ChainType.TON
+                    else 0
+                )
                 funding, fund_key = await job_operation(session, invoice.merchant_id, job, "fund")
-                if balance < needed:
+                if balance + shortfall_allowed < needed:
                     if funding:
                         if funding.status == "preparing" and not funding.tx_id:
                             funder_key = getattr(

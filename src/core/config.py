@@ -72,6 +72,7 @@ class Settings(BaseSettings):
     solana_treasury_private_key: SecretStr = Field(default="")
     ton_treasury_private_key: SecretStr = Field(default="")
     ton_deposit_gas_budget: str = "0.1"
+    ton_funding_tolerance: str = "0.001"
     non_evm_poll_interval_seconds: int = Field(default=15, ge=5, le=3600)
     ton_api_key: str = ""  # TON Center API key (опционально)
 
