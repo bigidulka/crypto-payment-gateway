@@ -2,14 +2,12 @@
 Модели инвойса и событий.
 """
 
-import enum
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from sqlalchemy import (
-    Boolean,
     DateTime,
     Enum,
     ForeignKey,
@@ -17,7 +15,6 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
-    Text,
     UniqueConstraint,
     func,
 )
@@ -26,10 +23,10 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from src.db.models.base import (
     Base,
     TimestampMixin,
-    UUIDMixin,
     UniversalArray,
     UniversalJSON,
     UniversalUUID,
+    UUIDMixin,
 )
 
 if TYPE_CHECKING:
@@ -93,9 +90,7 @@ class Invoice(Base, UUIDMixin, TimestampMixin):
     )
 
     # Метаданные от мерчанта (order_id, comment и т.д.)
-    extra_data: Mapped[Optional[dict[str, Any]]] = mapped_column(
-        UniversalJSON, nullable=True
-    )
+    extra_data: Mapped[Optional[dict[str, Any]]] = mapped_column(UniversalJSON, nullable=True)
 
     # Idempotency key для защиты от дублей
     idempotency_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
@@ -130,8 +125,6 @@ class Invoice(Base, UUIDMixin, TimestampMixin):
         """Проверка, истёк ли инвойс."""
         # Если expires_at timezone-naive (из SQLite), считаем что это UTC
         if self.expires_at.tzinfo is None:
-            from datetime import timezone
-
             expires_at_utc = self.expires_at.replace(tzinfo=timezone.utc)
         else:
             expires_at_utc = self.expires_at
@@ -163,11 +156,11 @@ class InvoiceEvent(Base, UUIDMixin):
 
     # Тип события
     event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    # Stable ID for financially meaningful event producers. Legacy events remain null.
+    event_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, unique=True)
 
     # Данные события
-    payload: Mapped[Optional[dict[str, Any]]] = mapped_column(
-        UniversalJSON, nullable=True
-    )
+    payload: Mapped[Optional[dict[str, Any]]] = mapped_column(UniversalJSON, nullable=True)
 
     # Timestamp
     created_at: Mapped[datetime] = mapped_column(

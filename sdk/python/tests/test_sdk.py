@@ -242,6 +242,36 @@ async def test_create_invoice_sends_key_and_idempotency(gateway):
     assert call["body"]["metadata"]["external_user_id"] == "shop:42"
 
 
+@pytest.mark.parametrize("value", [0.1, True, "NaN", "Infinity", "0", "-1"])
+async def test_inexact_or_invalid_money_is_rejected_before_http(gateway, value):
+    async with ArbitronClient(gateway.url, "key") as client:
+        with pytest.raises(ValueError):
+            await client.create_invoice(
+                amount=value,
+                asset="USDT",
+                allowed_chains=["bsc"],
+                external_user_id="test",
+                idempotency_key="stable",
+            )
+        with pytest.raises(ValueError):
+            await client.payout(
+                rail_id="test",
+                amount=value,
+                asset="USDT",
+                destination="42",
+                idempotency_key="stable",
+            )
+        with pytest.raises(ValueError):
+            await client.onchain_payout(
+                chain="bsc",
+                amount=value,
+                asset="USDT",
+                destination="test",
+                idempotency_key="stable",
+            )
+    assert gateway.calls == []
+
+
 async def test_chains_filters_inactive_and_caches(gateway):
     async with ArbitronClient(gateway.url, "k") as c:
         chains = await c.get_chains()

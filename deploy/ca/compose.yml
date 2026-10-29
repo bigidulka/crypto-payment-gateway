@@ -98,3 +98,15 @@ services:
         format: raw
     healthcheck:
       disable: true
+
+  # Read-only provider reconciliation (CryptoBot receipts, payout readback).
+  # It never resubmits an invoice or payout; separate profile for staged enablement.
+  worker-providers:
+    <<: *runtime
+    profiles: [providers]
+    command: [python, -m, src.workers.provider_poller]
+    env_file:
+      - path: ${GATEWAY_CONFIG_DIR:-/home/server/.config/gateway-ca}/arbitron-payment-worker-providers.env
+        format: raw
+    healthcheck:
+      disable: true

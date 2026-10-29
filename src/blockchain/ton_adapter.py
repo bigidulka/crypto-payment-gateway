@@ -1,678 +1,603 @@
-"""
-TON Adapter - адаптер для работы с The Open Network blockchain.
+"""TON receive/send using real wallet BOCs and completed canonical jetton traces."""
 
-Поддерживает:
-- Получение балансов TON и Jetton токенов
-- Отслеживание Transfer событий
-- Отправка транзакций (sweep)
-
-Использует TON Center HTTP API для взаимодействия.
-"""
-
-import asyncio
 import base64
-import hashlib
-import logging
-from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
 
 import httpx
+from tonsdk.boc import Cell
+from tonsdk.contract.token.ft import JettonWallet
+from tonsdk.utils import Address
 
 from src.blockchain.base_adapter import (
     BaseAdapter,
-    BalanceInfo,
     ChainType,
-    FeeEstimate,
     TransactionResult,
     TransferEvent,
 )
 from src.blockchain.chains import ChainConfig, get_chain_config
+from src.blockchain.prepared import (
+    ChainEvidenceError,
+    ChainRPCError,
+    PreparedTransfer,
+    TransferReceipt,
+)
+from src.blockchain.ton_evidence import complete_trace, hash_id, internal_transfer, successful, uint
+from src.blockchain.ton_keys import normalize_ton_address, wallet_from_seed
 from src.core.config import get_settings
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class TonTransferInfo:
-    """Информация о TON transfer."""
-
-    lt: int  # Logical time
-    hash: str
-    utime: int
-    from_address: str
-    to_address: str
-    jetton_master: str | None  # None для нативного TON
-    amount: int
-    decimals: int
+from src.ledger.amounts import atomic_to_decimal, decimal_to_atomic
 
 
 class TonAdapter(BaseAdapter[ChainConfig]):
-    """
-    Адаптер для работы с TON blockchain.
-
-    Использует TON Center HTTP API или TonAPI для взаимодействия.
-    """
-
     def __init__(
         self,
-        chain: str = "ton",
+        chain="ton",
         config: ChainConfig | None = None,
         rpc_url: str | None = None,
         api_key: str | None = None,
-    ) -> None:
-        if config is None:
-            config = get_chain_config(chain)
-
+        index_url: str | None = None,
+    ):
+        config = config or get_chain_config(chain)
         super().__init__(chain, config)
-
-        # Получаем RPC URL и API key
-        if rpc_url is None:
-            settings = get_settings()
-            rpc_url = getattr(settings, "ton_rpc_url", None) or config.rpc_url
-            api_key = getattr(settings, "ton_api_key", None)
-
-        self.rpc_url = rpc_url.rstrip("/")
-        self.api_key = api_key
+        self.settings = get_settings()
+        self.rpc_url = (rpc_url or self.settings.ton_rpc_url or config.rpc_url).rstrip("/")
+        self.index_url = (index_url or self.settings.ton_index_url).rstrip("/")
+        self.api_key = api_key if api_key is not None else self.settings.ton_api_key
         self._client: httpx.AsyncClient | None = None
-
-        # Кэш для jetton master -> decimals
-        self._decimals_cache: dict[str, int] = {
-            token.contract_address: token.decimals
-            for token in config.tokens.values()
+        self._tokens = {
+            normalize_ton_address(t.contract_address): t for t in config.tokens.values()
         }
 
-        logger.info(f"Initialized TonAdapter (rpc={rpc_url})")
-
     @property
-    def chain_type(self) -> ChainType:
+    def chain_type(self):
         return ChainType.TON
 
     @property
-    def native_symbol(self) -> str:
+    def native_symbol(self):
         return "TON"
 
     @property
-    def address_length(self) -> int:
-        return 48  # User-friendly format
+    def address_length(self):
+        return 66
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        """Получить HTTP клиент."""
+    async def _request(self, method: str, path: str, params=None, *, index=False, body=None):
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=30.0)
-        return self._client
-
-    async def _api_call(
-        self,
-        method: str,
-        params: dict[str, Any] | None = None,
-    ) -> Any:
-        """
-        Выполнить API вызов к TON Center.
-
-        Args:
-            method: API метод
-            params: Параметры
-
-        Returns:
-            Результат вызова
-        """
-        client = await self._get_client()
-
-        url = f"{self.rpc_url}/{method}"
-        headers = {}
-
-        if self.api_key:
-            headers["X-API-Key"] = self.api_key
-
+            self._client = httpx.AsyncClient(timeout=30, follow_redirects=False)
+        url = self.index_url if index else self.rpc_url
+        headers = {"X-API-Key": self.api_key} if self.api_key else {}
         try:
-            response = await client.get(url, params=params, headers=headers)
+            response = await self._client.request(
+                method, f"{url}/{path}", params=params, json=body, headers=headers
+            )
             response.raise_for_status()
             data = response.json()
+        except (httpx.HTTPError, ValueError):
+            raise ChainRPCError(f"TON {path} response unavailable") from None
+        if not isinstance(data, dict):
+            raise ChainRPCError(f"TON {path} malformed response")
+        if index:
+            return data
+        if data.get("ok") is not True or "result" not in data:
+            raise ChainRPCError(f"TON {path} rejected or malformed")
+        return data["result"]
 
-            if not data.get("ok"):
-                error = data.get("error", "Unknown error")
-                logger.error(f"TON API error: {error}")
-                raise Exception(f"API error: {error}")
+    async def _api_call(self, method, params=None):
+        return await self._request("GET", method, params)
 
-            return data.get("result")
+    async def _run_get_method(self, address, method, stack):
+        result = await self._request(
+            "POST", "runGetMethod", body={"address": address, "method": method, "stack": stack}
+        )
+        if (
+            not isinstance(result, dict)
+            or result.get("exit_code") != 0
+            or not isinstance(result.get("stack"), list)
+        ):
+            raise ChainEvidenceError("TON get-method proof unavailable")
+        return result
 
-        except httpx.HTTPError as e:
-            logger.error(f"TON HTTP error: {e}")
-            raise
-
-    async def _jsonrpc_call(
-        self,
-        method: str,
-        params: dict[str, Any] | None = None,
-    ) -> Any:
-        """
-        Выполнить JSON-RPC вызов к TON Center.
-
-        Args:
-            method: RPC метод
-            params: Параметры
-
-        Returns:
-            Результат вызова
-        """
-        client = await self._get_client()
-
-        url = f"{self.rpc_url}/jsonRPC"
-        headers = {"Content-Type": "application/json"}
-
-        if self.api_key:
-            headers["X-API-Key"] = self.api_key
-
-        payload = {
-            "id": "1",
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params or {},
-        }
-
+    async def is_connected(self):
         try:
-            response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-
-            if "error" in data:
-                logger.error(f"TON RPC error: {data['error']}")
-                raise Exception(f"RPC error: {data['error']}")
-
-            return data.get("result")
-
-        except httpx.HTTPError as e:
-            logger.error(f"TON HTTP error: {e}")
-            raise
-
-    # === Connection ===
-
-    async def is_connected(self) -> bool:
-        """Проверить подключение к ноде."""
-        try:
-            result = await self._api_call("getMasterchainInfo")
-            return result is not None
-        except Exception:
+            return await self.get_latest_block() > 0
+        except ChainRPCError:
             return False
 
-    # === Block / Seqno ===
-
-    async def get_latest_block(self) -> int:
-        """Получить номер последнего блока (seqno masterchain)."""
+    async def get_latest_block(self):
         result = await self._api_call("getMasterchainInfo")
-        if result is None:
-            raise Exception("Failed to get masterchain info")
-        return result.get("last", {}).get("seqno", 0)
+        return uint(result["last"]["seqno"], "masterchain seqno")
 
-    async def get_block_timestamp(self, seqno: int) -> int | None:
-        """Получить timestamp блока."""
-        try:
-            result = await self._api_call(
-                "getBlockHeader",
-                {"workchain": -1, "shard": -9223372036854775808, "seqno": seqno},
-            )
-            if result:
-                return result.get("gen_utime")
-        except Exception:
-            pass
-        return None
+    async def get_block_timestamp(self, block):
+        result = await self._api_call(
+            "getBlockHeader", {"workchain": -1, "shard": "-9223372036854775808", "seqno": block}
+        )
+        return uint(result["gen_utime"], "timestamp")
 
-    # === Balance ===
+    async def get_native_balance(self, address):
+        return atomic_to_decimal(
+            uint(
+                await self._api_call(
+                    "getAddressBalance", {"address": self.normalize_address(address)}
+                ),
+                "balance",
+            ),
+            9,
+        )
 
-    async def get_native_balance(self, address: str) -> Decimal:
-        """Получить баланс TON."""
-        result = await self._api_call("getAddressBalance", {"address": address})
-        if result is None:
+    @staticmethod
+    def _stack_address(value):
+        if value[0] not in ("cell", "slice") or not isinstance(value[1], dict):
+            raise ChainEvidenceError("TON stack address missing")
+        parsed = Cell.one_from_boc(base64.b64decode(value[1]["bytes"], validate=True)).begin_parse()
+        address = parsed.read_msg_addr()
+        if address is None:
+            raise ChainEvidenceError("TON stack address is null")
+        return normalize_ton_address(address.to_string(False))
+
+    async def _get_jetton_wallet_address(self, jetton_master, owner):
+        master, owner = self.normalize_address(jetton_master), self.normalize_address(owner)
+        if master not in self._tokens:
+            raise ChainEvidenceError("Jetton master is not canonical")
+        cell = Cell()
+        cell.bits.write_address(Address(owner))
+        result = await self._run_get_method(
+            master,
+            "get_wallet_address",
+            [["tvm.Slice", base64.b64encode(cell.to_boc(False)).decode()]],
+        )
+        return self._stack_address(result["stack"][0])
+
+    async def get_token_balance(self, address, token_address):
+        master, owner = self.normalize_address(token_address), self.normalize_address(address)
+        wallet = await self._get_jetton_wallet_address(master, owner)
+        info = await self._api_call("getAddressInformation", {"address": wallet})
+        if info.get("state") in ("uninitialized", "uninit"):
             return Decimal(0)
+        result = await self._run_get_method(wallet, "get_wallet_data", [])
+        stack = result["stack"]
+        if (
+            len(stack) < 3
+            or stack[0][0] != "num"
+            or self._stack_address(stack[1]) != owner
+            or self._stack_address(stack[2]) != master
+        ):
+            raise ChainEvidenceError("Jetton wallet owner/master mismatch")
+        raw = int(stack[0][1], 16)
+        return atomic_to_decimal(uint(raw, "jetton balance"), self._tokens[master].decimals)
 
-        # Баланс в нанотонах
-        nanotons = int(result)
-        return Decimal(nanotons) / Decimal(10**9)
-
-    async def get_token_balance(
-        self,
-        address: str,
-        token_address: str,
-    ) -> Decimal:
-        """
-        Получить баланс Jetton токена.
-
-        Args:
-            address: Адрес владельца
-            token_address: Jetton Master Address
-        """
-        try:
-            # Получаем Jetton Wallet адрес для владельца
-            wallet_address = await self._get_jetton_wallet_address(
-                token_address, address
+    async def _pages(self, path, field, params):
+        rows, seen = [], set()
+        limit = self.config.scanner_page_limit
+        for page in range(self.config.scanner_max_pages_per_address):
+            result = await self._request(
+                "GET",
+                path,
+                {**params, "limit": limit, "offset": page * limit, "sort": "asc"},
+                index=True,
             )
+            items = result.get(field)
+            if not isinstance(items, list):
+                raise ChainEvidenceError("TON indexed page is unavailable")
+            for row in items:
+                identity = row.get("transaction_hash") or row.get("hash")
+                if not identity or identity in seen:
+                    raise ChainEvidenceError("TON pagination is inconsistent")
+                seen.add(identity)
+                rows.append(row)
+            if len(items) < limit:
+                return rows
+        raise ChainEvidenceError("TON page budget exhausted; checkpoint must not advance")
 
-            if wallet_address is None:
-                return Decimal(0)
+    async def _trace(self, *, tx_hash=None, msg_hash=None):
+        query = {"tx_hash": tx_hash} if tx_hash else {"msg_hash": msg_hash}
+        result = await self._request("GET", "traces", {**query, "limit": 2}, index=True)
+        rows = result.get("traces")
+        if not isinstance(rows, list) or len(rows) > 1:
+            raise ChainEvidenceError("TON trace identity is ambiguous")
+        return rows[0] if rows else None
 
-            # Запрашиваем get_wallet_data у jetton wallet
-            result = await self._run_get_method(
-                wallet_address, "get_wallet_data", []
-            )
-
-            if result is None or "stack" not in result:
-                return Decimal(0)
-
-            stack = result["stack"]
-            if not stack:
-                return Decimal(0)
-
-            # Первый элемент стека - баланс
-            balance_item = stack[0]
-            if balance_item[0] == "num":
-                raw_balance = int(balance_item[1], 16)
-            else:
-                raw_balance = int(balance_item[1])
-
-            decimals = self._decimals_cache.get(token_address, 6)
-            return Decimal(raw_balance) / Decimal(10**decimals)
-
-        except Exception as e:
-            logger.error(f"Failed to get jetton balance: {e}")
-            return Decimal(0)
-
-    async def _get_jetton_wallet_address(
-        self,
-        jetton_master: str,
-        owner: str,
-    ) -> str | None:
-        """
-        Получить адрес Jetton Wallet для владельца.
-
-        Вызывает get_wallet_address у Jetton Master контракта.
-        """
-        try:
-            # Конвертируем owner address в cell slice
-            result = await self._run_get_method(
-                jetton_master,
-                "get_wallet_address",
-                [["tvm.Slice", self._address_to_cell(owner)]],
-            )
-
-            if result is None or "stack" not in result:
-                return None
-
-            stack = result["stack"]
-            if not stack:
-                return None
-
-            # Результат - адрес
-            addr_item = stack[0]
-            if addr_item[0] == "cell":
-                # Парсим cell в адрес
-                return self._cell_to_address(addr_item[1])
-
+    async def _jetton_event(self, row, owner, master, head):
+        if (
+            row.get("transaction_aborted") is not False
+            or self.normalize_address(row["destination"]) != owner
+        ):
             return None
-
-        except Exception as e:
-            logger.debug(f"Failed to get jetton wallet address: {e}")
+        if (
+            self.normalize_address(row["jetton_master"]) != master
+            or self.normalize_address(row["source"]) == owner
+        ):
             return None
+        trace = await self._trace(tx_hash=row["transaction_hash"])
+        if trace is None or not complete_trace(trace, head, self.config.confirmations):
+            raise ChainEvidenceError("Jetton trace is not finalized and complete")
+        wallet = await self._get_jetton_wallet_address(master, owner)
+        source_wallet = self.normalize_address(row["source_wallet"])
+        source = self.normalize_address(row["source"])
+        # Verify both master-derived wallet identities. A fake notification cannot pass.
+        if source_wallet != await self._get_jetton_wallet_address(master, source):
+            raise ChainEvidenceError("Jetton source wallet is not master-derived")
+        matches = []
+        for tx in trace.get("transactions", {}).values():
+            msg = tx.get("in_msg") or {}
+            if self.normalize_address(tx["account"]) != wallet or not successful(
+                tx, head, self.config.confirmations
+            ):
+                continue
+            if not msg.get("source") or self.normalize_address(msg["source"]) != source_wallet:
+                continue
+            content = msg.get("message_content") or {}
+            if not content.get("body"):
+                raise ChainEvidenceError("Jetton receipt body is unavailable")
+            raw, sender, query, memo = internal_transfer(content["body"])
+            if (
+                raw == uint(row["amount"], "jetton amount")
+                and sender == source
+                and query == uint(row["query_id"], "query id")
+            ):
+                matches.append((tx, raw, memo))
+        if len(matches) != 1:
+            raise ChainEvidenceError("Completed destination jetton receipt is unavailable")
+        tx, raw, memo = matches[0]
+        token = self._tokens[master]
+        originating = [
+            item
+            for item in trace["transactions"].values()
+            if hash_id(item["hash"]) == hash_id(row["transaction_hash"])
+        ]
+        if len(originating) != 1 or not successful(originating[0], head, self.config.confirmations):
+            raise ChainEvidenceError("Jetton initiating transaction proof is unavailable")
+        return TransferEvent(
+            hash_id(tx["hash"]),
+            tx["mc_block_seqno"],
+            0,
+            source,
+            owner,
+            master,
+            token.symbol,
+            atomic_to_decimal(raw, token.decimals),
+            raw,
+            self.chain,
+            ChainType.TON,
+            uint(tx["now"], "timestamp"),
+            memo,
+            originating[0]["mc_block_seqno"],
+        )
 
-    async def _run_get_method(
-        self,
-        address: str,
-        method: str,
-        stack: list,
-    ) -> dict | None:
-        """Запустить GET метод смарт-контракта."""
-        try:
-            result = await self._api_call(
-                "runGetMethod",
-                {
-                    "address": address,
-                    "method": method,
-                    "stack": stack,
-                },
-            )
-            return result
-        except Exception:
-            return None
-
-    def _address_to_cell(self, address: str) -> str:
-        """Конвертировать адрес в cell формат для TVM."""
-        # Упрощённая реализация - нужна полная для production
-        return address
-
-    def _cell_to_address(self, cell: str) -> str:
-        """Конвертировать cell в адрес."""
-        # Упрощённая реализация - нужна полная для production
-        return cell
-
-    # === Transfer Events ===
-
-    async def get_transfer_events(
-        self,
-        from_block: int,
-        to_block: int,
-        to_addresses: list[str],
-        token_addresses: list[str] | None = None,
-    ) -> list[TransferEvent]:
-        """
-        Получить Transfer события за диапазон блоков.
-
-        Для TON получаем транзакции каждого адреса и парсим jetton transfers.
-        """
-        events: list[TransferEvent] = []
-
-        for address in to_addresses:
-            # Получаем транзакции адреса
-            transactions = await self._get_transactions(
-                address, limit=100, from_lt=None, to_lt=None
-            )
-
-            for tx in transactions:
-                # Фильтруем по времени/seqno
-                utime = tx.get("utime", 0)
-                # TODO: более точная фильтрация по блокам
-
-                # Проверяем входящие сообщения
-                in_msg = tx.get("in_msg", {})
-                if not in_msg:
-                    continue
-
-                # Нативный TON transfer
-                if in_msg.get("value"):
-                    value = int(in_msg.get("value", 0))
-                    source = in_msg.get("source", "")
-
-                    # Фильтруем исходящие транзакции
-                    if not source:
-                        continue
-
-                    events.append(TransferEvent(
-                        tx_hash=tx.get("hash", ""),
-                        block_number=tx.get("mc_block_seqno", 0),
-                        log_index=0,
-                        from_address=source,
-                        to_address=address,
-                        token_address="",  # Нативный TON
-                        token_symbol="TON",
-                        amount=Decimal(value) / Decimal(10**9),
-                        raw_amount=value,
-                        chain=self.chain,
-                        chain_type=ChainType.TON,
-                        timestamp=utime,
-                    ))
-
-                # Jetton transfers (в out_msgs или parsed body)
-                jetton_transfers = self._parse_jetton_transfers(
-                    tx, address, token_addresses
+    async def get_transfer_events(self, from_block, to_block, to_addresses, token_addresses=None):
+        head = await self.get_latest_block()
+        if (
+            from_block < 0
+            or to_block < from_block
+            or to_block > head - self.config.confirmations + 1
+        ):
+            raise ChainEvidenceError("TON block range is not finalized")
+        lower = await self.get_block_timestamp(from_block)
+        upper = await self.get_block_timestamp(to_block)
+        events = {}
+        masters = [self.normalize_address(m) for m in (token_addresses or self._tokens)]
+        for address in dict.fromkeys(to_addresses):
+            owner = self.normalize_address(address)
+            for master in masters:
+                if master not in self._tokens:
+                    raise ChainEvidenceError("Jetton master is not configured")
+                rows = await self._pages(
+                    "jetton/transfers",
+                    "jetton_transfers",
+                    {
+                        "owner_address": owner,
+                        "jetton_master": master,
+                        "direction": "in",
+                        "start_utime": lower,
+                        "end_utime": upper,
+                    },
                 )
-                events.extend(jetton_transfers)
-
-        return events
-
-    async def _get_transactions(
-        self,
-        address: str,
-        limit: int = 100,
-        from_lt: int | None = None,
-        to_lt: int | None = None,
-    ) -> list[dict]:
-        """Получить транзакции адреса."""
-        params: dict[str, Any] = {
-            "address": address,
-            "limit": limit,
-        }
-
-        if from_lt:
-            params["lt"] = from_lt
-        if to_lt:
-            params["to_lt"] = to_lt
-
-        result = await self._api_call("getTransactions", params)
-        return result or []
-
-    def _parse_jetton_transfers(
-        self,
-        tx: dict,
-        target_address: str,
-        token_filter: list[str] | None,
-    ) -> list[TransferEvent]:
-        """
-        Парсить Jetton transfers из транзакции.
-
-        Jetton transfers используют internal_transfer opcode.
-        """
-        events: list[TransferEvent] = []
-
-        # Анализируем out_msgs для jetton transfer notification
-        out_msgs = tx.get("out_msgs", [])
-
-        for msg in out_msgs:
-            # Jetton transfer notification имеет специфический формат body
-            body = msg.get("message", "")
-            destination = msg.get("destination", "")
-
-            if not body:
-                continue
-
-            # Пробуем декодировать body как jetton notification
-            # opcode: 0x7362d09c (transfer_notification)
-            try:
-                decoded = self._decode_jetton_notification(body)
-                if decoded is None:
+                for row in rows:
+                    event = await self._jetton_event(row, owner, master, head)
+                    if event and from_block <= event.scan_block_number <= to_block:
+                        events[(event.tx_hash, event.log_index, owner)] = event
+            rows = await self._pages(
+                "transactions",
+                "transactions",
+                {"account": owner, "start_utime": lower, "end_utime": upper},
+            )
+            for tx in rows:
+                msg = tx.get("in_msg") or {}
+                if not msg.get("source") or not successful(tx, head, self.config.confirmations):
                     continue
-
-                jetton_master = decoded.get("jetton_master", "")
-                amount = decoded.get("amount", 0)
-                sender = decoded.get("sender", "")
-
-                # Фильтруем по токенам
-                if token_filter and jetton_master not in token_filter:
+                if (
+                    not msg.get("destination")
+                    or self.normalize_address(msg["destination"]) != owner
+                    or not from_block <= tx["mc_block_seqno"] <= to_block
+                ):
                     continue
+                raw = uint(
+                    (tx.get("description", {}).get("credit_ph") or {}).get("credit"),
+                    "native credit",
+                )
+                if raw > 0:
+                    event = TransferEvent(
+                        hash_id(tx["hash"]),
+                        tx["mc_block_seqno"],
+                        1,
+                        self.normalize_address(msg["source"]),
+                        owner,
+                        "",
+                        "TON",
+                        atomic_to_decimal(raw, 9),
+                        raw,
+                        self.chain,
+                        ChainType.TON,
+                        uint(tx["now"], "timestamp"),
+                    )
+                    events[(event.tx_hash, event.log_index, owner)] = event
+        return sorted(events.values(), key=lambda e: (e.block_number, e.tx_hash, e.log_index))
 
-                decimals = self._decimals_cache.get(jetton_master, 6)
-                token_symbol = self._get_token_symbol(jetton_master)
-
-                events.append(TransferEvent(
-                    tx_hash=tx.get("hash", ""),
-                    block_number=tx.get("mc_block_seqno", 0),
-                    log_index=len(events),
-                    from_address=sender,
-                    to_address=target_address,
-                    token_address=jetton_master,
-                    token_symbol=token_symbol,
-                    amount=Decimal(amount) / Decimal(10**decimals),
-                    raw_amount=amount,
-                    chain=self.chain,
-                    chain_type=ChainType.TON,
-                    timestamp=tx.get("utime"),
-                ))
-
-            except Exception:
-                continue
-
-        return events
-
-    def _decode_jetton_notification(self, body: str) -> dict | None:
-        """
-        Декодировать jetton transfer notification body.
-
-        Формат: opcode(32) + query_id(64) + amount(coins) + sender(address)
-        """
-        # TODO: Полная реализация декодирования TL-B
-        # Для MVP возвращаем None
-        return None
-
-    def _get_token_symbol(self, jetton_master: str) -> str:
-        """Получить символ токена по jetton master address."""
-        for token in self.config.tokens.values():
-            if token.contract_address == jetton_master:
-                return token.symbol
-        return "UNKNOWN"
-
-    # === Transaction Status ===
-
-    async def get_confirmations(self, tx_hash: str) -> int | None:
-        """
-        Получить количество подтверждений транзакции.
-
-        TON использует finality на основе masterchain seqno.
-        """
-        try:
-            # Получаем текущий seqno
-            current_seqno = await self.get_latest_block()
-
-            # Получаем транзакцию
-            # В TON нужен lt + hash для поиска транзакции
-            # Упрощённо считаем что если транзакция найдена - она подтверждена
-
-            return current_seqno  # Упрощённо
-
-        except Exception:
+    async def get_confirmations(self, tx_hash):
+        result = await self._request(
+            "GET", "transactions", {"hash": tx_hash, "limit": 2}, index=True
+        )
+        rows = result.get("transactions", [])
+        if len(rows) != 1 or hash_id(rows[0]["hash"]) != hash_id(tx_hash):
             return None
+        head = await self.get_latest_block()
+        return head - rows[0]["mc_block_seqno"] + 1 if successful(rows[0], head, 1) else None
 
-    async def is_tx_confirmed(
-        self,
-        tx_hash: str,
-        required_confirmations: int | None = None,
-    ) -> bool:
-        """
-        Проверить, подтверждена ли транзакция.
+    async def is_tx_confirmed(self, tx_hash, required_confirmations=None):
+        count = await self.get_confirmations(tx_hash)
+        return count is not None and count >= (required_confirmations or self.config.confirmations)
 
-        TON имеет быструю финальность (~5 сек).
-        """
-        confirmations = await self.get_confirmations(tx_hash)
-        if confirmations is None:
-            return False
+    async def prepare_transfer(self, private_key, destination, amount, token=None, *, reference=""):
+        wallet = wallet_from_seed(
+            private_key, self.settings.ton_wallet_version, self.settings.ton_workchain
+        )
+        sender = self.normalize_address(wallet.address.to_string(False))
+        destination = self.normalize_address(destination)
+        if sender == destination or len(reference.encode()) > 120:
+            raise ChainEvidenceError("TON transfer destination or reference is invalid")
+        master = self.normalize_address(token) if token else ""
+        if master and master not in self._tokens:
+            raise ChainEvidenceError("Jetton master is not configured")
+        decimals = self._tokens[master].decimals if master else 9
+        raw = decimal_to_atomic(amount, decimals)
+        info = await self._api_call("getWalletInformation", {"address": sender})
+        if info.get("account_state") in ("uninitialized", "uninit"):
+            seqno = 0
+        else:
+            seqno = uint(info.get("seqno"), "wallet seqno")
+        payload, target, attached = reference or None, destination, raw
+        if master:
+            if decimal_to_atomic(await self.get_token_balance(sender, master), decimals) < raw:
+                raise ChainEvidenceError("Insufficient canonical jetton balance")
+            target = await self._get_jetton_wallet_address(master, sender)
+            forward = decimal_to_atomic(Decimal(self.settings.ton_forward_amount), 9)
+            attached = decimal_to_atomic(Decimal(self.settings.ton_jetton_attach_amount), 9)
+            if forward <= 0 or attached <= forward:
+                raise ChainEvidenceError("TON jetton attached/forward amount configuration invalid")
+            payload = JettonWallet().create_transfer_body(
+                Address(destination),
+                raw,
+                forward,
+                b"\x00\x00\x00\x00" + reference.encode(),
+                Address(sender),
+            )
+        message = wallet.create_transfer_message(
+            target, attached, seqno, payload=payload, send_mode=1
+        )
+        signed = message["signing_message"].begin_parse()
+        signed.read_uint(32)
+        valid_until = signed.read_uint(32)
 
-        if required_confirmations is None:
-            required_confirmations = self.config.confirmations
+        def b64(cell):
+            return base64.b64encode(cell.to_boc(False)).decode() if cell else ""
 
-        return confirmations >= required_confirmations
-
-    # === Send Transaction ===
+        estimate = await self._request(
+            "POST",
+            "estimateFee",
+            body={
+                "address": sender,
+                "body": b64(message["body"]),
+                "init_code": b64(message.get("code")),
+                "init_data": b64(message.get("data")),
+                "ignore_chksig": False,
+            },
+        )
+        fees = estimate.get("source_fees") if isinstance(estimate, dict) else None
+        if not isinstance(fees, dict):
+            raise ChainEvidenceError("TON fee estimate is unavailable")
+        fee = sum(uint(fees[k], k) for k in ("in_fwd_fee", "storage_fee", "gas_fee", "fwd_fee"))
+        # Attached TON pays jetton forwarding/rent; keep it separate from jetton entitlement.
+        budget = fee + (attached if master else 0)
+        if decimal_to_atomic(await self.get_native_balance(sender), 9) < fee + attached:
+            raise ChainEvidenceError("Insufficient TON for amount, fees and forwarding")
+        return PreparedTransfer(
+            self.chain,
+            message["message"].bytes_hash().hex(),
+            b64(message["message"]),
+            sender,
+            destination,
+            master,
+            raw,
+            budget,
+            {
+                "seqno": seqno,
+                "valid_until": valid_until,
+                "body_hash": message["body"].bytes_hash().hex(),
+                "reference": reference,
+            },
+        )
 
     async def estimate_transfer_fee(
-        self,
-        from_address: str,
-        to_address: str,
-        token_address: str | None = None,
-        amount: Decimal | None = None,
-    ) -> FeeEstimate:
-        """Оценить комиссию за транзакцию."""
-        # Базовая комиссия TON ~0.01-0.05 TON
-        base_fee = 50_000_000  # 0.05 TON в нанотонах
-
-        if token_address:
-            # Jetton transfer стоит дороже
-            base_fee = 100_000_000  # 0.1 TON
-
-        return FeeEstimate(
-            estimated_fee=Decimal(base_fee) / Decimal(10**9),
-            estimated_fee_raw=base_fee,
+        self, from_address, to_address, token_address=None, amount=None
+    ):
+        raise ChainEvidenceError(
+            "TON fee estimation requires the exact signed body; use prepare_transfer"
         )
 
-    async def send_native_token(
-        self,
-        from_private_key: str,
-        to_address: str,
-        amount: Decimal,
-    ) -> TransactionResult:
-        """
-        Отправить TON.
-
-        Note: Требует tonsdk или tonpy для подписи.
-        """
-        # TODO: Реализовать с tonsdk
-        logger.warning("TON native transfer not implemented yet")
-        return TransactionResult(
-            tx_hash="",
-            success=False,
-            error="Not implemented",
-        )
-
-    async def send_token(
-        self,
-        from_private_key: str,
-        to_address: str,
-        token_address: str,
-        amount: Decimal,
-    ) -> TransactionResult:
-        """
-        Отправить Jetton токен.
-
-        Note: Требует tonsdk или tonpy для подписи.
-        """
-        # TODO: Реализовать с tonsdk
-        logger.warning("TON jetton transfer not implemented yet")
-        return TransactionResult(
-            tx_hash="",
-            success=False,
-            error="Not implemented",
-        )
-
-    # === Address Validation ===
-
-    def is_valid_address(self, address: str) -> bool:
-        """
-        Проверить валидность TON адреса.
-
-        Поддерживает:
-        - Raw формат: workchain:hex_hash
-        - User-friendly: base64url encoded
-        """
+    async def broadcast_prepared(self, prepared):
         try:
-            # User-friendly формат
-            if len(address) == 48 and not ":" in address:
-                # Base64 encoded
+            await self._request("POST", "sendBoc", body={"boc": prepared.payload})
+        except ChainRPCError:
+            return TransferReceipt("unknown", prepared.tx_id, reason="broadcast_outcome_unknown")
+        return TransferReceipt("pending", prepared.tx_id)
+
+    async def transfer_receipt(self, prepared):
+        # BOC hash/body hash are looked up, never seqno advancement alone.
+        result = await self._request(
+            "GET",
+            "transactionsByMessage",
+            {"body_hash": prepared.context["body_hash"], "direction": "in", "limit": 2},
+            index=True,
+        )
+        rows = result.get("transactions")
+        if not isinstance(rows, list) or len(rows) > 1:
+            return TransferReceipt("unknown", prepared.tx_id, reason="wallet_receipt_ambiguous")
+        if not rows:
+            info = await self._api_call("getWalletInformation", {"address": prepared.sender})
+            head = await self.get_latest_block()
+            stable_time = await self.get_block_timestamp(head - self.config.confirmations + 1)
+            synced = info.get("sync_utime")
+            if (
+                isinstance(synced, int)
+                and synced >= stable_time
+                and stable_time > prepared.context.get("valid_until", 2**32)
+            ):
+                seqno = (
+                    info.get("seqno", 0)
+                    if info.get("account_state") in ("uninit", "uninitialized")
+                    else info.get("seqno")
+                )
+                if seqno == prepared.context["seqno"]:
+                    return TransferReceipt(
+                        "failed", prepared.tx_id, reason="wallet_message_expired_unexecuted"
+                    )
+            return TransferReceipt("unknown", prepared.tx_id, reason="wallet_receipt_not_observed")
+        root = rows[0]
+        content = (root.get("in_msg") or {}).get("message_content") or {}
+        if (
+            self.normalize_address(root["account"]) != prepared.sender
+            or hash_id(content["hash"]) != prepared.context["body_hash"]
+        ):
+            raise ChainEvidenceError("TON signed body binding differs")
+        head = await self.get_latest_block()
+        trace = await self._trace(tx_hash=root["hash"])
+        if not trace or not complete_trace(trace, head, self.config.confirmations):
+            return TransferReceipt("pending", prepared.tx_id)
+        if not successful(root, head, self.config.confirmations):
+            fee = self._native_cost(trace, prepared.sender, 0)
+            return TransferReceipt(
+                "failed", prepared.tx_id, fee, reason="wallet_execution_failed", native_cost_raw=fee
+            )
+        if prepared.token:
+            rows = await self._pages(
+                "jetton/transfers",
+                "jetton_transfers",
+                {
+                    "owner_address": prepared.sender,
+                    "jetton_master": prepared.token,
+                    "direction": "out",
+                    "start_lt": uint(root["lt"], "logical time"),
+                    "end_lt": uint(trace["end_lt"], "logical time"),
+                },
+            )
+            matches = []
+            for row in rows:
+                if row.get("trace_id") != root.get("trace_id"):
+                    continue
+                if (
+                    self.normalize_address(row["destination"]) != prepared.destination
+                    or uint(row["amount"], "amount") != prepared.amount_raw
+                ):
+                    continue
                 try:
-                    decoded = base64.urlsafe_b64decode(address + "==")
-                    return len(decoded) == 36  # 1+1+32+2 bytes
-                except Exception:
-                    return False
+                    event = await self._jetton_event(
+                        row, prepared.destination, prepared.token, head
+                    )
+                except ChainEvidenceError:
+                    return TransferReceipt(
+                        "reconciliation_required",
+                        prepared.tx_id,
+                        reason="jetton_destination_needs_reconciliation",
+                        wallet_released=True,
+                    )
+                if event:
+                    matches.append(event)
+            if len(matches) != 1:
+                return TransferReceipt(
+                    "reconciliation_required",
+                    prepared.tx_id,
+                    reason="jetton_destination_receipt_unavailable",
+                    wallet_released=True,
+                )
+        else:
+            messages = [
+                m
+                for m in root.get("out_msgs", [])
+                if m.get("destination")
+                and self.normalize_address(m["destination"]) == prepared.destination
+                and uint(m["value"], "native amount") == prepared.amount_raw
+            ]
+            if len(messages) != 1:
+                return TransferReceipt(
+                    "unknown", prepared.tx_id, reason="native_output_unavailable"
+                )
+            matching = [
+                tx
+                for tx in trace.get("transactions", {}).values()
+                if (tx.get("in_msg") or {}).get("hash") == messages[0]["hash"]
+                and successful(tx, head, self.config.confirmations)
+            ]
+            if len(matching) != 1:
+                return TransferReceipt(
+                    "unknown", prepared.tx_id, reason="native_destination_receipt_unavailable"
+                )
+        return TransferReceipt(
+            "completed",
+            prepared.tx_id,
+            sum(uint(tx["total_fees"], "fee") for tx in trace["transactions"].values()),
+            native_cost_raw=self._native_cost(
+                trace, prepared.sender, 0 if prepared.token else prepared.amount_raw
+            ),
+        )
 
-            # Raw формат
-            if ":" in address:
-                parts = address.split(":")
-                if len(parts) != 2:
-                    return False
-                workchain = int(parts[0])
-                hex_hash = parts[1]
-                return len(hex_hash) == 64 and workchain in (-1, 0)
+    def _native_cost(self, trace, sender, principal):
+        spent = 0
+        for tx in trace["transactions"].values():
+            if self.normalize_address(tx["account"]) != sender:
+                continue
+            spent += uint(tx["total_fees"], "source fee")
+            spent += sum(
+                uint(msg.get("value", 0), "outgoing value") for msg in tx.get("out_msgs", [])
+            )
+            spent -= uint(
+                (tx.get("description", {}).get("credit_ph") or {}).get("credit", 0),
+                "incoming credit",
+            )
+        if spent < principal:
+            raise ChainEvidenceError("TON source native cost differs")
+        return spent - principal
 
+    async def send_native_token(self, from_private_key, to_address, amount):
+        prepared = await self.prepare_transfer(from_private_key, to_address, amount)
+        result = await self.broadcast_prepared(prepared)
+        return TransactionResult(result.tx_id, result.status == "pending", result.reason)
+
+    async def send_token(self, from_private_key, to_address, token_address, amount):
+        prepared = await self.prepare_transfer(from_private_key, to_address, amount, token_address)
+        result = await self.broadcast_prepared(prepared)
+        return TransactionResult(result.tx_id, result.status == "pending", result.reason)
+
+    def normalize_address(self, address):
+        return normalize_ton_address(address)
+
+    def is_valid_address(self, address):
+        try:
+            self.normalize_address(address)
+            return True
+        except ChainEvidenceError:
             return False
 
-        except Exception:
-            return False
-
-    def normalize_address(self, address: str) -> str:
-        """
-        Нормализовать TON адрес к user-friendly формату.
-
-        Flags: bounceable=True, testnet=False
-        """
-        if not self.is_valid_address(address):
-            raise ValueError(f"Invalid TON address: {address}")
-
-        # Если уже user-friendly - возвращаем как есть
-        if len(address) == 48 and ":" not in address:
-            return address
-
-        # Конвертируем raw в user-friendly
-        # TODO: Полная реализация
-        return address
-
-    async def close(self) -> None:
-        """Закрыть HTTP клиент."""
+    async def close(self):
         if self._client and not self._client.is_closed:
             await self._client.aclose()
 
 
-# Singleton адаптер
-_ton_adapter: TonAdapter | None = None
-
-
-def get_ton_adapter() -> TonAdapter:
-    """Получить singleton TON адаптер."""
-    global _ton_adapter
-    if _ton_adapter is None:
-        _ton_adapter = TonAdapter()
-    return _ton_adapter
+def get_ton_adapter():
+    return TonAdapter()

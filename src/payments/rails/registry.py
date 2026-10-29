@@ -8,13 +8,19 @@ from src.core.config import get_settings
 from src.crypto.encryption import decrypt_secret, encrypt_secret
 from src.payments.rails.base import Rail, RailType
 from src.payments.rails.cryptobot import CryptobotRail
+from src.payments.rails.walletpay import WalletPayRail
+from src.payments.rails.xrocket import XRocketRail
 
 _RAIL_CLASSES: dict[RailType, type[Rail]] = {
     RailType.CRYPTOBOT: CryptobotRail,
+    RailType.XROCKET: XRocketRail,
+    RailType.TGWALLET: WalletPayRail,
 }
 
 _CREDENTIAL_KEYS: dict[RailType, frozenset[str]] = {
     RailType.CRYPTOBOT: frozenset({"token"}),
+    RailType.XROCKET: frozenset({"token"}),
+    RailType.TGWALLET: frozenset({"token"}),
 }
 
 
@@ -45,6 +51,8 @@ def build_rail(
         raise ValueError(f"unsupported or unregistered rail type: {rail_type}") from exc
 
     credentials: dict = {}
+    if not encrypted_credentials and rail_type_enum in _CREDENTIAL_KEYS:
+        raise ValueError("provider credentials require a non-empty token")
     if encrypted_credentials:
         decrypted = decrypt_secret(
             bytes.fromhex(encrypted_credentials), _encryption_key()
@@ -59,7 +67,7 @@ def build_rail(
                 f"credentials contain forbidden keys: {', '.join(sorted(unknown_keys))}"
             )
         if "token" not in decoded or not isinstance(decoded["token"], str) or not decoded["token"]:
-            raise ValueError("cryptobot credentials require a non-empty token")
+            raise ValueError("provider credentials require a non-empty token")
         credentials = decoded
     if network is None:
         return rail_class(**credentials) if credentials else rail_class()

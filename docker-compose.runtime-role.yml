@@ -32,3 +32,7 @@ services:
     <<: *runtime-env
   worker-expirer:
     <<: *runtime-env
+  worker-providers:
+    <<: *runtime-env
+  worker-onchain:
+    <<: *runtime-env

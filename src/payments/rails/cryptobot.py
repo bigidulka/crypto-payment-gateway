@@ -12,6 +12,7 @@ CryptoBot-рельс: приём через createInvoice, статусы чер
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -19,10 +20,13 @@ import aiohttp
 
 from src.payments.rails.base import (
     Rail,
+    RailBalance,
+    RailCapabilities,
     RailError,
     RailInvoice,
     RailInvoiceRequest,
     RailInvoiceStatus,
+    RailPayment,
     RailPayout,
     RailPayoutRequest,
     RailType,
@@ -84,6 +88,51 @@ def _telegram_user_id(destination: str) -> int:
 class CryptobotRail(Rail):
     rail_type = RailType.CRYPTOBOT
 
+    @property
+    def capabilities(self) -> RailCapabilities:
+        return RailCapabilities(payout_mode="check", balances=True)
+
+    async def account_identity(self) -> str:
+        from src.payments.rails.http import identifier
+        data = await self._api("GET", "getMe")
+        if not isinstance(data, dict):
+            raise RailError("cryptobot", "malformed account identity")
+        return identifier(data.get("app_id"), "cryptobot", "application id")
+
+    async def get_balances(self) -> tuple[RailBalance, ...]:
+        from src.payments.rails.http import amount
+        data = await self._api("GET", "getBalance")
+        if not isinstance(data, list):
+            raise RailError("cryptobot", "malformed balance response")
+        seen: set[str] = set()
+        result: list[RailBalance] = []
+        for row in data:
+            if not isinstance(row, dict) or not isinstance(row.get("currency_code"), str) or row["currency_code"] in seen:
+                raise RailError("cryptobot", "duplicate or malformed balance row")
+            asset = row["currency_code"]
+            seen.add(asset)
+            result.append(RailBalance(asset, amount(row.get("available"), "cryptobot", positive=False),
+                                      amount(row.get("onhold"), "cryptobot", positive=False)))
+        return tuple(result)
+
+    async def verify_payment(self, provider_invoice_id: str) -> RailPayment | None:
+        invoice = await self.get_invoice(provider_invoice_id)
+        if invoice.status != RailInvoiceStatus.PAID:
+            return None
+        from src.payments.rails.http import amount
+        settled = None
+        if "fee_amount" in invoice.raw:
+            if invoice.raw.get("fee_asset") != invoice.asset:
+                raise RailError("cryptobot", "settlement fee asset mismatch")
+            fee = amount(invoice.raw["fee_amount"], "cryptobot", positive=False)
+            if fee >= invoice.amount:
+                raise RailError("cryptobot", "invalid settlement fee")
+            from src.payments.rails.http import money_sum
+            settled = money_sum("cryptobot", invoice.amount, fee.copy_negate())
+        return RailPayment(provider_invoice_id, invoice.amount, invoice.asset,
+                           paid_at=str(invoice.raw.get("paid_at") or ""), raw=invoice.raw,
+                           settled_amount=settled)
+
     def __init__(
         self,
         token: str,
@@ -124,11 +173,12 @@ class CryptobotRail(Rail):
                 headers=headers,
                 json=payload if method == "POST" else None,
                 params=payload if method == "GET" else None,
+                allow_redirects=False,
             ) as response:
                 status = response.status
                 retry_after_seconds = _parse_retry_after(response.headers.get("Retry-After"))
                 try:
-                    body = await response.json(content_type=None)
+                    body = await response.json(content_type=None, loads=lambda value: json.loads(value, parse_float=Decimal))
                 except (aiohttp.ClientError, ValueError) as exc:
                     raise RailError(
                         "cryptobot",
@@ -141,7 +191,7 @@ class CryptobotRail(Rail):
             raise
         except aiohttp.ClientError as exc:
             raise RailError(
-                "cryptobot", f"network error: {exc}", outcome_unknown=mutation
+                "cryptobot", "provider transport failure", outcome_unknown=mutation
             ) from exc
         except TimeoutError as exc:
             raise RailError(
@@ -269,12 +319,24 @@ class CryptobotRail(Rail):
                 permanent=True,
                 outcome_unknown=True,
             )
+        try:
+            from src.payments.rails.http import payment_url
+            check_url = payment_url(check_url, "cryptobot")
+            actual_amount = _positive_finite_amount(result.get("amount"), "check amount")
+            if result.get("asset") != requested_asset or actual_amount != requested_amount:
+                raise RailError("cryptobot", "check amount or asset mismatch")
+        except RailError as exc:
+            raise RailError("cryptobot", "created check requires reconciliation", outcome_unknown=True) from exc
         return RailPayout(
             success=True,
             provider_payout_id=provider_payout_id,
             check_url=check_url,
             message="Check created",
             raw=result,
+            amount=actual_amount,
+            asset=requested_asset,
+            destination=str(recipient_id),
+            destination_type="telegram_user_id",
         )
 
     async def close(self) -> None:
@@ -301,10 +363,11 @@ class CryptobotRail(Rail):
                 f"unknown provider invoice status: {raw_status}",
                 permanent=True,
             ) from exc
+        from src.payments.rails.http import payment_url
         return RailInvoice(
             provider_invoice_id=provider_invoice_id,
             status=status,
-            pay_url=str(data.get("bot_invoice_url", "")),
+            pay_url=payment_url(data.get("bot_invoice_url"), "cryptobot"),
             asset=asset,
             amount=amount,
             raw=data,

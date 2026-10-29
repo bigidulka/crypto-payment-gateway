@@ -149,6 +149,11 @@ async def test_session(monkeypatch) -> AsyncGenerator[AsyncSession, None]:
                 pytest.fail(
                     f"TEST_DATABASE_URL is missing migrated tables: {sorted(missing_tables)}"
                 )
+            # The ledger migrations install statement triggers that refuse TRUNCATE
+            # from any client. Replication role suspends trigger firing for this
+            # one guarded reset of a disposable database; every regular client
+            # still hits the guards.
+            await connection.execute(text("SET LOCAL session_replication_role = replica"))
             quoted_tables = ", ".join(f'"{table_name}"' for table_name in _RESET_TABLES)
             await connection.execute(
                 text(f"TRUNCATE TABLE {quoted_tables} RESTART IDENTITY CASCADE")

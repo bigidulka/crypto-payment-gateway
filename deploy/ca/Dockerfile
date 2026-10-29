@@ -16,6 +16,10 @@ RUN python -m pip install --no-cache-dir --no-index --no-deps /wheels/* && rm -r
     && mkdir -p /data && chown app:app /data
 COPY --chown=app:app src /app/src
 COPY --chown=app:app config/chains.toml /app/config/chains.toml
+COPY --chown=app:app config/providers.toml /app/config/providers.toml
+# Migrations run only as an external owner-role one-off from this same image.
+COPY --chown=app:app alembic.ini /app/alembic.ini
+COPY --chown=app:app alembic /app/alembic
 COPY --chown=app:app requirements.txt /app/requirements.txt
 COPY --chown=app:app docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh

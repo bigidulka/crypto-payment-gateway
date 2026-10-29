@@ -6,7 +6,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -15,6 +15,17 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from src.core.config import get_settings
+
+
+async def has_onchain_scan_schema(session: AsyncSession) -> bool:
+    """Durable enrolment survives feature rollback; old schemas need no new-table query."""
+    if session.bind.dialect.name != "postgresql":
+        return await session.run_sync(
+            lambda sync: inspect(sync.connection()).has_table("onchain_scan_cursors")
+        )
+    return bool(
+        await session.scalar(text("SELECT to_regclass('public.onchain_scan_cursors') IS NOT NULL"))
+    )
 
 
 @lru_cache
@@ -46,6 +57,20 @@ def get_engine() -> AsyncEngine:
 
 
 _RUNTIME_PROTECTED_TABLES = (
+    "onchain_scan_cursors",
+    "onchain_receipts",
+    "onchain_operations",
+    "gateway_rail_connections",
+    "gateway_liquidity_recognitions",
+    "gateway_invoice_options",
+    "gateway_operations",
+    "gateway_payout_receipts",
+    "provider_settlements",
+    "provider_payment_mappings",
+    "provider_payment_observations",
+    "provider_verification_decisions",
+    "provider_payment_receipts",
+    "provider_payment_recipient_intents",
     "address_lease_events",
     "api_keys",
     "chain_checkpoints",
@@ -111,6 +136,29 @@ async def require_runtime_database_ready() -> None:
     await verify_limited_runtime_database_role()
     async with get_engine().connect() as connection:
         await connection.execute(text("SELECT 1"))
+        if get_settings().onchain_gateway_enabled:
+            await connection.execute(
+                text("SELECT encrypted_payload FROM onchain_operations LIMIT 0")
+            )
+            await connection.execute(text("SELECT session_id FROM onchain_scan_cursors LIMIT 0"))
+        if get_settings().ledger_rail_orchestration_enabled:
+            # Readiness must prove that the enabled financial path has its
+            # migrations and runtime grants; never run DDL from the app.
+            await connection.execute(text("SELECT 1 FROM gateway_payout_receipts LIMIT 0"))
+            await connection.execute(
+                text("SELECT destination_type FROM gateway_operations LIMIT 0")
+            )
+            count = await connection.scalar(
+                text("""SELECT count(*) FROM pg_trigger t
+JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+WHERE n.nspname='public' AND c.relname IN ('provider_settlements','provider_payment_receipts')
+  AND t.tgname='gateway_receipt_serialization' AND NOT t.tgisinternal
+  AND t.tgenabled='O'""")
+            )
+            if count != 2:
+                raise RuntimeError(
+                    "provider settlement and receipt serialization migration is required"
+                )
 
 
 @lru_cache

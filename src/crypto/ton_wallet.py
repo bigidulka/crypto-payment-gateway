@@ -144,37 +144,10 @@ class TonHDWallet:
         return key
 
     def _compute_wallet_address(self, public_key: bytes) -> Tuple[str, str]:
-        """
-        Вычислить адрес TON wallet из public key.
-
-        Returns:
-            Tuple[raw_address, user_friendly_address]
-        """
-        # Для v3r2 wallet адрес = hash(code + data)
-        # data = subwallet_id(32bit) + public_key(256bit)
-        # Упрощённая реализация (для полной нужна TVM Cell сериализация)
-
-        subwallet_id = 698983191  # Default subwallet ID
-
-        # Создаём data cell (упрощённо)
-        data = (
-            subwallet_id.to_bytes(4, "big") +
-            b"\x00" * 4 +  # seqno = 0
-            public_key
-        )
-
-        # Hash
-        state_hash = hashlib.sha256(V3R2_CODE_HASH + data).digest()
-
-        # Raw address
-        raw_address = f"{self.workchain}:{state_hash.hex()}"
-
-        # User-friendly address (bounceable, mainnet)
-        user_friendly = self._to_user_friendly(
-            self.workchain, state_hash, bounceable=True, testnet=False
-        )
-
-        return raw_address, user_friendly
+        from src.blockchain.ton_keys import wallet_contract
+        contract = wallet_contract(public_key, None, self.wallet_version, self.workchain)
+        return (contract.address.to_string(False),
+                contract.address.to_string(True, True, False))
 
     def _to_user_friendly(
         self,

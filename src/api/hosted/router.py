@@ -3,9 +3,12 @@ Hosted Payment Pages Router.
 Публичные эндпоинты для плательщиков.
 """
 
+import json
 from datetime import datetime, timezone
+from html import escape
 
 from fastapi import APIRouter, HTTPException, Request, status
+from fastapi.responses import HTMLResponse
 
 from src.api.deps import SessionDep
 from src.api.hosted.schemas import (
@@ -17,10 +20,21 @@ from src.api.hosted.schemas import (
 from src.blockchain.chains import get_chain_config
 from src.core.exceptions import InvoiceExpiredError, InvoiceNotFoundError, PaymentError
 from src.db.models import InvoiceStatus
+from src.payments.checkout import checkout_uri
+from src.payments.policy import invoice_checkout_chains
 from src.services.invoice_service import InvoiceService
 from src.services.payment_service import PaymentService
 
 router = APIRouter(prefix="/pay", tags=["Hosted Payment"])
+
+
+@router.get("/{public_id}", response_class=HTMLResponse, include_in_schema=False)
+async def payment_page(public_id: str, session: SessionDep):
+    try:
+        invoice = await InvoiceService(session).get_invoice_by_public_id(public_id)
+    except InvoiceNotFoundError:
+        raise HTTPException(status_code=404, detail="Invoice not found") from None
+    return HTMLResponse(_render_payment_page(invoice, _is_expired(invoice.expires_at)))
 
 
 def _is_expired(expires_at: datetime) -> bool:
@@ -83,7 +97,7 @@ async def get_invoice_info(
         amount=invoice.amount,
         asset=invoice.asset,
         status=invoice.status.value,
-        allowed_chains=invoice.allowed_chains,
+        allowed_chains=invoice_checkout_chains(invoice),
         expires_at=invoice.expires_at,
         is_expired=is_expired,
         merchant_name=invoice.merchant.name if invoice.merchant else "Unknown",
@@ -134,10 +148,12 @@ async def select_payment_option(
     chain_config = get_chain_config(payment_session.chain)
     deposit_address = payment_session.deposit_address.address
 
-    # Формируем QR data (EIP-681 формат для EVM/native)
     token_config = chain_config.get_token(payment_session.token)
     token_contract_address = token_config.contract_address if token_config else ""
-    qr_data = f"ethereum:{deposit_address}@{chain_config.chain_id}"
+    qr_data = checkout_uri(
+        payment_session.chain, payment_session.token, invoice.amount,
+        deposit_address, invoice.public_id,
+    )
     explorer_token_url = (
         chain_config.get_explorer_address_url(token_contract_address)
         if token_contract_address
@@ -240,7 +256,7 @@ def _render_payment_page(invoice, is_expired: bool) -> str:
 
     # Собираем данные о сетях
     chains_data = []
-    for chain in invoice.allowed_chains:
+    for chain in invoice_checkout_chains(invoice):
         chain_config = get_chain_config(chain)
         chains_data.append(
             {
@@ -257,6 +273,11 @@ def _render_payment_page(invoice, is_expired: bool) -> str:
         selected_session = invoice.payment_sessions[0]
         if selected_session.deposit_address:
             deposit_address = selected_session.deposit_address.address
+
+    initial_qr = checkout_uri(
+        selected_session.chain, selected_session.token, invoice.amount,
+        deposit_address, invoice.public_id,
+    ) if deposit_address else ""
 
     return f"""
 <!DOCTYPE html>
@@ -783,7 +804,7 @@ def _render_payment_page(invoice, is_expired: bool) -> str:
 </head>
 <body>
     <div class="container">
-        <div class="merchant">{invoice.merchant.name if invoice.merchant else ''}</div>
+        <div class="merchant">{escape(invoice.merchant.name) if invoice.merchant else ''}</div>
 
         <div class="header">
             <div class="amount">{invoice.amount}</div>
@@ -813,16 +834,12 @@ def _render_payment_page(invoice, is_expired: bool) -> str:
             <div class="selection-step">
                 <div class="step-title">
                     <span class="step-number">2</span>
-                    Выберите токен
+                    Токен оплаты
                 </div>
                 <div class="token-grid">
-                    <div class="token-option usdt {'selected' if invoice.asset == 'USDT' else ''}" data-token="USDT" onclick="selectToken('USDT')">
-                        <div class="icon">₮</div>
-                        <div class="name">USDT</div>
-                    </div>
-                    <div class="token-option usdc {'selected' if invoice.asset == 'USDC' else ''}" data-token="USDC" onclick="selectToken('USDC')">
-                        <div class="icon">$</div>
-                        <div class="name">USDC</div>
+                    <div class="token-option {invoice.asset.lower()} selected" data-token="{invoice.asset}">
+                        <div class="icon">{'₮' if invoice.asset == 'USDT' else '$' if invoice.asset == 'USDC' else '◆'}</div>
+                        <div class="name">{invoice.asset}</div>
                     </div>
                 </div>
             </div>
@@ -833,6 +850,12 @@ def _render_payment_page(invoice, is_expired: bool) -> str:
         </div>
 
         <!-- Payment Info (shown after selection) -->
+        <div id="providerMethods" class="hidden selection-step">
+            <div class="step-title">Другие способы оплаты</div>
+            <div id="providerButtons" class="chain-grid"></div>
+            <p id="providerMessage" role="status"></p>
+            <a id="providerPayLink" class="btn hidden" target="_blank" rel="noopener noreferrer">Перейти к оплате</a>
+        </div>
         <div class="payment-info {'hidden' if not deposit_address else ''}" id="paymentInfo">
             <div class="qr-container">
                 <div class="qr-code">
@@ -907,6 +930,7 @@ def _render_payment_page(invoice, is_expired: bool) -> str:
         const expiresAt = new Date("{invoice.expires_at.isoformat()}");
         const initialAsset = "{invoice.asset}";
         const initialAddress = "{deposit_address or ''}";
+        const initialQR = {json.dumps(initial_qr)};
 
         let selectedChain = "{selected_session.chain if selected_session else ''}";
         let selectedToken = "{selected_session.token if selected_session else invoice.asset}";
@@ -921,14 +945,72 @@ def _render_payment_page(invoice, is_expired: bool) -> str:
 
             // If already have address, start polling and generate QR
             if (initialAddress) {{
-                generateQR(initialAddress);
+                generateQR(initialQR);
                 startPolling();
             }}
 
             updateConfirmBtn();
+            loadProviderMethods();
             updateCountdown();
             setInterval(updateCountdown, 1000);
         }});
+
+        async function loadProviderMethods() {{
+            try {{
+                if (new Date() >= expiresAt || ['CONFIRMED','EXPIRED'].includes('{invoice.status.value}')) return;
+                const response = await fetch('/pay/' + publicId + '/methods');
+                if (!response.ok) return;
+                const data = await response.json();
+                if (!data.items.length) return;
+                const box = document.getElementById('providerMethods');
+                const buttons = document.getElementById('providerButtons');
+                box.classList.remove('hidden');
+                buttons.replaceChildren();
+                for (const method of data.items) {{
+                    const button = document.createElement('button');
+                    button.className = 'chain-option';
+                    button.textContent = method.label || ({{cryptobot:'CryptoBot',xrocket:'xRocket',tgwallet:'Wallet Pay'}}[method.type] || method.type);
+                    button.disabled = !!data.selected;
+                    button.onclick = () => chooseProvider(method.id, button);
+                    buttons.appendChild(button);
+                }}
+                if (data.selected) showProviderOperation(data.selected);
+            }} catch (e) {{
+                document.getElementById('providerMessage').textContent = 'Не удалось загрузить способы оплаты.';
+            }}
+        }}
+
+        async function chooseProvider(railId, button) {{
+            button.disabled = true;
+            try {{
+                const response = await fetch('/pay/' + publicId + '/select-provider', {{
+                    method:'POST', headers:{{'Content-Type':'application/json'}},
+                    body:JSON.stringify({{rail_id:railId}})
+                }});
+                if (!response.ok) throw new Error('provider unavailable');
+                showProviderOperation(await response.json());
+            }} catch (e) {{
+                document.getElementById('providerMessage').textContent = 'Проверяем счёт. Обновите страницу через несколько секунд.';
+                setTimeout(loadProviderMethods, 5000);
+            }}
+        }}
+
+        function showProviderOperation(operation) {{
+            document.getElementById('selectionUI').classList.add('hidden');
+            const message = document.getElementById('providerMessage');
+            if (['failed','reconciliation_required'].includes(operation.status)) {{
+                message.textContent = 'Счёт требует проверки. Обратитесь к продавцу.';
+            }} else if (operation.pay_url && new URL(operation.pay_url).protocol === 'https:') {{
+                const link = document.getElementById('providerPayLink');
+                link.href = operation.pay_url;
+                link.classList.remove('hidden');
+                message.textContent = 'Оплатите счёт по ссылке. Статус обновится автоматически.';
+                startPolling();
+            }} else {{
+                message.textContent = 'Проверяем готовность счёта. Ссылка появится после подтверждения.';
+                setTimeout(loadProviderMethods, 5000);
+            }}
+        }}
 
         // Chain Selection
         function selectChain(chain) {{
@@ -985,7 +1067,7 @@ def _render_payment_page(invoice, is_expired: bool) -> str:
                 document.getElementById('explorerLink').href = data.explorer_address_url;
 
                 // Generate QR
-                generateQR(data.deposit_address);
+                generateQR(data.qr_data);
 
                 // Update status
                 document.getElementById('statusBadge').className = 'status-badge awaiting_payment';
@@ -1001,10 +1083,10 @@ def _render_payment_page(invoice, is_expired: bool) -> str:
         }}
 
         // Generate QR Code
-        function generateQR(address) {{
+        function generateQR(paymentUri) {{
             const canvas = document.getElementById('qrCanvas');
             if (typeof QRCode !== 'undefined') {{
-                QRCode.toCanvas(canvas, address, {{
+                QRCode.toCanvas(canvas, paymentUri, {{
                     width: 180,
                     margin: 1,
                     color: {{ dark: '#1f2937', light: '#ffffff' }}

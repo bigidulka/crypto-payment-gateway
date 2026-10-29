@@ -269,6 +269,8 @@ async def cryptobot_api():
             result = {
                 "check_id": 99,
                 "bot_check_url": "https://t.me/CryptoBot?start=C99",
+                "amount": body["amount"],
+                "asset": body["asset"],
             }
         return web.json_response({"ok": True, "result": result})
 
@@ -581,4 +583,4 @@ def test_registry_rejects_unknown_rail():
 
 def test_registry_rejects_known_but_unregistered_rail():
     with pytest.raises(ValueError, match="unregistered"):
-        build_rail("xrocket", None)
+        build_rail("solana", None)

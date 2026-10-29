@@ -40,7 +40,7 @@ from src.db.models import (
     PaymentSessionStatus,
     TxStatus,
 )
-from src.db.session import get_session_context
+from src.db.session import get_session_context, has_onchain_scan_schema
 from src.services.invoice_service import InvoiceService
 from src.services.payment_service import PaymentService
 
@@ -328,6 +328,10 @@ async def get_active_deposit_addresses(
             )
         )
     )
+    if await has_onchain_scan_schema(session):
+        from src.db.models import OnchainScanCursor
+        stmt = stmt.where(~select(OnchainScanCursor.session_id).where(
+            OnchainScanCursor.session_id == PaymentSession.id).exists())
     result = await session.execute(stmt)
     sessions = result.scalars().all()
 

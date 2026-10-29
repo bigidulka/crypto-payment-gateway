@@ -2,6 +2,8 @@
 Rate limiting middleware для API.
 """
 
+import hashlib
+
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -19,6 +21,10 @@ def get_api_key_or_ip(request: Request) -> str:
     api_key = request.headers.get("X-API-Key")
     if api_key:
         return f"api:{api_key[:16]}"  # Используем часть ключа для идентификации
+    # Merchant API authenticates with Bearer; several products may share one egress IP.
+    authorization = request.headers.get("Authorization", "")
+    if authorization.startswith("Bearer ") and len(authorization) > 7:
+        return "bearer:" + hashlib.sha256(authorization[7:].encode()).hexdigest()[:16]
 
     # Fallback на IP адрес
     return get_remote_address(request)

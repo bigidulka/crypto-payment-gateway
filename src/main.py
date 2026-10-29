@@ -5,9 +5,10 @@ Arbitron Payment Gateway - Main Application.
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
@@ -15,10 +16,12 @@ from src.api.admin.router import router as admin_router
 from src.api.hosted.router import router as hosted_router
 from src.api.merchant.router import router as merchant_router
 from src.api.public.router import router as public_router
+from src.api.providers.router import router as providers_router, public_router as provider_public_router
 from src.api.wallet.router import router as wallet_router
 from src.blockchain.chains import get_all_chains
 from src.blockchain.rpc_manager import close_all_rpc_managers, init_all_rpc_managers
 from src.core.config import get_settings
+from src.core.exceptions import AppException
 from src.core.rate_limit import limiter
 from src.db.redis import close_redis, get_redis
 from src.db.session import (
@@ -28,6 +31,14 @@ from src.db.session import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def application_error_response(request: Request, exc: AppException) -> JSONResponse:
+    """Expose intentional domain errors without serializing internal exception details."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"code": exc.code, "detail": exc.message},
+    )
 
 
 @asynccontextmanager
@@ -124,6 +135,13 @@ def create_app() -> FastAPI:
     # Rate limiting
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_exception_handler(AppException, application_error_response)
+    async def validation_response(request: Request, error: RequestValidationError):
+        # Pydantic includes the original credential input by default.
+        details = [{key:value for key,value in row.items() if key in ('loc','msg','type')}
+            for row in error.errors()]
+        return JSONResponse(status_code=422, content={'detail':details})
+    app.add_exception_handler(RequestValidationError, validation_response)
 
     # CORS middleware
     app.add_middleware(
@@ -140,6 +158,10 @@ def create_app() -> FastAPI:
         prefix="/v1",
         tags=["Merchant API"],
     )
+    from src.api.onchain.router import router as onchain_router
+    app.include_router(onchain_router, prefix="/v1", tags=["On-chain payments"])
+    app.include_router(providers_router, prefix="/v1", tags=["Provider payments"])
+    app.include_router(provider_public_router, tags=["Hosted provider payments"])
 
     app.include_router(
         hosted_router,

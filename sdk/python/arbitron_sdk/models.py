@@ -69,6 +69,8 @@ class Invoice:
     allowed_chains: tuple[str, ...]
     expires_at: str
     payment: dict[str, Any] = field(default_factory=dict)
+    allowed_rails: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> "Invoice":
@@ -82,7 +84,48 @@ class Invoice:
             allowed_chains=tuple(data.get("allowed_chains") or ()),
             expires_at=str(data.get("expires_at", "")),
             payment=dict(data.get("payment") or {}),
+            allowed_rails=tuple(str(value) for value in data.get("allowed_rails") or ()),
+            metadata=dict(data.get("metadata") or {}),
         )
+
+
+@dataclass(frozen=True)
+class ProviderOperation:
+    id: str
+    status: str
+    rail_id: str
+    pay_url: str | None = None
+    failure_code: str | None = None
+
+    @classmethod
+    def from_api(cls, data: dict) -> "ProviderOperation":
+        return cls(str(data["id"]), str(data["status"]), str(data["rail_id"]),
+            data.get("pay_url"), data.get("failure_code"))
+
+
+@dataclass(frozen=True)
+class ProviderBalance:
+    rail_id: str
+    asset: str
+    network: str
+    available: Decimal | None
+    ledger_balance: Decimal
+    reserved: Decimal
+    availability: str
+    payout_mode: str
+    as_of: str
+    unledgered_available: Decimal | None = None
+
+    @classmethod
+    def from_api(cls, data: dict) -> "ProviderBalance":
+        def optional(name):
+            return Decimal(str(data[name])) if data.get(name) is not None else None
+
+        return cls(str(data["rail_id"]), data["asset"], data["network"],
+            optional("available"),
+            Decimal(str(data["ledger_balance"])), Decimal(str(data["reserved"])),
+            data["availability"], data["payout_mode"], data["as_of"],
+            optional("unledgered_available"))
 
 
 @dataclass(frozen=True)

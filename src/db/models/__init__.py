@@ -18,6 +18,7 @@ from src.db.models.enums import (
     enum_values,
 )
 from src.db.models.invoice import Invoice, InvoiceEvent
+from src.db.models.gateway_operation import GatewayInvoiceOptions, GatewayLiquidityRecognition, GatewayOperation, GatewayRailConnection, GatewayPayoutReceipt, ProviderSettlement
 from src.db.models.ledger import LedgerAccount, LedgerAsset, LedgerEntry, LedgerTransaction
 from src.db.models.merchant import ApiKey, Merchant, Webhook
 from src.db.models.payment import (
@@ -25,6 +26,13 @@ from src.db.models.payment import (
     DepositAddress,
     OnchainTx,
     PaymentSession,
+)
+from src.db.models.provider_payment import (
+    ProviderPaymentMapping,
+    ProviderPaymentObservation,
+    ProviderPaymentReceipt,
+    ProviderPaymentRecipientIntent,
+    ProviderVerificationDecision,
 )
 from src.db.models.rail import Rail
 from src.db.models.sweep import (
@@ -41,6 +49,11 @@ from src.db.models.user_wallet import (
 )
 
 __all__ = [
+    "GatewayInvoiceOptions",
+    "GatewayOperation",
+    "GatewayRailConnection",
+    "GatewayLiquidityRecognition",
+    "ProviderSettlement",
     # Base
     "Base",
     "TimestampMixin",
@@ -82,8 +95,16 @@ __all__ = [
     "Deposit",
     "UserBalance",
     # Ledger foundation
+    # Disabled provider-ingestion source facts
+    "ProviderPaymentMapping",
+    "ProviderPaymentObservation",
+    "ProviderPaymentReceipt",
+    "ProviderPaymentRecipientIntent",
+    "ProviderVerificationDecision",
     "LedgerAsset",
     "LedgerAccount",
     "LedgerTransaction",
     "LedgerEntry",
 ]
+
+from src.db.models.onchain_gateway import OnchainOperation, OnchainReceipt, OnchainScanCursor

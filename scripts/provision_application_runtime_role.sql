@@ -98,6 +98,19 @@ SELECT format(
 )
 \gexec
 
+-- Additive provider objects are granted only when already migrated. No owner
+-- rights, TRUNCATE or privileges on unreviewed future objects are introduced.
+SELECT format('GRANT SELECT, INSERT, UPDATE ON TABLE public.%I TO %I',
+    c.relname, current_setting('application.runtime_role'))
+FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+WHERE n.nspname='public' AND c.relkind='r' AND c.relname=ANY(ARRAY[
+    'provider_payment_mappings','provider_payment_observations',
+    'provider_verification_decisions','provider_payment_receipts',
+    'provider_payment_recipient_intents','provider_settlements',
+    'onchain_operations','onchain_receipts','onchain_scan_cursors','gateway_rail_connections','gateway_invoice_options','gateway_operations',
+    'gateway_payout_receipts'])
+\gexec
+
 DO $$
 DECLARE
     runtime_name text := current_setting('application.runtime_role');
@@ -114,16 +127,23 @@ BEGIN
        )
        OR EXISTS (
            SELECT 1
-           FROM unnest(ARRAY[
+           FROM pg_class relation
+           JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+           WHERE namespace.nspname='public' AND relation.relkind IN ('r','p')
+             AND relation.relname=ANY(ARRAY[
                'address_lease_events', 'api_keys', 'chain_checkpoints',
                'deposit_addresses', 'deposits', 'invoice_events', 'invoices',
                'ledger_accounts', 'ledger_assets', 'ledger_entries',
                'ledger_transactions', 'merchants', 'onchain_txs',
                'outbox_webhooks', 'payment_sessions', 'rails',
                'unified_sweep_jobs', 'user_balances', 'user_wallets',
-               'wallet_addresses', 'webhooks'
-           ]) table_name
-           WHERE has_table_privilege(runtime_name, 'public.' || table_name, 'TRUNCATE')
+               'wallet_addresses', 'webhooks', 'provider_payment_mappings',
+               'provider_payment_observations', 'provider_verification_decisions',
+               'provider_payment_receipts', 'provider_payment_recipient_intents',
+               'provider_settlements', 'onchain_operations','onchain_receipts','onchain_scan_cursors','gateway_rail_connections',
+               'gateway_invoice_options', 'gateway_operations', 'gateway_payout_receipts'
+           ])
+             AND has_table_privilege(runtime_name, relation.oid, 'TRUNCATE')
        )
     THEN
         RAISE EXCEPTION 'runtime role % has effective CREATE, TRUNCATE, or public security-definer EXECUTE privilege', runtime_name;

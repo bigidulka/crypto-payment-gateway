@@ -1,9 +1,16 @@
 # CA release and state authority
 
-Application source is the observed RU commit `58dc6db9399ef5a177fe47eabf2751c86cab0fc8`,
-not the diverged default branch. Every one of the five running roles matched
-all 86 inventoried application modules and static files. Resolved packages
-are pinned from that runtime; the Python base is pinned to 3.12.15.
+Since 2026-10-29 the application source is the reviewed tree of
+`codex/gateway-separation-20261028` (`ea5b396`), imported onto this CA release
+ancestry; the earlier runtime base was the observed RU commit
+`58dc6db9399ef5a177fe47eabf2751c86cab0fc8`. Resolved packages stay pinned from
+that runtime (all roles import with them); the Python base is pinned to 3.12.15.
+
+Schema changes (Alembic 0011-0016) are applied by a one-off container from the
+release image with the owner role, never by runtime containers; afterwards the
+new tables receive the same runtime grants as the existing ones. The
+`providers` profile adds the read-only provider reconciliation worker; provider
+payments stay disabled until `LEDGER_RAIL_ORCHESTRATION_*` names the merchant.
 
 Configuration is external and role-specific. Runtime must use `arbitron_runtime`,
 with no superuser, CREATE DATABASE or CREATE ROLE rights, and no migration-owner
