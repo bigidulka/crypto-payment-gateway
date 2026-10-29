@@ -1,0 +1,124 @@
+name: gateway_ca
+
+x-runtime: &runtime
+  image: gateway-ca:${GATEWAY_RELEASE_COMMIT:?exact published release required}
+  restart: unless-stopped
+  stop_grace_period: 120s
+  volumes:
+    - ${GATEWAY_STATE_DIR:-/home/server/State/gateway-ca}/data:/data
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    profiles: [state]
+    image: ${GATEWAY_POSTGRES_IMAGE:?immutable PostgreSQL 16 image required}
+    restart: unless-stopped
+    stop_grace_period: 120s
+    env_file:
+      - path: ${GATEWAY_CONFIG_DIR:-/home/server/.config/gateway-ca}/arbitron-payment-postgres.env
+        format: raw
+    environment:
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ${GATEWAY_STATE_DIR:-/home/server/State/gateway-ca}/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U arbitron -d arbitron_payment"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  redis:
+    profiles: [state]
+    image: ${GATEWAY_REDIS_IMAGE:?immutable Redis 7.4 image required}
+    restart: unless-stopped
+    stop_grace_period: 120s
+    command: [redis-server, /run/secrets/redis.conf]
+    volumes:
+      - ${GATEWAY_STATE_DIR:-/home/server/State/gateway-ca}/redis:/data
+      - ${GATEWAY_CONFIG_DIR:-/home/server/.config/gateway-ca}/redis.conf:/run/secrets/redis.conf:ro
+      - ${GATEWAY_CONFIG_DIR:-/home/server/.config/gateway-ca}/redis.password:/run/secrets/redis.password:ro
+      - ./redis-healthcheck.sh:/run/redis-healthcheck.sh:ro
+    healthcheck:
+      test: [CMD, sh, /run/redis-healthcheck.sh]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  api:
+    <<: *runtime
+    profiles: [api]
+    env_file:
+      - path: ${GATEWAY_CONFIG_DIR:-/home/server/.config/gateway-ca}/arbitron-payment-api.env
+        format: raw
+    ports:
+      - 127.0.0.1:8123:8000
+
+  worker-poller:
+    <<: *runtime
+    profiles: [financial]
+    command: [python, -m, src.workers.evm_log_poller]
+    env_file:
+      - path: ${GATEWAY_CONFIG_DIR:-/home/server/.config/gateway-ca}/arbitron-payment-worker-poller.env
+        format: raw
+    healthcheck:
+      disable: true
+
+  worker-webhook:
+    <<: *runtime
+    profiles: [financial]
+    command: [python, -m, src.workers.webhook_dispatcher]
+    env_file:
+      - path: ${GATEWAY_CONFIG_DIR:-/home/server/.config/gateway-ca}/arbitron-payment-worker-webhook.env
+        format: raw
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    healthcheck:
+      disable: true
+
+  worker-sweeper:
+    <<: *runtime
+    profiles: [financial]
+    command: [python, -m, src.workers.unified_sweeper_runner]
+    env_file:
+      - path: ${GATEWAY_CONFIG_DIR:-/home/server/.config/gateway-ca}/arbitron-payment-worker-sweeper.env
+        format: raw
+    healthcheck:
+      disable: true
+
+  worker-expirer:
+    <<: *runtime
+    profiles: [financial]
+    command: [python, -m, src.workers.invoice_expirer]
+    env_file:
+      - path: ${GATEWAY_CONFIG_DIR:-/home/server/.config/gateway-ca}/arbitron-payment-worker-expirer.env
+        format: raw
+    healthcheck:
+      disable: true
+
+  # Read-only provider reconciliation (CryptoBot receipts, payout readback).
+  # It never resubmits an invoice or payout; separate profile for staged enablement.
+  worker-providers:
+    <<: *runtime
+    profiles: [providers]
+    command: [python, -m, src.workers.provider_poller]
+    env_file:
+      - path: ${GATEWAY_CONFIG_DIR:-/home/server/.config/gateway-ca}/arbitron-payment-worker-providers.env
+        format: raw
+    healthcheck:
+      disable: true
+
+  # Non-EVM receipt scanning per payment session (TON/Solana); payouts stay
+  # behind ONCHAIN_PAYOUT_ENABLED and gas funding needs separate funder keys.
+  worker-onchain:
+    <<: *runtime
+    profiles: [onchain]
+    command: [python, -m, src.workers.onchain_gateway]
+    env_file:
+      - path: ${GATEWAY_CONFIG_DIR:-/home/server/.config/gateway-ca}/arbitron-payment-worker-onchain.env
+        format: raw
+    healthcheck:
+      disable: true
