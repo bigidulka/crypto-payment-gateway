@@ -147,7 +147,7 @@ class CheckoutProfileConfig(BaseModel):
     min_amount: Decimal = Field(gt=0, le=100000, decimal_places=2)
     max_amount: Decimal = Field(gt=0, le=100000, decimal_places=2)
     custom_amount: bool = True
-    methods: list[CheckoutMethod] = Field(min_length=1, max_length=8)
+    methods: list[CheckoutMethod] = Field(min_length=1, max_length=16)
     default_language: Literal["en", "ru"] = "en"
     invoice_ttl_minutes: int = Field(default=60, ge=10, le=1440)
     # Pre-checkout invoices (metadata product + telegram_user_id) credited by the feed.
@@ -483,12 +483,15 @@ class TelegramCheckoutService:
 
     def _method_screen(self, sid, state, lang, profile, *, note: str | None = None) -> Screen:
         amount = Decimal(state["amount"])
-        rows = []
+        buttons = []
         for method in profile.methods:
             label = method.label
             if method.surcharge_percent:
                 label += f" · +{method.surcharge_percent.normalize():f}% {text(lang, 'fee')}"
-            rows.append([{"text": label, "callback_data": callback(sid, f"m{method.short_id}")}])
+            buttons.append({"text": label, "callback_data": callback(sid, f"m{method.short_id}")})
+        # A long method list stays readable on a phone as two columns.
+        width = 2 if len(buttons) > 6 else 1
+        rows = [buttons[i : i + width] for i in range(0, len(buttons), width)]
         rows.append([self._button(lang, "back", sid, "b"), self._button(lang, "cancel", sid, "x")])
         body = (
             f"{self._title(profile)}\n{text(lang, 'amount')}: <b>{usd(amount)}</b>\n\n"
