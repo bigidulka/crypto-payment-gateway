@@ -638,8 +638,11 @@ class ProviderPaymentIngestionService:
         )
         if invoice is None or rail is None or asset is None:
             raise ProviderIngestionError("tenant mapping parent mismatch")
+        # The provider TTL never outlives the invoice, so a verified provider
+        # payment of a time-expired invoice is a late but valid payment.
         if (
-            not invoice.is_payable
+            invoice.status
+            not in (InvoiceStatus.CREATED, InvoiceStatus.AWAITING_PAYMENT, InvoiceStatus.EXPIRED)
             or invoice.asset != mapping.provider_asset_code
             or _atomic(invoice.amount, asset.atomic_decimals) != expected_atomic
         ):

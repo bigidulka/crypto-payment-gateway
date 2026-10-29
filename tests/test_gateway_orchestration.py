@@ -95,6 +95,7 @@ async def gateway(monkeypatch):
         payout_unknown=False,
         payout_status="finished",
         provider_balance=Decimal("500"),
+        expired=False,
     )
     app = web.Application()
 
@@ -124,7 +125,8 @@ async def gateway(monkeypatch):
             response = next(
                 row for row in state.invoices.values() if row["id"] == request.query["invoiceId"]
             )
-        return web.json_response({**response, "status": "paid" if state.paid else "active"})
+        status = "paid" if state.paid else "expired" if state.expired else "active"
+        return web.json_response({**response, "status": status})
 
     async def payments(request):
         return web.json_response(
@@ -888,3 +890,49 @@ async def test_database_refuses_unproven_or_mutated_recognition(gateway):
                 {"id": uuid4(), "operation": operation.id, "source": row.id},
             )
         await session.rollback()
+
+
+async def age_invoice(gateway, invoice):
+    # The owner fixture role may rewrite a disposable invoice's deadline.
+    async with gateway.factory() as session, session.begin():
+        await session.execute(
+            text("UPDATE invoices SET expires_at=now() - interval '10 minutes' WHERE id=:id"),
+            {"id": invoice.id},
+        )
+
+
+@pytest.mark.asyncio
+async def test_expired_unpaid_provider_invoice_stops_counting_as_open(gateway):
+    gateway.state.provider_balance = Decimal("500")
+    invoice = await new_invoice(gateway, amount=Decimal("100"))
+    operation = await gateway.service.select_invoice(invoice.public_id, gateway.rail_id)
+    before = (await gateway.service.balances(gateway.merchant.id, gateway.rail_id))[0]
+    assert before["unledgered_available"] == Decimal("400")
+    await age_invoice(gateway, invoice)
+    # The provider still reports it payable: the operation must stay open.
+    assert (await gateway.service.poll_invoice(gateway.merchant.id, operation.id)).status == "pending"
+    gateway.state.expired = True
+    closed = await gateway.service.poll_invoice(gateway.merchant.id, operation.id)
+    assert closed.status == "failed" and closed.failure_code == "provider_invoice_expired"
+    after = (await gateway.service.balances(gateway.merchant.id, gateway.rail_id))[0]
+    assert after["unledgered_available"] == Decimal("500")
+    assert await gateway.service.poll_batch() == 0
+
+
+@pytest.mark.asyncio
+async def test_provider_payment_verified_after_invoice_deadline_still_credits_once(gateway):
+    invoice = await new_invoice(gateway, amount=Decimal("100"))
+    operation = await gateway.service.select_invoice(invoice.public_id, gateway.rail_id)
+    await age_invoice(gateway, invoice)
+    async with gateway.factory() as session, session.begin():
+        await session.execute(
+            text("UPDATE invoices SET status='EXPIRED' WHERE id=:id"), {"id": invoice.id}
+        )
+    gateway.state.paid = True
+    result = await gateway.service.poll_invoice(gateway.merchant.id, operation.id)
+    assert result.status == "completed"
+    assert (await gateway.service.poll_invoice(gateway.merchant.id, operation.id)).status == "completed"
+    receipt = await gateway.service.receipt(gateway.merchant.id, invoice.id)
+    assert receipt["status"] == "CONFIRMED" and receipt["receipt"]["net"] == Decimal("97")
+    balance = (await gateway.service.balances(gateway.merchant.id, gateway.rail_id))[0]
+    assert balance["ledger_balance"] == Decimal("97")

@@ -130,7 +130,7 @@ async def payment_methods(merchant: MerchantDep, service: ServiceDep):
 
 
 @router.get("/rails/{rail_id}/balances", response_model=BalancesResponse)
-@limiter.limit("10/minute")
+@limiter.limit(RATE_LIMITS["get_invoice"])
 async def balances(request: Request, rail_id: UUID, merchant: MerchantDep, service: ServiceDep):
     return {"items": await provider_call(service.balances(merchant.id, rail_id))}
 
