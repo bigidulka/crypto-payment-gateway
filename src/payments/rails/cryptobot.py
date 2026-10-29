@@ -12,7 +12,10 @@ CryptoBot-рельс: приём через createInvoice, статусы чер
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -30,6 +33,7 @@ from src.payments.rails.base import (
     RailPayout,
     RailPayoutRequest,
     RailType,
+    WebhookRejected,
 )
 
 API_BASE = "https://pay.crypt.bot/api"
@@ -338,6 +342,28 @@ class CryptobotRail(Rail):
             destination=str(recipient_id),
             destination_type="telegram_user_id",
         )
+
+    def webhook_invoice_id(
+        self, body: bytes, headers: Mapping[str, str], secret: str = ""
+    ) -> str | None:
+        # Crypto Pay signs the raw body with SHA256(app token) as the HMAC key.
+        key = hashlib.sha256(self._token.encode()).digest()
+        expected = hmac.new(key, body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(headers.get("crypto-pay-api-signature", ""), expected):
+            raise WebhookRejected("cryptobot signature mismatch")
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return None
+        if not isinstance(data, dict) or data.get("update_type") != "invoice_paid":
+            return None
+        payload = data.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        invoice_id = payload.get("invoice_id")
+        if not isinstance(invoice_id, (int, str)) or isinstance(invoice_id, bool):
+            return None
+        return str(invoice_id) or None
 
     async def close(self) -> None:
         if self._session and not self._session.closed:

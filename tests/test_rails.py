@@ -584,3 +584,23 @@ def test_registry_rejects_unknown_rail():
 def test_registry_rejects_known_but_unregistered_rail():
     with pytest.raises(ValueError, match="unregistered"):
         build_rail("solana", None)
+
+
+def test_cryptobot_push_signature_uses_token_digest():
+    import hashlib
+    import hmac
+
+    from src.payments.rails.base import WebhookRejected
+
+    rail = CryptobotRail("12345:token")
+    body = json.dumps(
+        {"update_type": "invoice_paid", "payload": {"invoice_id": 777, "status": "paid"}}
+    ).encode()
+    key = hashlib.sha256(b"12345:token").digest()
+    signature = hmac.new(key, body, hashlib.sha256).hexdigest()
+    assert rail.webhook_invoice_id(body, {"crypto-pay-api-signature": signature}) == "777"
+    with pytest.raises(WebhookRejected):
+        rail.webhook_invoice_id(body + b" ", {"crypto-pay-api-signature": signature})
+    other = json.dumps({"update_type": "something_else", "payload": {}}).encode()
+    other_signature = hmac.new(key, other, hashlib.sha256).hexdigest()
+    assert rail.webhook_invoice_id(other, {"crypto-pay-api-signature": other_signature}) is None

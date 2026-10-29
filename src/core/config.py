@@ -143,6 +143,7 @@ class Settings(BaseSettings):
     ledger_rail_orchestration_enabled: bool = False
     ledger_rail_orchestration_merchants: str = ""
     gateway_provider_poll_interval_seconds: int = Field(default=30, ge=5, le=3600)
+    provider_webhook_secrets: SecretStr = Field(default="")
     gateway_provider_poll_batch_size: int = Field(default=10, ge=1, le=50)
 
     # === CORS ===
@@ -254,6 +255,16 @@ class Settings(BaseSettings):
         )
         if present:
             raise RuntimeError("limited runtime environment contains forbidden owner key names")
+
+    @property
+    def provider_webhook_secret_map(self) -> dict[str, str]:
+        """Per-rail push secrets that differ from the API token: "rail_id=secret,..."."""
+        pairs = (
+            item.split("=", 1)
+            for item in self.provider_webhook_secrets.get_secret_value().split(",")
+            if "=" in item
+        )
+        return {rail.strip(): secret.strip() for rail, secret in pairs if rail.strip()}
 
     @property
     def ledger_rail_orchestration_merchant_ids(self) -> set[str]:
