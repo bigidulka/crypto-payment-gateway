@@ -3,7 +3,7 @@
 import asyncio
 import os
 from decimal import Decimal
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -243,7 +243,7 @@ async def test_custom_amount_bounds_and_session_binding(gateway, checkout):
         {"type": "callback", "data": start["buttons"][0][0]["callback_data"]}
     )
     assert "expired" in stale["text"]
-    unknown = await checkout.screen({"type": "callback", "data": "ap:nope:zz"})
+    unknown = await checkout.screen({"type": "callback", "data": "ap:nope:Z9"})
     assert unknown["text"] is None and unknown["toast"]
     fresh = await checkout.screen({"type": "callback", "data": "ap:-:n"})
     assert fresh["buttons"][0][0]["text"] == "$10"
@@ -309,40 +309,156 @@ async def test_onchain_flow_underpay_then_overpay_credits_floor(gateway, checkou
     assert Decimal(item["gross"]) == Decimal("10.019")
 
 
-async def test_legacy_product_invoices_are_in_the_feed(gateway, checkout):
-    async def paid_invoice(metadata):
-        async with gateway.factory() as session:
-            invoice = await InvoiceService(session).create_invoice(
-                gateway.merchant,
-                Decimal("7"),
-                "USDT",
-                [],
-                allowed_rails=[gateway.rail_id],
-                idempotency_key=str(uuid4()),
-                metadata=metadata,
-                customer_telegram_id="42",
-            )
-        operation = await gateway.service.select_invoice(invoice.public_id, gateway.rail_id)
-        gateway.state.paid, gateway.state.gross, gateway.state.net = True, "7", "6.8"
-        assert (
-            await gateway.service.poll_invoice(gateway.merchant.id, operation.id)
-        ).status == "completed"
-        gateway.state.paid = False
-        return invoice
+async def paid_invoice(gateway, metadata):
+    async with gateway.factory() as session:
+        invoice = await InvoiceService(session).create_invoice(
+            gateway.merchant,
+            Decimal("7"),
+            "USDT",
+            [],
+            allowed_rails=[gateway.rail_id],
+            idempotency_key=str(uuid4()),
+            metadata=metadata,
+            customer_telegram_id="42",
+        )
+    operation = await gateway.service.select_invoice(invoice.public_id, gateway.rail_id)
+    gateway.state.paid, gateway.state.gross, gateway.state.net = True, "7", "6.8"
+    assert (
+        await gateway.service.poll_invoice(gateway.merchant.id, operation.id)
+    ).status == "completed"
+    gateway.state.paid = False
+    return invoice
 
-    legacy = await paid_invoice(
-        {"product": "llmass-topup", "telegram_user_id": 42, "external_user_id": "42"}
+
+async def paid_chain_invoice(gateway):
+    from tests.test_onchain_gateway import transfer
+
+    address = str(Keypair.from_seed(uuid4().bytes * 2).pubkey())
+    async with gateway.factory() as session:
+        invoice = await InvoiceService(session).create_invoice(
+            gateway.merchant,
+            Decimal("7"),
+            "USDT",
+            ["solana"],
+            idempotency_key=str(uuid4()),
+            metadata={"checkout": True, "telegram_user_id": 50, "requested_amount": "7.00"},
+        )
+        deposit = DepositAddress(
+            address=address,
+            encrypted_privkey=encrypt_secret(
+                "unit-key", get_settings().encryption_key.get_secret_value()
+            ),
+            chain_group="solana",
+            derivation_path="m/44'/501'/125'/0'",
+            derivation_index=uuid4().int % 2**31,
+        )
+        session.add(deposit)
+        await session.flush()
+        session.add(
+            PaymentSession(
+                invoice_id=invoice.id,
+                chain="solana",
+                token="USDT",
+                deposit_address_id=deposit.id,
+                expires_at=invoice.expires_at,
+            )
+        )
+        await session.commit()
+    async with gateway.factory() as session, session.begin():
+        await OnchainGatewayService(session).consume_event(
+            transfer(address, "7", "feed-chain", symbol="USDT")
+        )
+    return invoice
+
+
+async def test_unpayable_rows_never_block_the_feed(gateway, checkout, monkeypatch):
+    http = checkout.http
+
+    async def feed(query=""):
+        result = await http.get("/v1/checkout/payments" + query)
+        assert result.status_code == 200, result.text
+        return [item["invoice_id"] for item in result.json()["items"]]
+
+    enable_chain(gateway, monkeypatch)
+    chain = await paid_chain_invoice(gateway)
+    assert await feed() == [str(chain.id)]
+    # Chain receipts are hidden while the chain gateway is off; they must not block.
+    monkeypatch.setenv("ONCHAIN_GATEWAY_ENABLED", "false")
+    get_settings.cache_clear()
+    for metadata in (
+        {"product": "llmass-topup", "telegram_user_id": 42.0},
+        {"product": "llmass-topup", "telegram_user_id": -1},
+        {"product": "llmass-topup", "telegram_user_id": "44"},
+        {"product": "other-product", "telegram_user_id": 47},
+        {"order": "not a bot top-up", "telegram_user_id": 43},
+        {"checkout": True, "telegram_user_id": 5},
+        {"checkout": True, "telegram_user_id": 6, "requested_amount": 7},
+        {"checkout": "true", "telegram_user_id": 8, "requested_amount": "7.00"},
+        # A checkout claim above what the customer paid is never credited.
+        {"checkout": True, "telegram_user_id": 45, "requested_amount": "100"},
+    ):
+        await paid_invoice(gateway, metadata)
+    legacy = await paid_invoice(gateway, {"product": "llmass-topup", "telegram_user_id": 42})
+    good = await paid_invoice(
+        gateway, {"checkout": True, "telegram_user_id": 46, "requested_amount": "7.00"}
     )
-    await paid_invoice({"order": "not a bot top-up", "telegram_user_id": 43})
-    await paid_invoice({"product": "llmass-topup", "telegram_user_id": "44"})
-    # A checkout claim above what the customer paid is never credited.
-    await paid_invoice({"checkout": True, "telegram_user_id": 45, "requested_amount": "100"})
-    items = (await checkout.http.get("/v1/checkout/payments?limit=10")).json()["items"]
-    assert [(i["invoice_id"], i["telegram_user_id"], i["credit_amount"]) for i in items] == [
-        (str(legacy.id), 42, "7.00")
-    ]
-    assert items[0]["external_id"] == f"gateway-{legacy.id}"
-    assert UUID(items[0]["invoice_id"]) == legacy.id
+    assert (await http.put("/v1/checkout/profile", json=profile(gateway))).status_code == 200
+    # Legacy invoices need an explicit per-profile allowlist.
+    assert await feed("?limit=1") == [str(good.id)]
+    body = profile(gateway, legacy_products=["llmass-topup"])
+    assert (await http.put("/v1/checkout/profile", json=body)).status_code == 200
+    assert await feed("?limit=1") == [str(legacy.id)]
+    assert await feed("?limit=10") == [str(legacy.id), str(good.id)]
+    assert await feed(f"?limit=1&after={legacy.id}") == [str(good.id)]
+    [item] = (await http.get("/v1/checkout/payments?limit=1")).json()["items"]
+    assert item["telegram_user_id"] == 42 and item["credit_amount"] == "7.00"
+    assert item["external_id"] == f"gateway-{legacy.id}"
+    # A row the SQL admits but payment() rejects is skipped rather than blocking.
+    original = TelegramCheckoutService.payment
+
+    async def reject_legacy(self, merchant_id, invoice_id, **kwargs):
+        if invoice_id == legacy.id:
+            return None
+        return await original(self, merchant_id, invoice_id, **kwargs)
+
+    monkeypatch.setattr(TelegramCheckoutService, "payment", reject_legacy)
+    assert await feed("?limit=1") == [str(good.id)]
+
+
+async def test_buttons_follow_stable_ids_and_url_labels_are_raw(gateway, checkout):
+    second = await gateway.service.connect(gateway.merchant.id, "xrocket", str(uuid4()), ["USDT"])
+    first = {"method": str(gateway.rail_id), "label": "A&B <x>"}
+    other = {"method": str(second), "label": "Second"}
+    body = profile(gateway, methods=[first, other])
+    assert (await checkout.http.put("/v1/checkout/profile", json=body)).status_code == 200
+    start = await checkout.screen({"type": "start"})
+    methods = await checkout.press(start, "$10")
+    # The profile is reordered and the $25 preset removed while the menu is open.
+    body = profile(gateway, methods=[other, first], preset_amounts=["10"])
+    assert (await checkout.http.put("/v1/checkout/profile", json=body)).status_code == 200
+    stale = await checkout.press(start, "$25")
+    assert stale["toast"] == "This option is no longer available."
+    invoice = await checkout.press(methods, "A&B <x>")
+    assert invoice["buttons"][0][0]["text"] == "Pay via A&B <x>"
+
+
+async def test_session_lock_is_owned_and_released_by_its_owner(gateway, checkout, monkeypatch):
+    import src.services.telegram_checkout_service as module
+
+    monkeypatch.setattr(module, "LOCK_WAIT_SECONDS", 0.3)
+    assert (
+        await checkout.http.put("/v1/checkout/profile", json=profile(gateway))
+    ).status_code == 200
+    start = await checkout.screen({"type": "start"})
+    sid = start["buttons"][0][0]["callback_data"].split(":")[1]
+    lock = f"checkout:tg:{gateway.merchant.id}:lock:{sid}"
+    await checkout.redis.set(lock, "another-owner", ex=60)
+    busy = await checkout.press(start, "$10")
+    assert busy["text"] is None and busy["toast"] == "Please wait…"
+    assert await checkout.redis.get(lock) == "another-owner"
+    await checkout.redis.delete(lock)
+    assert "Choose how to pay" in (await checkout.press(start, "$10"))["text"]
+    assert await checkout.redis.get(lock) is None
 
 
 async def test_sdk_connector_end_to_end_over_http(gateway, checkout):
@@ -406,6 +522,7 @@ async def test_sdk_connector_end_to_end_over_http(gateway, checkout):
                 assert connector.is_ours(check)
                 gateway.state.paid, gateway.state.gross, gateway.state.net = True, "25.75", "25"
                 paid = await connector.callback(USER, check)
+                await asyncio.gather(*connector._tasks)
                 assert paid.paid and len(credited) == 1
                 assert credited[0][:2] == (USER, Decimal("25.00"))
                 assert await connector.sync() == 0

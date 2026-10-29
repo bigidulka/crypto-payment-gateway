@@ -81,8 +81,9 @@ async def payments(
     merchant: MerchantDep,
     checkout: CheckoutDep,
     limit: int = Query(50, ge=1, le=100),
+    after: UUID | None = Query(None),
 ):
-    return {"items": await checkout.payments(merchant.id, limit)}
+    return {"items": await checkout.payments(merchant.id, limit, after)}
 
 
 @router.get("/payments/{invoice_id}")

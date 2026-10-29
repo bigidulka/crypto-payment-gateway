@@ -33,7 +33,11 @@ async def topup(query: CallbackQuery):
 (неверная подпись → `WebhookVerificationError`, отвечайте 400). Без aiogram:
 `checkout.start/callback/input(...)` возвращают `Screen` с `text`, `reply_markup()`
 (словарь Bot API), `expect_input`, `toast`; `text is None` — сообщение не менять,
-только показать `toast`.
+только показать `toast`. Пока меню ждёт свою сумму (5 минут), перехватывайте
+только текст, для которого `checkout.wants_input(user_id, text)` истинно: любой
+другой текст закрывает ожидание и идёт обычным обработчикам бота. Роутер aiogram
+сначала отвечает на callback, при невозможности правки шлёт экран новым
+сообщением, а сверку после оплаты запускает фоном.
 
 ## Контракт зачисления
 
@@ -47,9 +51,13 @@ async def topup(query: CallbackQuery):
     платит её плюс `surcharge_percent` метода (округление вверх до цента);
   - перевод в сети (TON/Solana): запрошенная сумма плюс переплата сверх счёта,
     вниз до цента. Недоплата и просрочка не зачисляются никогда.
-- Старые счета с метаданными `telegram_user_id` + `product` (например
-  `llmass-topup`) тоже попадают в ленту: рельс — сумма счёта, сеть — пришедшее
-  вниз до цента (как зачислял LLMASS).
+- Старые счета с метаданными `telegram_user_id` + `product` попадают в ленту,
+  только если `product` есть в `legacy_products` профиля (по умолчанию пусто;
+  LLMASS: `["llmass-topup"]`): рельс — сумма счёта, сеть — пришедшее вниз до
+  цента (как зачислял LLMASS).
+- Строка, которую нельзя зачислить, в ленту не попадает и не задерживает более
+  новые; `after=<invoice_id>` продолжает ленту за последней виденной позицией,
+  SDK листает до пустой страницы.
 
 ## API шлюза (Bearer-ключ мерчанта)
 
@@ -57,23 +65,26 @@ async def topup(query: CallbackQuery):
 |---|---|---|
 | GET/PUT | `/v1/checkout/profile` | профиль меню мерчанта |
 | POST | `/v1/checkout/telegram` | следующий экран |
-| GET | `/v1/checkout/payments?limit=50` | подтверждённые оплаты без ack |
+| GET | `/v1/checkout/payments?limit=50&after=<invoice_id>` | подтверждённые оплаты без ack |
 | GET | `/v1/checkout/payments/{invoice_id}` | одна позиция (404 — не подтверждена) |
 | POST | `/v1/checkout/payments/{invoice_id}/ack` | идемпотентный ack |
 
 Профиль: `product_title`, `currency_label` (`USD`), `preset_amounts`,
 `min_amount`, `max_amount`, `custom_amount`, `methods`
 (`[{method: <rail uuid>|"ton"|"solana", label, surcharge_percent}]`),
-`default_language` (`ru`/`en`), `invoice_ttl_minutes`. Суммы — строки с ≤2
+`default_language` (`ru`/`en`), `invoice_ttl_minutes`, `legacy_products`. Суммы — строки с ≤2
 знаками; рельсы проверяются на принадлежность мерчанту и USDT, сети — на
 включённый on-chain шлюз.
 
 Экран: запрос `{"telegram_user_id", "lang", "action"}`, где `action` —
 `{"type":"start"}`, `{"type":"callback","data":"ap:…"}` или
 `{"type":"input","text":"…"}`; ответ `{"text", "buttons", "expect_input",
-"toast", "paid"}`. `callback_data` — `ap:<sid>:<op>`, ≤64 байт; сессия в Redis
-привязана к пользователю (чужое нажатие — только toast), повторное и
-параллельное нажатие не выпускают второй счёт.
+"toast", "paid"}`. `callback_data` — `ap:<sid>:<op>`, ≤64 байт; сумма кодируется
+в центах, способ — коротким стабильным id (имя сети или первые 8 hex рельса),
+поэтому правка профиля не перенаправит старую кнопку. Сессия в Redis привязана к
+пользователю (чужое нажатие — только toast); все изменения сессии идут под
+блокировкой с токеном владельца (TTL 120 с, снимается только владельцем), так что
+повторное и параллельное нажатие не выпускают второй счёт и не затирают выпущенный.
 
 Ленту будит существующий вебхук `invoice.confirmed`; новых событий нет.
 

@@ -13,18 +13,20 @@ import json
 import logging
 import re
 import secrets
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC
-from decimal import ROUND_DOWN, ROUND_UP, Decimal, InvalidOperation
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from html import escape
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import and_, cast, exists, func, or_, select
+from sqlalchemy import Numeric, and_, case, cast, exists, false, func, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import JSONB, insert
 
 from src.blockchain.chains import get_chain_config, is_chain_supported
+from src.core.config import get_settings
 from src.core.exceptions import AppException, ValidationError
 from src.db.models import (
     CheckoutPaymentAck,
@@ -34,9 +36,12 @@ from src.db.models import (
     GatewayRailConnection,
     Invoice,
     InvoiceStatus,
+    LedgerAsset,
     Merchant,
     PaymentSession,
+    ProviderPaymentObservation,
     ProviderPaymentReceipt,
+    ProviderSettlement,
     Rail,
 )
 from src.db.models.onchain_gateway import OnchainReceipt
@@ -54,12 +59,20 @@ CHAINS = ("ton", "solana")
 CENT = Decimal("0.01")
 CALLBACK_PREFIX = "ap:"
 CALLBACK_MAX_BYTES = 64
-INPUT_TTL_SECONDS = 15 * 60
+INPUT_TTL_SECONDS = 5 * 60
 POLL_THROTTLE_SECONDS = 5
-LOCK_SECONDS = 30
+# Outlives one invoice issuance: provider create (30 s timeout) plus database work.
+LOCK_SECONDS = 120
 LOCK_WAIT_SECONDS = 8.0
-_CALLBACK = re.compile(r"^ap:([A-Za-z0-9_-]{1,16}|-):([a-z])([0-9]{0,2})$")
+FEED_SCAN_BATCHES = 10
+_CALLBACK = re.compile(r"^ap:([A-Za-z0-9_-]{1,16}|-):([a-z])([0-9a-z]{0,10})$")
 _AMOUNT = re.compile(r"^[0-9]{1,7}(\.[0-9]{1,2})?$")
+REQUESTED_PATTERN = r"^[0-9]{1,9}(\.[0-9]{1,2})?$"
+USER_ID_PATTERN = r"^[1-9][0-9]{0,17}$"
+_REQUESTED = re.compile(REQUESTED_PATTERN)
+_RELEASE = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0"
+)
 
 
 def _exact(value: Any) -> Any:
@@ -94,6 +107,11 @@ class CheckoutMethod(BaseModel):
     def is_chain(self) -> bool:
         return self.method in CHAINS
 
+    @property
+    def short_id(self) -> str:
+        """Stable button id: a profile edit never redirects an old button to another method."""
+        return self.method if self.is_chain else UUID(self.method).hex[:8]
+
 
 class CheckoutProfileConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -106,6 +124,10 @@ class CheckoutProfileConfig(BaseModel):
     methods: list[CheckoutMethod] = Field(min_length=1, max_length=8)
     default_language: Literal["en", "ru"] = "en"
     invoice_ttl_minutes: int = Field(default=60, ge=10, le=1440)
+    # Pre-checkout invoices (metadata product + telegram_user_id) credited by the feed.
+    legacy_products: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(
+        default_factory=list, max_length=8
+    )
 
     @field_validator("min_amount", "max_amount", mode="before")
     @classmethod
@@ -133,7 +155,7 @@ class CheckoutProfileConfig(BaseModel):
             raise ValueError("preset amounts must be unique")
         if not self.preset_amounts and not self.custom_amount:
             raise ValueError("configure preset amounts or allow a custom amount")
-        if len({m.method for m in self.methods}) != len(self.methods):
+        if len({m.short_id for m in self.methods}) != len(self.methods):
             raise ValueError("payment methods must be unique")
         return self
 
@@ -258,22 +280,53 @@ class TelegramCheckoutService:
             return await self._start(merchant_id, user_id, lang, profile)
         if kind == "input":
             sid = await self.redis.get(self._key(merchant_id, "input", user_id))
-            state = await self._load(merchant_id, sid) if sid else None
-            if state is None or state["uid"] != user_id or state["step"] != "custom":
+            if not sid:
                 return self._expired(lang)
-            return await self._input(merchant_id, sid, state, lang, profile, action["text"])
+            async with self._session_lock(merchant_id, sid) as owned:
+                if not owned:
+                    return Screen(None, toast=text(lang, "wait"))
+                state = await self._load(merchant_id, sid)
+                if state is None or state["uid"] != user_id or state["step"] != "custom":
+                    return self._expired(lang)
+                return await self._input(merchant_id, sid, state, lang, profile, action["text"])
         match = _CALLBACK.match(action.get("data") or "")
         if kind != "callback" or match is None:
             return Screen(None, toast=text(lang, "unknown"))
         sid, op, arg = match.groups()
-        state = await self._load(merchant_id, sid) if sid != "-" else None
-        if state is not None and state["uid"] != user_id:
-            return Screen(None, toast=text(lang, "foreign"))
-        if op == "n":
-            return await self._start(merchant_id, user_id, lang, profile)
-        if state is None:
+        if sid == "-":
+            if op == "n":
+                return await self._start(merchant_id, user_id, lang, profile)
             return self._expired(lang)
-        return await self._press(merchant_id, sid, state, lang, profile, op, arg)
+        # Every session write happens under the owner lock, so no press can
+        # overwrite an invoice another press of the same menu just issued.
+        async with self._session_lock(merchant_id, sid) as owned:
+            state = await self._load(merchant_id, sid)
+            if state is not None and state["uid"] != user_id:
+                return Screen(None, toast=text(lang, "foreign"))
+            if not owned:
+                return Screen(None, toast=text(lang, "wait"))
+            if op == "n":
+                return await self._start(merchant_id, user_id, lang, profile)
+            if state is None:
+                return self._expired(lang)
+            return await self._press(merchant_id, sid, state, lang, profile, op, arg)
+
+    @asynccontextmanager
+    async def _session_lock(self, merchant_id, sid):
+        key = self._key(merchant_id, "lock", sid)
+        token = secrets.token_hex(16)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + LOCK_WAIT_SECONDS
+        owned = bool(await self.redis.set(key, token, nx=True, ex=LOCK_SECONDS))
+        while not owned and loop.time() < deadline:
+            await asyncio.sleep(0.2)
+            owned = bool(await self.redis.set(key, token, nx=True, ex=LOCK_SECONDS))
+        try:
+            yield owned
+        finally:
+            if owned:
+                # Compare-and-delete: an expired lock taken over by another press stays its own.
+                await self.redis.eval(_RELEASE, 1, key, token)
 
     def _expired(self, lang) -> Screen:
         return Screen(text(lang, "session_expired"), [[self._button(lang, "new", "-", "n")]])
@@ -301,12 +354,14 @@ class TelegramCheckoutService:
                 merchant_id, sid, state, lang, profile, check=op == "k"
             )
         if op == "a":
-            index = int(arg or -1)
-            if not 0 <= index < len(profile.preset_amounts):
+            amount = next(
+                (a for a in profile.preset_amounts if arg.isdigit() and a * 100 == int(arg)), None
+            )
+            if amount is None:
                 screen = self._amount_screen(sid, lang, profile)
                 screen.toast = text(lang, "unavailable")
                 return screen
-            state.update(step="method", amount=str(profile.preset_amounts[index].quantize(CENT)))
+            state.update(step="method", amount=str(amount.quantize(CENT)))
             await self._save(merchant_id, sid, state, profile)
             return self._method_screen(sid, state, lang, profile)
         if op == "c" and profile.custom_amount:
@@ -317,12 +372,12 @@ class TelegramCheckoutService:
             )
             return self._custom_screen(sid, lang, profile)
         if op == "m" and state["amount"]:
-            index = int(arg or -1)
-            if not 0 <= index < len(profile.methods):
+            method = next((m for m in profile.methods if m.short_id == arg), None)
+            if method is None:
                 screen = self._method_screen(sid, state, lang, profile)
                 screen.toast = text(lang, "unavailable")
                 return screen
-            return await self._choose(merchant_id, sid, lang, profile, index)
+            return await self._choose(merchant_id, sid, state, lang, profile, method)
         if op == "b":
             await self.redis.delete(self._key(merchant_id, "input", state["uid"]))
             if state["step"] == "invoice" and state["amount"]:
@@ -364,8 +419,8 @@ class TelegramCheckoutService:
 
     def _amount_screen(self, sid, lang, profile) -> Screen:
         presets = [
-            {"text": usd(amount), "callback_data": callback(sid, f"a{index}")}
-            for index, amount in enumerate(profile.preset_amounts)
+            {"text": usd(amount), "callback_data": callback(sid, f"a{int(amount * 100)}")}
+            for amount in profile.preset_amounts
         ]
         rows = [presets[i : i + 3] for i in range(0, len(presets), 3)]
         if profile.custom_amount:
@@ -391,11 +446,11 @@ class TelegramCheckoutService:
     def _method_screen(self, sid, state, lang, profile, *, note: str | None = None) -> Screen:
         amount = Decimal(state["amount"])
         rows = []
-        for index, method in enumerate(profile.methods):
+        for method in profile.methods:
             label = method.label
             if method.surcharge_percent:
                 label += f" · +{method.surcharge_percent.normalize():f}% {text(lang, 'fee')}"
-            rows.append([{"text": label, "callback_data": callback(sid, f"m{index}")}])
+            rows.append([{"text": label, "callback_data": callback(sid, f"m{method.short_id}")}])
         rows.append([self._button(lang, "back", sid, "b"), self._button(lang, "cancel", sid, "x")])
         body = (
             f"{self._title(profile)}\n{text(lang, 'amount')}: <b>{usd(amount)}</b>\n\n"
@@ -405,33 +460,18 @@ class TelegramCheckoutService:
             body += f"\n\n<i>{note}</i>"
         return Screen(body, rows, toast=note)
 
-    async def _choose(self, merchant_id, sid, lang, profile, index) -> Screen:
-        lock = self._key(merchant_id, "lock", sid)
-        deadline = asyncio.get_running_loop().time() + LOCK_WAIT_SECONDS
-        while not await self.redis.set(lock, "1", nx=True, ex=LOCK_SECONDS):
-            if asyncio.get_running_loop().time() >= deadline:
-                return Screen(None, toast=text(lang, "wait"))
-            await asyncio.sleep(0.2)
+    async def _choose(self, merchant_id, sid, state, lang, profile, method) -> Screen:
+        """Runs under the session lock; the invoice id is stored before it is released."""
         try:
-            # A concurrent press may have issued the invoice while this one waited.
-            state = await self._load(merchant_id, sid)
-            if state is None:
-                return self._expired(lang)
-            if state["invoice"]:
-                return await self._invoice_screen(merchant_id, sid, state, lang, profile)
-            method = profile.methods[index]
-            try:
-                invoice_id = await self._issue(merchant_id, sid, state, profile, method)
-            except (AppException, RailError) as exc:
-                logger.warning("checkout invoice was not issued: %s", type(exc).__name__)
-                state["attempt"] += 1
-                await self._save(merchant_id, sid, state, profile)
-                return self._method_screen(sid, state, lang, profile, note=text(lang, "failed"))
-            state.update(step="invoice", invoice=str(invoice_id))
+            invoice_id = await self._issue(merchant_id, sid, state, profile, method)
+        except (AppException, RailError) as exc:
+            logger.warning("checkout invoice was not issued: %s", type(exc).__name__)
+            state["attempt"] += 1
             await self._save(merchant_id, sid, state, profile)
-            return await self._invoice_screen(merchant_id, sid, state, lang, profile)
-        finally:
-            await self.redis.delete(lock)
+            return self._method_screen(sid, state, lang, profile, note=text(lang, "failed"))
+        state.update(step="invoice", invoice=str(invoice_id))
+        await self._save(merchant_id, sid, state, profile)
+        return await self._invoice_screen(merchant_id, sid, state, lang, profile)
 
     async def _issue(self, merchant_id, sid, state, profile, method: CheckoutMethod) -> UUID:
         amount = Decimal(state["amount"])
@@ -598,63 +638,156 @@ class TelegramCheckoutService:
     def _method_label(profile, method_id: str) -> str:
         for method in profile.methods:
             if method.method == method_id:
-                return escape(method.label, quote=False)
+                return method.label
         return "provider"
 
     # --- credit feed ---
 
-    def _eligible(self, merchant_id: UUID):
+    def _eligible(self, merchant_id: UUID, legacy_products: list[str]):
+        """SQL twin of the checks in payment(): an unpayable row must never enter the feed."""
         meta = cast(Invoice.extra_data, JSONB)
+        user = meta["telegram_user_id"]
+        requested = meta["requested_amount"]
+        requested_value = case(
+            (
+                and_(
+                    func.jsonb_typeof(requested) == "string",
+                    requested.astext.op("~")(REQUESTED_PATTERN),
+                ),
+                cast(requested.astext, Numeric),
+            ),
+            else_=None,
+        )
+        is_checkout = func.coalesce(
+            and_(
+                func.jsonb_typeof(meta["checkout"]) == "boolean",
+                meta["checkout"].astext == "true",
+            ),
+            False,
+        )
+        legacy = (
+            and_(
+                is_checkout.is_(False),
+                func.jsonb_typeof(meta["product"]) == "string",
+                meta["product"].astext.in_(legacy_products),
+                Invoice.amount >= CENT,
+            )
+            if legacy_products
+            else false()
+        )
+        receipts = [
+            exists(
+                select(ProviderPaymentReceipt.id)
+                .join(
+                    ProviderPaymentObservation,
+                    ProviderPaymentObservation.id == ProviderPaymentReceipt.observation_id,
+                )
+                .join(
+                    ProviderSettlement,
+                    ProviderSettlement.observation_id == ProviderPaymentObservation.id,
+                )
+                .join(LedgerAsset, LedgerAsset.id == ProviderPaymentObservation.ledger_asset_id)
+                .where(
+                    ProviderPaymentReceipt.invoice_id == Invoice.id,
+                    ProviderPaymentReceipt.merchant_id == merchant_id,
+                    LedgerAsset.symbol == TOKEN,
+                )
+            )
+        ]
+        # The receipt endpoint shows chain receipts only while the chain gateway is on.
+        if get_settings().onchain_gateway_enabled:
+            receipts.append(
+                exists(
+                    select(OnchainReceipt.id)
+                    .join(LedgerAsset, LedgerAsset.id == OnchainReceipt.asset_id)
+                    .where(
+                        OnchainReceipt.invoice_id == Invoice.id,
+                        OnchainReceipt.merchant_id == merchant_id,
+                        LedgerAsset.symbol == TOKEN,
+                    )
+                )
+            )
         return and_(
             Invoice.merchant_id == merchant_id,
             Invoice.status == InvoiceStatus.CONFIRMED,
             Invoice.asset == TOKEN,
-            func.jsonb_typeof(meta["telegram_user_id"]) == "number",
+            func.jsonb_typeof(user) == "number",
+            user.astext.op("~")(USER_ID_PATTERN),
             or_(
-                meta["checkout"].astext == "true",
-                func.jsonb_typeof(meta["product"]) == "string",
+                and_(is_checkout, requested_value >= CENT, requested_value <= Invoice.amount),
+                legacy,
             ),
-            or_(
-                exists().where(
-                    ProviderPaymentReceipt.invoice_id == Invoice.id,
-                    ProviderPaymentReceipt.merchant_id == merchant_id,
-                ),
-                exists().where(
-                    OnchainReceipt.invoice_id == Invoice.id,
-                    OnchainReceipt.merchant_id == merchant_id,
-                ),
-            ),
+            or_(*receipts),
         )
 
-    async def payments(self, merchant_id: UUID, limit: int) -> list[dict]:
+    async def _legacy_products(self, merchant_id: UUID) -> list[str]:
+        profile = await self.get_profile(merchant_id)
+        return list(profile.legacy_products) if profile else []
+
+    async def payments(
+        self, merchant_id: UUID, limit: int, after: UUID | None = None
+    ) -> list[dict]:
+        """Oldest un-acknowledged payable items; `after` continues past a seen invoice."""
         self.provider.require_enabled(merchant_id)
-        async with self.factory() as session:
-            invoices = (
-                await session.scalars(
-                    select(Invoice)
-                    .where(
-                        self._eligible(merchant_id),
-                        ~exists().where(CheckoutPaymentAck.invoice_id == Invoice.id),
+        legacy = await self._legacy_products(merchant_id)
+        cursor = None
+        if after is not None:
+            async with self.factory() as session:
+                row = (
+                    await session.execute(
+                        select(Invoice.updated_at, Invoice.id).where(
+                            Invoice.id == after, Invoice.merchant_id == merchant_id
+                        )
                     )
-                    .order_by(Invoice.updated_at, Invoice.id)
-                    .limit(limit)
+                ).first()
+            if row is None:
+                raise ValidationError("Unknown feed cursor")
+            cursor = tuple(row)
+        items: list[dict] = []
+        # Defence in depth: a row payment() still rejects is skipped, never blocks newer ones.
+        for _ in range(FEED_SCAN_BATCHES):
+            statement = select(Invoice).where(
+                self._eligible(merchant_id, legacy),
+                ~exists().where(CheckoutPaymentAck.invoice_id == Invoice.id),
+            )
+            if cursor is not None:
+                statement = statement.where(tuple_(Invoice.updated_at, Invoice.id) > cursor)
+            async with self.factory() as session:
+                batch = (
+                    await session.scalars(
+                        statement.order_by(Invoice.updated_at, Invoice.id).limit(limit)
+                    )
+                ).all()
+            for invoice in batch:
+                cursor = (invoice.updated_at, invoice.id)
+                item = await self.payment(
+                    merchant_id, invoice.id, invoice=invoice, legacy_products=legacy
                 )
-            ).all()
-        items = []
-        for invoice in invoices:
-            item = await self.payment(merchant_id, invoice.id, invoice=invoice)
-            if item is not None:
-                items.append(item)
+                if item is not None:
+                    items.append(item)
+                    if len(items) == limit:
+                        return items
+            if len(batch) < limit:
+                break
         return items
 
     async def payment(
-        self, merchant_id: UUID, invoice_id: UUID, *, invoice: Invoice | None = None
+        self,
+        merchant_id: UUID,
+        invoice_id: UUID,
+        *,
+        invoice: Invoice | None = None,
+        legacy_products: list[str] | None = None,
     ) -> dict | None:
         """Credit instruction for a confirmed checkout invoice; None is never credited."""
+        if legacy_products is None:
+            legacy_products = await self._legacy_products(merchant_id)
         async with self.factory() as session:
             if invoice is None:
                 invoice = await session.scalar(
-                    select(Invoice).where(Invoice.id == invoice_id, self._eligible(merchant_id))
+                    select(Invoice).where(
+                        Invoice.id == invoice_id, self._eligible(merchant_id, legacy_products)
+                    )
                 )
             acked = await session.scalar(
                 select(exists().where(CheckoutPaymentAck.invoice_id == invoice_id))
@@ -663,19 +796,19 @@ class TelegramCheckoutService:
             return None
         meta = invoice.extra_data or {}
         user_id = meta.get("telegram_user_id")
-        if not isinstance(user_id, int) or isinstance(user_id, bool) or user_id <= 0:
+        if not isinstance(user_id, int) or isinstance(user_id, bool) or not 0 < user_id < 10**18:
             return None
-        try:
-            if meta.get("checkout") is True:
-                requested = Decimal(str(meta["requested_amount"]))
-            elif isinstance(meta.get("product"), str):
-                requested = invoice.amount
-            else:
+        if meta.get("checkout") is True:
+            raw = meta.get("requested_amount")
+            if not isinstance(raw, str) or not _REQUESTED.match(raw):
                 return None
-        except (KeyError, InvalidOperation):
+            requested = Decimal(raw)
+        elif meta.get("product") in legacy_products and isinstance(meta.get("product"), str):
+            requested = invoice.amount
+        else:
             return None
         # The customer pays the requested amount plus the surcharge, never less.
-        if not requested.is_finite() or requested <= 0 or requested > invoice.amount:
+        if requested < CENT or requested > invoice.amount:
             return None
         receipt = (await self.provider.receipt(merchant_id, invoice_id))["receipt"]
         if receipt is None or receipt["asset"] != TOKEN:
