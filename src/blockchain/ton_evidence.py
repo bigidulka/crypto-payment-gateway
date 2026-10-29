@@ -45,13 +45,22 @@ def successful(tx: dict, head: int, depth: int) -> bool:
         return False
     description = tx.get("description", {})
     message = tx.get("in_msg") or {}
-    if description.get("aborted") is not False or message.get("bounced") is True:
-        return False
     compute = description.get("compute_ph", {})
-    if compute and not (compute.get("success") is True and compute.get("exit_code") in (0, 1)):
-        # Native transfers to an uninitialized deposit wallet have no VM phase.
-        if not (compute.get("skipped") is True and tx.get("end_status") in ("uninit", "nonexist")):
-            return False
+    # Native transfers to an uninitialized deposit wallet have no VM phase; the
+    # node then reports the transaction as aborted although the credit landed.
+    credited_uninit = (
+        compute.get("skipped") is True
+        and compute.get("reason") == "no_state"
+        and tx.get("end_status") in ("uninit", "nonexist")
+    )
+    if message.get("bounced") is True or (
+        description.get("aborted") is not False and not credited_uninit
+    ):
+        return False
+    if compute and not credited_uninit and not (
+        compute.get("success") is True and compute.get("exit_code") in (0, 1)
+    ):
+        return False
     action = description.get("action")
     if action and (
         action.get("success") is not True

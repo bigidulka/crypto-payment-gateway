@@ -358,6 +358,19 @@ def test_ton_success_requires_execution_inclusion_and_no_bounce():
         dict(tx, in_msg={"bounced": True}),
     ]:
         assert not successful(modified, 70, 12)
+    # Mainnet shape of a gas top-up to a never-deployed deposit wallet.
+    uninit = dict(
+        tx,
+        end_status="uninit",
+        description={"aborted": True, "compute_ph": {"skipped": True, "reason": "no_state"}},
+    )
+    assert successful(uninit, 70, 12)
+    for modified in [
+        dict(uninit, end_status="active"),
+        dict(uninit, description={"aborted": True, "compute_ph": {"skipped": True, "reason": "no_gas"}}),
+        dict(uninit, in_msg={"bounced": True}),
+    ]:
+        assert not successful(modified, 70, 12)
 
 
 async def test_ton_jetton_requires_completed_destination_receipt():
