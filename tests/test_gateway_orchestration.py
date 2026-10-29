@@ -56,7 +56,7 @@ async def gateway(monkeypatch):
     async with engine.connect() as conn:
         assert (
             await conn.scalar(text("SELECT version_num FROM alembic_version"))
-            == "0016_liquidity_recognition"
+            == "0017_deposit_index_per_group"
         )
         assert await conn.scalar(text("SELECT current_database()")) == url.database
         role = (
@@ -936,3 +936,25 @@ async def test_provider_payment_verified_after_invoice_deadline_still_credits_on
     assert receipt["status"] == "CONFIRMED" and receipt["receipt"]["net"] == Decimal("97")
     balance = (await gateway.service.balances(gateway.merchant.id, gateway.rail_id))[0]
     assert balance["ledger_balance"] == Decimal("97")
+
+
+@pytest.mark.asyncio
+async def test_derivation_index_is_unique_per_chain_group_only(gateway):
+    from src.crypto.encryption import encrypt_secret
+    from src.db.models import DepositAddress
+
+    index = 2_000_000_000 - (uuid4().int % 1_000_000)
+    key = encrypt_secret("unit-key", get_settings().encryption_key.get_secret_value())
+
+    def address(group):
+        return DepositAddress(
+            address=f"{group}-{uuid4().hex}", encrypted_privkey=key, chain_group=group,
+            derivation_path=f"m/{group}/{index}", derivation_index=index,
+        )
+
+    async with gateway.factory() as session, session.begin():
+        session.add_all([address("evm"), address("ton"), address("solana")])
+    async with gateway.factory() as session:
+        with pytest.raises(DBAPIError):
+            async with session.begin():
+                session.add(address("ton"))

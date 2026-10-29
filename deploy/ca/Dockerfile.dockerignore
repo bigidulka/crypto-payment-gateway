@@ -44,6 +44,7 @@
 !alembic/versions/20261008_0014_settlement_receipt_binding.py
 !alembic/versions/20261008_0015_onchain_operations.py
 !alembic/versions/20261029_0016_liquidity_recognition.py
+!alembic/versions/20261029_0017_deposit_index_per_group.py
 !config/chains.toml
 !config/providers.toml
 !deploy/ca/gateway.runtime.lock

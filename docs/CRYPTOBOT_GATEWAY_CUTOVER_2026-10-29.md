@@ -25,3 +25,31 @@ Receipt: `~/Projects/_tmp/gateway-cutover-20261029/ACCEPTANCE.json`.
 Закрыть приём: убрать `ARBITRON_CRYPTOBOT_RAIL_ID`/вернуть старый образ PaymentBot возможно только вместе с
 возвратом `CRYPTO_BOT_TOKEN` из `pre-gateway-cutover-20261029`; ledger/квитанции/операции шлюза не удалять.
 Незавершённые payout-операции сначала сверить (`POST /v1/operations/{id}/reconcile`).
+
+## Этап 2: xRocket, TON, Solana, Telegram-кошельки (29.10.2026)
+
+### xRocket
+- Отдельное приложение xRocket Pay «Relaxed Violet» (Current API, JWT), включены только «Трансферы».
+  Подключено к платформенному мерчанту: rail `a35a0764-…`, активы USDT/TON, выплата — transfer владельцу.
+- Боты: метод `xrocket` (`GatewayXRocketPaymentMethod`, +3% сервиса), свой ключ учёта; manager выводит
+  xRocket-доход переводом в кошелёк xRocket владельца. Живой оплаты ещё не было.
+
+### TON / Solana
+- Шлюз: `ONCHAIN_GATEWAY_CHAINS` ограничивает новый путь квитанций сетями `ton,solana`; EVM остаётся на прежнем пути.
+- CA: тестовые devnet/testnet RPC заменены на mainnet; сгенерированы отдельные BIP-39 seed'ы (депозиты и
+  treasury для каждой сети) только в `/home/server/.config/gateway-ca/nonevm-mainnet-20261029` (600).
+  Стартовые блоки записаны, чтение mainnet и сканирование окна проверены.
+- TON-адаптер ограничивает частоту запросов (`TON_MIN_REQUEST_INTERVAL_SECONDS`), 429 повторяется безопасно;
+  mainnet-ключ toncenter можно добавить в `TON_API_KEY` позже.
+- **Не активировано:** `NON_EVM_ENABLED=false`, `ONCHAIN_GATEWAY_ENABLED=false`, воркер `worker-onchain` не запущен,
+  клиенты TON/Solana не видят. Сбор с депозитных адресов и выплаты требуют отдельных funder-кошельков с газом.
+
+Активация после согласованной живой оплаты:
+1. В `arbitron-payment-api.env` и `arbitron-payment-worker-onchain.env`: `NON_EVM_ENABLED=true`, `ONCHAIN_GATEWAY_ENABLED=true`.
+2. Пересоздать `api`, запустить профиль `onchain` (`worker-onchain`).
+3. Оплатить 1 USDT в TON и Solana через бота, проверить квитанцию и зачисление.
+
+### Telegram Wallet → Walt Pay
+- Wallet Pay с 28.09.2026 называется Walt Pay; адаптер уже на `pay.walt.io` и Store API 1.2.0.
+- Нужен ключ магазина после заявки и KYB в мерчант-портале Walt; API выплат нет, холд 48 ч.
+- Self-custodial Gram wallet merchant API не имеет; его пользователи платят on-chain через TON-путь.

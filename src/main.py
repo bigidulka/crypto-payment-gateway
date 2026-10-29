@@ -87,33 +87,28 @@ async def init_rpc_managers():
 
 
 async def sync_deposit_address_counter():
-    """Синхронизировать Redis счётчик с максимальным индексом в БД."""
+    """Raise each chain group's Redis counter past its highest stored index; never lower it."""
     from sqlalchemy import func, select
 
     from src.db.models import DepositAddress
     from src.db.session import get_session_factory
 
     try:
-        session_factory = get_session_factory()
-        async with session_factory() as session:
-            result = await session.execute(select(func.max(DepositAddress.derivation_index)))
-            max_index = result.scalar()
-
-        # Используем Redis пул вместо нового подключения
+        async with get_session_factory()() as session:
+            rows = (
+                await session.execute(
+                    select(DepositAddress.chain_group, func.max(DepositAddress.derivation_index))
+                    .group_by(DepositAddress.chain_group)
+                )
+            ).all()
         redis_client = await get_redis()
-
-        if max_index is not None:
-            # Устанавливаем счётчик на max_index + 1 (для следующего адреса)
-            await redis_client.set("deposit_address:next_index", max_index + 1)
-            logger.info(f"Redis deposit counter synced to {max_index + 1}")
-        else:
-            # Нет адресов в БД - начинаем с 0
-            current = await redis_client.get("deposit_address:next_index")
-            if current is None:
-                await redis_client.set("deposit_address:next_index", 0)
-                logger.info("Redis deposit counter initialized to 0")
-            else:
-                logger.info(f"Redis deposit counter already set to {current}")
+        for chain_group, max_index in rows:
+            key = f"deposit_address:{chain_group}:next_index"
+            # The allocator INCRs and uses value-1, so value max+1 yields max+1 next.
+            current = int(await redis_client.get(key) or 0)
+            if current < max_index + 1:
+                await redis_client.set(key, max_index + 1)
+                logger.info(f"Redis {chain_group} deposit counter raised to {max_index + 1}")
     except Exception as e:
         logger.error(f"Failed to sync deposit address counter: {e}")
 
