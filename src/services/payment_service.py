@@ -171,7 +171,7 @@ class PaymentService:
             raise ValidationError(f"Asset {token} is not supported on {chain}")
 
         from src.payments.policy import gateway_onchain_enabled
-        modern = gateway_onchain_enabled(invoice.merchant_id, self.settings)
+        modern = gateway_onchain_enabled(invoice.merchant_id, self.settings, chain)
         if (invoice.extra_data or {}).get("gateway_receipt_required") is True and not modern:
             raise ValidationError("On-chain payment is temporarily unavailable")
         if chain_config.chain_type != ChainType.EVM and not modern:

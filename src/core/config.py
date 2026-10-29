@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     ton_funder_private_key: SecretStr = Field(default="")
     onchain_payout_enabled: bool = False
     onchain_gateway_enabled: bool = False
+    # Comma list of chains on the receipt-ledger path; empty keeps every chain on it.
+    onchain_gateway_chains: str = ""
     onchain_rebroadcast_interval_seconds: int = Field(default=60, ge=15, le=3600)
     evm_treasury_private_key: SecretStr = Field(default="")
     solana_treasury_private_key: SecretStr = Field(default="")
