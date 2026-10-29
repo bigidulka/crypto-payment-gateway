@@ -393,3 +393,11 @@ class WithdrawResponse(BaseModel):
     to_address: str
     message: str | None = None
     explorer_url: str | None = None
+    outcome: Literal["sent", "rejected", "unknown"] = Field(
+        "unknown",
+        description=(
+            "sent: broadcast, tx_hash set; rejected: refused before any broadcast "
+            "attempt, nothing left the treasury; unknown: a broadcast may have "
+            "happened, reconcile on-chain before retrying or refunding"
+        ),
+    )

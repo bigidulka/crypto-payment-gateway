@@ -1525,6 +1525,7 @@ async def withdraw_from_treasury(
             amount=request.amount,
             to_address=request.to_address,
             message=f"Invalid amount: {e}",
+            outcome="rejected",
         )
     
     # Получаем конфиг сети
@@ -1538,6 +1539,7 @@ async def withdraw_from_treasury(
             amount=request.amount,
             to_address=request.to_address,
             message=f"Unknown chain: {chain}. Supported: base, arbitrum, bsc, polygon, avax, optimism, solana, ton",
+            outcome="rejected",
         )
     
     # EVM chains
@@ -1560,6 +1562,7 @@ async def withdraw_from_treasury(
             amount=request.amount,
             to_address=request.to_address,
             message="Solana withdraw not implemented yet",
+            outcome="rejected",
         )
     
     # TON
@@ -1571,6 +1574,7 @@ async def withdraw_from_treasury(
             amount=request.amount,
             to_address=request.to_address,
             message="TON withdraw not implemented yet",
+            outcome="rejected",
         )
     
     return WithdrawResponse(
@@ -1580,6 +1584,7 @@ async def withdraw_from_treasury(
         amount=request.amount,
         to_address=request.to_address,
         message=f"Unsupported chain type: {config.chain_type}",
+        outcome="rejected",
     )
 
 
@@ -1607,6 +1612,7 @@ async def _withdraw_evm(
             amount=str(amount),
             to_address=to_address,
             message="FUNDER_PRIVATE_KEY not configured",
+            outcome="rejected",
         )
     
     try:
@@ -1630,6 +1636,7 @@ async def _withdraw_evm(
                     amount=str(amount),
                     to_address=to_address,
                     message=f"Successfully sent {amount} {config.native_symbol}",
+                    outcome="sent",
                     explorer_url=config.get_explorer_tx_url(tx_hash),
                 )
             else:
@@ -1640,6 +1647,7 @@ async def _withdraw_evm(
                     amount=str(amount),
                     to_address=to_address,
                     message="Transaction failed",
+                    outcome="unknown",
                 )
         
         # ERC20 токен
@@ -1654,6 +1662,7 @@ async def _withdraw_evm(
                     amount=str(amount),
                     to_address=to_address,
                     message=f"Token {token} not found on {chain}. Available: {available_tokens}",
+                    outcome="rejected",
                 )
             
             # Конвертируем в raw amount
@@ -1675,6 +1684,7 @@ async def _withdraw_evm(
                     amount=str(amount),
                     to_address=to_address,
                     message=f"Successfully sent {amount} {token}",
+                    outcome="sent",
                     explorer_url=config.get_explorer_tx_url(tx_hash),
                 )
             else:
@@ -1685,6 +1695,7 @@ async def _withdraw_evm(
                     amount=str(amount),
                     to_address=to_address,
                     message="Transaction failed - check gas balance",
+                    outcome="unknown",
                 )
                 
     except Exception as e:
@@ -1695,6 +1706,7 @@ async def _withdraw_evm(
             amount=str(amount),
             to_address=to_address,
             message=f"Error: {str(e)}",
+            outcome="unknown",
         )
 
 
