@@ -1,0 +1,16 @@
+{
+  "source": "Reviewed application tree of codex/gateway-separation-20261028 imported onto the CA release ancestry",
+  "intentional_changes": [
+    "Pinned Python 3.12.15 base with the exact resolved packages of the five existing roles",
+    "Explicit application-source allowlist and UID1000; external configuration and native state",
+    "Scoped CA profiles; limited database role retained and new internal Redis credential required",
+    "Application source replaced by the reviewed gateway-separation tree (migrations 0011-0016)",
+    "Image carries config/providers.toml and Alembic files for an external owner-role migration one-off",
+    "Optional providers profile runs the read-only provider reconciliation worker",
+    "Runtime lock adds solders, tonsdk and jsonalias for TON/Solana; optional onchain profile"
+  ],
+  "source_credential_literal_scan": "PASS_ALL_APPLICATION_MODULES_AND_STATIC_CONFIG",
+  "protected_configuration": "Outside Git, image and source manifest",
+  "application_source_commit": "c9ed7fe",
+  "previous_runtime_base": "58dc6db9399ef5a177fe47eabf2751c86cab0fc8"
+}
