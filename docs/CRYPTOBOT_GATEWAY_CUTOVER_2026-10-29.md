@@ -41,13 +41,16 @@ Receipt: `~/Projects/_tmp/gateway-cutover-20261029/ACCEPTANCE.json`.
   Стартовые блоки записаны, чтение mainnet и сканирование окна проверены.
 - TON-адаптер ограничивает частоту запросов (`TON_MIN_REQUEST_INTERVAL_SECONDS`), 429 повторяется безопасно;
   mainnet-ключ toncenter можно добавить в `TON_API_KEY` позже.
-- **Не активировано:** `NON_EVM_ENABLED=false`, `ONCHAIN_GATEWAY_ENABLED=false`, воркер `worker-onchain` не запущен,
-  клиенты TON/Solana не видят. Сбор с депозитных адресов и выплаты требуют отдельных funder-кошельков с газом.
-
-Активация после согласованной живой оплаты:
-1. В `arbitron-payment-api.env` и `arbitron-payment-worker-onchain.env`: `NON_EVM_ENABLED=true`, `ONCHAIN_GATEWAY_ENABLED=true`.
-2. Пересоздать `api`, запустить профиль `onchain` (`worker-onchain`).
-3. Оплатить 1 USDT в TON и Solana через бота, проверить квитанцию и зачисление.
+- **Активировано 29.10.2026 после живой проверки:** `NON_EVM_ENABLED=true`, `ONCHAIN_GATEWAY_ENABLED=true`,
+  `ONCHAIN_GATEWAY_CHAINS=ton,solana`, `worker-onchain` запущен; выплаты (`ONCHAIN_PAYOUT_ENABLED`) выключены.
+- Живая приёмка: средства с `main4` (Ethereum) забриджены Relay/Symbiosis на одноразовые кошельки;
+  в `@test_t2m_bot` оплачено по 1.00 USDT в TON (jetton) и Solana (SPL) → сессии `paid`, счета `CONFIRMED`,
+  `onchain_receipts` по 1000000, бот зачислил 1.00 в `arbitron:ton:USDT` и `arbitron:solana:USDT` и уведомил.
+- Исправлено по ходу: уникальность индекса депозитного адреса теперь в пределах группы сетей (миграция 0017),
+  счётчик Redis синхронизируется по группам; нулевой нативный баланс депозита больше не роняет sweep.
+- Сбор с депозитных адресов ждёт отдельных funder-ключей (`TON_FUNDER_PRIVATE_KEY`, `SOLANA_FUNDER_PRIVATE_KEY`)
+  с газом: задачи в `pending_gas / separate_gas_funder_required`, средства на депозитах.
+- UX: депозитный TON-адрес бот показывает в raw-форме `0:…`; удобнее показывать `UQ…`.
 
 ### Telegram Wallet → Walt Pay
 - Wallet Pay с 28.09.2026 называется Walt Pay; адаптер уже на `pay.walt.io` и Store API 1.2.0.
