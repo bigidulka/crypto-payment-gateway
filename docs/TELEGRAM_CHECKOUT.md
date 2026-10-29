@@ -86,3 +86,10 @@ async def topup(query: CallbackQuery):
    `checkout_payment_acks`.
 3. Нужен Redis (`REDIS_URL`) — состояние меню и блокировки.
 4. `PUT /v1/checkout/profile` для мерчанта, затем подключение бота как выше.
+
+## Артефакт SDK
+
+`sdk/python/dist/arbitron_sdk-0.4.0-py3-none-any.whl` (не в git), собран
+`SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) uv build --wheel --out-dir dist .`
+из коммита `9eb8a8b`; сборка воспроизводима.
+sha256 `35c128cd835a19b27692845bafdbb5323d1c5cc0f7051501c840c3b20e06df6c`.
