@@ -594,3 +594,18 @@ async def test_unfunded_deposit_waits_for_a_separate_gas_funder(gateway, monkeyp
         assert stored.last_error == "separate_gas_funder_required"
         assert stored.state == SweepState.PENDING_GAS
     adapter.submit.assert_not_called()
+
+
+async def test_emptied_treasury_quotes_a_verified_zero(gateway, monkeypatch):
+    await setup_chain(gateway, monkeypatch, symbol="USDC")
+    adapter = AsyncMock()
+    adapter.normalize_address = lambda x: x
+    adapter.get_token_balance.return_value = Decimal("0.000000")
+    # Ample gas above any SOL other isolated tests left owed to merchants.
+    adapter.get_native_balance.return_value = Decimal("1000000")
+    async with gateway.factory() as session:
+        quote = await OnchainGatewayService(session).balance(
+            gateway.merchant.id, "solana", "USDC", adapter
+        )
+    assert quote["reason"] is None and quote["wallet_atomic"] == "0"
+    assert Decimal(quote["available"]) == 0

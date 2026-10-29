@@ -220,7 +220,8 @@ class OnchainGatewayService:
                     if asset.canonical_identifier
                     else await adapter.get_native_balance(address)
                 )
-                wallet = decimal_to_atomic(value, asset.atomic_decimals)
+                # An emptied treasury is a verified zero, not an unreadable balance.
+                wallet = decimal_to_atomic(value, asset.atomic_decimals, allow_zero=True)
                 available = max(0, min(own - reserved, wallet - others - reserved))
                 reason = None
                 config = get_chain_config(chain)
@@ -234,7 +235,9 @@ class OnchainGatewayService:
                     wallet
                     if asset.is_native
                     else decimal_to_atomic(
-                        await adapter.get_native_balance(address), config.native_decimals
+                        await adapter.get_native_balance(address),
+                        config.native_decimals,
+                        allow_zero=True,
                     )
                 )
                 gas_liquid = max(0, native_wallet - native_owed)
