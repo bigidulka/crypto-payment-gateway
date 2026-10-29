@@ -216,8 +216,9 @@ async def sweep_once(factory):
                         job.state = SweepState.SWEEPING
                     await session.commit()
                     continue
+                # A fresh deposit address legitimately holds no native coin yet.
                 balance = decimal_to_atomic(
-                    await adapter.get_native_balance(sender), config.native_decimals
+                    await adapter.get_native_balance(sender), config.native_decimals, allow_zero=True
                 )
                 if config.chain_type == ChainType.TON:
                     gas = decimal_to_atomic(Decimal(settings.ton_deposit_gas_budget), 9)

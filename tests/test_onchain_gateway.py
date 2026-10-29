@@ -564,3 +564,33 @@ def test_staged_chain_list_keeps_other_chains_on_their_current_path(monkeypatch)
         assert gateway_onchain_enabled(merchant, chain="bsc")
     finally:
         get_settings.cache_clear()
+
+
+async def test_unfunded_deposit_waits_for_a_separate_gas_funder(gateway, monkeypatch):
+    invoice, sender, treasury = await setup_chain(gateway, monkeypatch, symbol="USDC")
+    monkeypatch.setenv("SOLANA_FUNDER_PRIVATE_KEY", "")
+    monkeypatch.setenv("FUNDER_PRIVATE_KEY", "")
+    get_settings.cache_clear()
+    async with gateway.factory() as session, session.begin():
+        await OnchainGatewayService(session).consume_event(transfer(sender, "100", "unfunded"))
+        payment = await session.scalar(
+            select(PaymentSession).where(PaymentSession.invoice_id == invoice.id)
+        )
+        session.add(OnchainScanCursor(session_id=payment.id, chain="solana", last_block=20))
+        job = await session.scalar(
+            select(UnifiedSweepJob).where(UnifiedSweepJob.source_id == payment.id)
+        )
+    adapter = AsyncMock()
+    adapter.normalize_address = lambda x: x
+    adapter.get_native_balance.return_value = Decimal("0")
+    adapter.estimate_transfer_fee.return_value = type("Fee", (), {"estimated_fee_raw": 5000})()
+    adapter.native_rent_reserve.return_value = 2039280
+    monkeypatch.setattr("src.workers.onchain_gateway.adapter_for", lambda _: adapter)
+    from src.workers.onchain_gateway import sweep_once
+
+    await sweep_once(gateway.factory)
+    async with gateway.factory() as session:
+        stored = await session.get(UnifiedSweepJob, job.id)
+        assert stored.last_error == "separate_gas_funder_required"
+        assert stored.state == SweepState.PENDING_GAS
+    adapter.submit.assert_not_called()
