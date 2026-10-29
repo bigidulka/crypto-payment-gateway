@@ -53,7 +53,10 @@ class Settings(BaseSettings):
     ton_rpc_url: str = "https://toncenter.com/api/v2"
     ton_index_url: str = "https://toncenter.com/api/v3"
     ton_wallet_version: Literal["v3r2", "v4r2"] = "v3r2"
-    ton_workchain: Literal[0, -1] = 0
+    # Environment values arrive as text; only the basechain and masterchain are valid.
+    ton_workchain: int = Field(default=0, ge=-1, le=0)
+    # Keyless toncenter allows about one request per second; a key raises the limit.
+    ton_min_request_interval_seconds: float = Field(default=1.1, ge=0, le=10)
     ton_jetton_attach_amount: str = "0.05"
     ton_forward_amount: str = "0.000000001"
     non_evm_enabled: bool = False

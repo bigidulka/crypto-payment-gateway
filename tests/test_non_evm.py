@@ -525,3 +525,32 @@ class TestBaseAdapter:
 
         # 9 decimals
         assert adapter.to_raw_amount(Decimal("1"), 9) == 1_000_000_000
+
+
+async def test_ton_requests_are_paced_and_retry_only_rejected_rate_limits(monkeypatch):
+    import httpx
+
+    from src.blockchain import ton_adapter as module
+    from src.core.config import get_settings
+
+    monkeypatch.setenv("NON_EVM_ENABLED", "true")
+    monkeypatch.setenv("TON_MIN_REQUEST_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("TON_WORKCHAIN", "0")
+    get_settings.cache_clear()
+    try:
+        assert get_settings().ton_workchain == 0
+        calls = []
+
+        def handler(request):
+            calls.append(request.url.path)
+            if len(calls) == 1:
+                return httpx.Response(429, json={"ok": False})
+            return httpx.Response(200, json={"ok": True, "result": {"last": {"seqno": 7}}})
+
+        adapter = module.TonAdapter("ton", rpc_url="https://ton.invalid/api/v2", api_key="")
+        adapter._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        assert await adapter._api_call("getMasterchainInfo") == {"last": {"seqno": 7}}
+        assert len(calls) == 2
+        await adapter.close()
+    finally:
+        get_settings.cache_clear()
