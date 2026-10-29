@@ -155,3 +155,10 @@
 !src/workers/unified_sweeper.py
 !src/workers/unified_sweeper_runner.py
 !src/workers/webhook_dispatcher.py
+!src/api/checkout
+!src/api/checkout/__init__.py
+!src/api/checkout/router.py
+!src/services/telegram_checkout_service.py
+!src/payments/telegram_texts.py
+!src/db/models/checkout.py
+!alembic/versions/20261029_0018_telegram_checkout.py
