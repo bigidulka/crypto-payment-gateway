@@ -1,5 +1,7 @@
 """TON receive/send using real wallet BOCs and completed canonical jetton traces."""
 
+import asyncio
+import time
 import base64
 from decimal import Decimal
 
@@ -26,6 +28,11 @@ from src.blockchain.ton_keys import normalize_ton_address, wallet_from_seed
 from src.core.config import get_settings
 from src.ledger.amounts import atomic_to_decimal, decimal_to_atomic
 
+
+
+_pace_lock = asyncio.Lock()
+_last_request_at = 0.0
+_RATE_LIMIT_RETRIES = 3
 
 class TonAdapter(BaseAdapter[ChainConfig]):
     def __init__(
@@ -59,14 +66,31 @@ class TonAdapter(BaseAdapter[ChainConfig]):
     def address_length(self):
         return 66
 
+    async def _paced(self, send):
+        # One process-wide pace for the shared provider limit; a 429 is rejected
+        # before processing, so retrying it never repeats an executed request.
+        global _last_request_at
+        for attempt in range(_RATE_LIMIT_RETRIES + 1):
+            async with _pace_lock:
+                wait = _last_request_at + self.settings.ton_min_request_interval_seconds - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                _last_request_at = time.monotonic()
+            response = await send()
+            if response.status_code != 429 or attempt == _RATE_LIMIT_RETRIES:
+                return response
+            await asyncio.sleep(self.settings.ton_min_request_interval_seconds * (attempt + 2))
+
     async def _request(self, method: str, path: str, params=None, *, index=False, body=None):
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(timeout=30, follow_redirects=False)
         url = self.index_url if index else self.rpc_url
         headers = {"X-API-Key": self.api_key} if self.api_key else {}
         try:
-            response = await self._client.request(
-                method, f"{url}/{path}", params=params, json=body, headers=headers
+            response = await self._paced(
+                lambda: self._client.request(
+                    method, f"{url}/{path}", params=params, json=body, headers=headers
+                )
             )
             response.raise_for_status()
             data = response.json()
