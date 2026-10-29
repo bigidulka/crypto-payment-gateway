@@ -110,3 +110,15 @@ services:
         format: raw
     healthcheck:
       disable: true
+
+  # Non-EVM receipt scanning per payment session (TON/Solana); payouts stay
+  # behind ONCHAIN_PAYOUT_ENABLED and gas funding needs separate funder keys.
+  worker-onchain:
+    <<: *runtime
+    profiles: [onchain]
+    command: [python, -m, src.workers.onchain_gateway]
+    env_file:
+      - path: ${GATEWAY_CONFIG_DIR:-/home/server/.config/gateway-ca}/arbitron-payment-worker-onchain.env
+        format: raw
+    healthcheck:
+      disable: true

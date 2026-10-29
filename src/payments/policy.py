@@ -7,10 +7,14 @@ from pathlib import Path
 CUSTODIAL_RAIL_TYPES = frozenset({"cryptobot", "xrocket", "tgwallet"})
 
 
-def gateway_onchain_enabled(merchant_id, settings=None):
+def gateway_onchain_enabled(merchant_id, settings=None, chain=None):
     from src.core.config import get_settings
 
     settings = settings or get_settings()
+    chains = {item.strip() for item in settings.onchain_gateway_chains.split(",") if item.strip()}
+    # A staged rollout keeps the other chains of the merchant on their current path.
+    if chain is not None and chains and chain not in chains:
+        return False
     return (
         settings.onchain_gateway_enabled
         and settings.ledger_rail_orchestration_enabled

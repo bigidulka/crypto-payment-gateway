@@ -542,3 +542,25 @@ async def test_enrolment_detection_is_compatible_with_the_0011_schema():
             assert not await has_onchain_scan_schema(session)
     finally:
         await engine.dispose()
+
+
+def test_staged_chain_list_keeps_other_chains_on_their_current_path(monkeypatch):
+    from src.payments.policy import gateway_onchain_enabled
+
+    merchant = uuid4()
+    monkeypatch.setenv("ONCHAIN_GATEWAY_ENABLED", "true")
+    monkeypatch.setenv("LEDGER_RAIL_ORCHESTRATION_ENABLED", "true")
+    monkeypatch.setenv("LEDGER_RAIL_ORCHESTRATION_MERCHANTS", str(merchant))
+    monkeypatch.setenv("ONCHAIN_GATEWAY_CHAINS", "ton, solana")
+    get_settings.cache_clear()
+    try:
+        assert gateway_onchain_enabled(merchant, chain="solana")
+        assert gateway_onchain_enabled(merchant, chain="ton")
+        assert not gateway_onchain_enabled(merchant, chain="bsc")
+        # Merchant-wide checks without a chain keep their previous meaning.
+        assert gateway_onchain_enabled(merchant)
+        monkeypatch.setenv("ONCHAIN_GATEWAY_CHAINS", "")
+        get_settings.cache_clear()
+        assert gateway_onchain_enabled(merchant, chain="bsc")
+    finally:
+        get_settings.cache_clear()
