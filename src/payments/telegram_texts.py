@@ -27,6 +27,12 @@ TEXTS = {
             "Less is not credited; anything above the amount is credited too. "
             "Leave the comment / memo empty."
         ),
+        "onchain_note_evm": (
+            "Send exactly this amount of {token} on {network}. "
+            "The network fee is on you — if an exchange deducts a withdrawal fee, add it on top. "
+            "A small shortfall within the network tolerance is credited as received; a larger one is not credited. "
+            "Anything above the amount is credited too."
+        ),
         "onchain_auto": "The balance is credited automatically after network confirmation.",
         "underpaid": "Received {received} of {amount} {token}. Send the remaining {missing} {token}.",
         "wrong_token": "A {got} transfer arrived instead of {token}; it is not credited. Contact support.",
@@ -69,6 +75,12 @@ TEXTS = {
             "Комиссия сети — за ваш счёт: если биржа удерживает комиссию за вывод, добавьте её сверху. "
             "Меньшая сумма не зачисляется, излишек тоже зачисляется. "
             "Комментарий / memo оставьте пустым."
+        ),
+        "onchain_note_evm": (
+            "Отправьте ровно эту сумму {token} в сети {network}. "
+            "Комиссия сети — за ваш счёт: если биржа удерживает комиссию за вывод, добавьте её сверху. "
+            "Небольшая недостача в пределах допуска зачисляется по факту поступления, большая не зачисляется. "
+            "Излишек тоже зачисляется."
         ),
         "onchain_auto": "Баланс пополнится автоматически после подтверждения в сети.",
         "underpaid": "Получено {received} из {amount} {token}. Доплатите {missing} {token}.",

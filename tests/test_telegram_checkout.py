@@ -571,13 +571,14 @@ async def test_evm_methods_screens_and_poller_evidence_feed(gateway, checkout, m
         assert result.status_code == 200, result.text
         return result.json()["items"]
 
-    # Tolerated underpayment: the poller confirms it, the feed never credits it.
+    # A shortfall the poller tolerates is credited as received.
     short_screen, short = await issue("USDT · BNB")
     assert (
         "BNB Smart Chain" in short_screen["text"]
         and "<code>10.00</code> USDT" in short_screen["text"]
     )
-    await evm_pay(gateway, short.id, ["9.99"])
+    await evm_pay(gateway, short.id, ["9.95"])
+    assert "credited as received" in short_screen["text"]
     # Wrong token contract on the session's address: never credited.
     _, wrong = await issue("USDT · BNB", user=USER + 1)
     usdc = "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"
@@ -592,16 +593,21 @@ async def test_evm_methods_screens_and_poller_evidence_feed(gateway, checkout, m
     for invoice in (short, wrong, split, good):
         async with gateway.factory() as session:
             assert (await session.get(Invoice, invoice.id)).status == InvoiceStatus.CONFIRMED
+    [tolerated] = await feed("?limit=1")
+    assert tolerated["invoice_id"] == str(short.id) and tolerated["credit_amount"] == "9.95"
+    assert (await http.post(f"/v1/checkout/payments/{short.id}/ack")).status_code == 200
+    # The excluded rows between them never block the next payable one.
     [item] = await feed("?limit=1")
     assert item["invoice_id"] == str(good.id) and item["telegram_user_id"] == USER + 3
     assert item["credit_amount"] == "25.01" and item["method"] == "base"
     assert item["network"] == "base" and Decimal(item["gross"]) == Decimal("25.019")
     assert item["external_id"] == f"gateway-{good.id}"
-    for bad in (short, wrong, split):
+    for bad in (wrong, split):
         assert (await http.get(f"/v1/checkout/payments/{bad.id}")).status_code == 404
         assert (await http.post(f"/v1/checkout/payments/{bad.id}/ack")).status_code == 404
     assert (await http.post(f"/v1/checkout/payments/{good.id}/ack")).status_code == 200
     assert await feed() == []
+    assert (await http.get(f"/v1/checkout/payments/{short.id}")).json()["acked"] is True
 
 
 async def test_sdk_connector_end_to_end_over_http(gateway, checkout):

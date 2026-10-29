@@ -648,7 +648,12 @@ class TelegramCheckoutService:
                 "",
                 "<i>"
                 + text(
-                    lang, "onchain_note", token=invoice.asset, network=escape(network, quote=False)
+                    lang,
+                    "onchain_note"
+                    if get_chain_config(session_row.chain).chain_type != ChainType.EVM
+                    else "onchain_note_evm",
+                    token=invoice.asset,
+                    network=escape(network, quote=False),
                 )
                 + "</i>",
                 text(lang, "onchain_auto"),
@@ -763,7 +768,8 @@ class TelegramCheckoutService:
                     )
                 )
             )
-        receipts.append(self._evm_evidence_sql())
+        requested_amount = case((is_checkout, requested_value), else_=Invoice.amount)
+        receipts.append(self._evm_evidence_sql(requested_amount))
         return and_(
             Invoice.merchant_id == merchant_id,
             Invoice.status == InvoiceStatus.CONFIRMED,
@@ -789,7 +795,7 @@ class TelegramCheckoutService:
                     result.append((chain, token, asset.contract_address.lower()))
         return result
 
-    def _evm_evidence_sql(self):
+    def _evm_evidence_sql(self, requested_amount):
         """SQL twin of _evm_evidence(): the legacy EVM poller path, which writes no receipt."""
         confirmed_sum = (
             select(func.sum(OnchainTx.amount))
@@ -825,14 +831,15 @@ class TelegramCheckoutService:
                     PaymentSession.status == PaymentSessionStatus.PAID,
                     PaymentSession.token == Invoice.asset,
                     or_(*assets) if assets else false(),
-                    PaymentSession.received_amount >= Invoice.amount,
+                    # A shortfall the poller tolerated reduces the credit; it stays positive.
+                    requested_amount + PaymentSession.received_amount - Invoice.amount >= CENT,
                     PaymentSession.received_amount == confirmed_sum,
                 )
             ),
         )
 
     async def _evm_evidence(self, invoice: Invoice) -> tuple[str, Decimal] | None:
-        """(chain, received) when the EVM poller confirmed exactly this invoice in full."""
+        """(chain, received) when the EVM poller confirmed this invoice; a tolerated shortfall is included."""
         async with self.factory() as session:
             if await session.scalar(
                 select(
@@ -863,7 +870,7 @@ class TelegramCheckoutService:
             or payment.token != invoice.asset
             or any(tx.token_contract != contract for tx in txs)
             or received is None
-            or received < invoice.amount
+            or received <= 0
             or not confirmed
             or sum(confirmed, Decimal(0)) != received
         ):
