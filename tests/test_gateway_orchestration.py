@@ -57,7 +57,7 @@ async def gateway(monkeypatch):
     async with engine.connect() as conn:
         assert (
             await conn.scalar(text("SELECT version_num FROM alembic_version"))
-            == "0017_deposit_index_per_group"
+            == "0018_telegram_checkout"
         )
         assert await conn.scalar(text("SELECT current_database()")) == url.database
         role = (

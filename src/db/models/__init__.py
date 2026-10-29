@@ -108,3 +108,4 @@ __all__ = [
 ]
 
 from src.db.models.onchain_gateway import OnchainOperation, OnchainReceipt, OnchainScanCursor
+from src.db.models.checkout import CheckoutPaymentAck, CheckoutProfile

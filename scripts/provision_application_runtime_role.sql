@@ -108,7 +108,14 @@ WHERE n.nspname='public' AND c.relkind='r' AND c.relname=ANY(ARRAY[
     'provider_verification_decisions','provider_payment_receipts',
     'provider_payment_recipient_intents','provider_settlements',
     'onchain_operations','onchain_receipts','onchain_scan_cursors','gateway_rail_connections','gateway_invoice_options','gateway_operations',
-    'gateway_payout_receipts','gateway_liquidity_recognitions'])
+    'gateway_payout_receipts','gateway_liquidity_recognitions','checkout_profiles'])
+\gexec
+
+-- Credit acknowledgements are append-only: the runtime never rewrites them.
+SELECT format('GRANT SELECT, INSERT ON TABLE public.%I TO %I',
+    c.relname, current_setting('application.runtime_role'))
+FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+WHERE n.nspname='public' AND c.relkind='r' AND c.relname='checkout_payment_acks'
 \gexec
 
 DO $$
@@ -142,7 +149,7 @@ BEGIN
                'provider_payment_receipts', 'provider_payment_recipient_intents',
                'provider_settlements', 'onchain_operations','onchain_receipts','onchain_scan_cursors','gateway_rail_connections',
                'gateway_invoice_options', 'gateway_operations', 'gateway_payout_receipts',
-               'gateway_liquidity_recognitions'
+               'gateway_liquidity_recognitions', 'checkout_profiles', 'checkout_payment_acks'
            ])
              AND has_table_privilege(runtime_name, relation.oid, 'TRUNCATE')
        )

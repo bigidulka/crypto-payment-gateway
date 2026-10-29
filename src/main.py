@@ -156,6 +156,8 @@ def create_app() -> FastAPI:
     from src.api.onchain.router import router as onchain_router
     app.include_router(onchain_router, prefix="/v1", tags=["On-chain payments"])
     app.include_router(providers_router, prefix="/v1", tags=["Provider payments"])
+    from src.api.checkout.router import router as checkout_router
+    app.include_router(checkout_router, prefix="/v1", tags=["Telegram checkout"])
     app.include_router(provider_public_router, tags=["Hosted provider payments"])
 
     app.include_router(

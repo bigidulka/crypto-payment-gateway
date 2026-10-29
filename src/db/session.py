@@ -57,6 +57,8 @@ def get_engine() -> AsyncEngine:
 
 
 _RUNTIME_PROTECTED_TABLES = (
+    "checkout_profiles",
+    "checkout_payment_acks",
     "onchain_scan_cursors",
     "onchain_receipts",
     "onchain_operations",
