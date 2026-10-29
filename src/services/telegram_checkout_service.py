@@ -25,7 +25,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from sqlalchemy import Numeric, and_, case, cast, exists, false, func, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import JSONB, insert
 
-from src.blockchain.chains import get_chain_config, is_chain_supported
+from src.blockchain.chains import (
+    ChainType,
+    get_chain_config,
+    get_evm_chains,
+    is_chain_supported,
+)
 from src.core.config import get_settings
 from src.core.exceptions import AppException, ValidationError
 from src.db.models import (
@@ -38,11 +43,14 @@ from src.db.models import (
     InvoiceStatus,
     LedgerAsset,
     Merchant,
+    OnchainTx,
     PaymentSession,
+    PaymentSessionStatus,
     ProviderPaymentObservation,
     ProviderPaymentReceipt,
     ProviderSettlement,
     Rail,
+    TxStatus,
 )
 from src.db.models.onchain_gateway import OnchainReceipt
 from src.payments.policy import gateway_onchain_enabled
@@ -54,8 +62,16 @@ from src.services.invoice_service import InvoiceService
 logger = logging.getLogger(__name__)
 
 TOKEN = "USDT"
+# Stablecoins settled 1:1 as the profile's USD.
+ASSETS = ("USDT", "USDC")
 CURRENCY = "USD"
 CHAINS = ("ton", "solana")
+
+
+def checkout_chains() -> tuple[str, ...]:
+    return CHAINS + tuple(get_evm_chains())
+
+
 CENT = Decimal("0.01")
 CALLBACK_PREFIX = "ap:"
 CALLBACK_MAX_BYTES = 64
@@ -65,7 +81,7 @@ POLL_THROTTLE_SECONDS = 5
 LOCK_SECONDS = 120
 LOCK_WAIT_SECONDS = 8.0
 FEED_SCAN_BATCHES = 10
-_CALLBACK = re.compile(r"^ap:([A-Za-z0-9_-]{1,16}|-):([a-z])([0-9a-z]{0,10})$")
+_CALLBACK = re.compile(r"^ap:([A-Za-z0-9_-]{1,16}|-):([a-z])([0-9a-z]{0,16})$")
 _AMOUNT = re.compile(r"^[0-9]{1,7}(\.[0-9]{1,2})?$")
 REQUESTED_PATTERN = r"^[0-9]{1,9}(\.[0-9]{1,2})?$"
 USER_ID_PATTERN = r"^[1-9][0-9]{0,17}$"
@@ -86,6 +102,8 @@ class CheckoutMethod(BaseModel):
     method: str = Field(min_length=1, max_length=64)
     label: str = Field(min_length=1, max_length=32)
     surcharge_percent: Decimal = Field(default=Decimal(0), ge=0, le=50, decimal_places=2)
+    # Chain methods only; provider rails settle in USDT.
+    token: Literal["USDT", "USDC"] = TOKEN
 
     @field_validator("surcharge_percent", mode="before")
     @classmethod
@@ -96,21 +114,29 @@ class CheckoutMethod(BaseModel):
     @classmethod
     def method_identity(cls, value):
         value = value.strip().lower()
-        if value in CHAINS:
+        if value in checkout_chains():
             return value
         try:
             return str(UUID(value))
         except ValueError:
-            raise ValueError("method must be a provider rail id or one of: ton, solana") from None
+            raise ValueError("method must be a provider rail id or a configured chain") from None
+
+    @model_validator(mode="after")
+    def rail_token(self):
+        if not self.is_chain and self.token != TOKEN:
+            raise ValueError("provider rail methods settle in USDT")
+        return self
 
     @property
     def is_chain(self) -> bool:
-        return self.method in CHAINS
+        return self.method in checkout_chains()
 
     @property
     def short_id(self) -> str:
         """Stable button id: a profile edit never redirects an old button to another method."""
-        return self.method if self.is_chain else UUID(self.method).hex[:8]
+        if not self.is_chain:
+            return UUID(self.method).hex[:8]
+        return self.method if self.token == TOKEN else self.method + self.token.lower()
 
 
 class CheckoutProfileConfig(BaseModel):
@@ -219,18 +245,10 @@ class TelegramCheckoutService:
         async with self.factory() as session, session.begin():
             for method in profile.methods:
                 if method.is_chain:
-                    config = (
-                        get_chain_config(method.method)
-                        if is_chain_supported(method.method)
-                        else None
-                    )
-                    if (
-                        config is None
-                        or not self.settings.non_evm_enabled
-                        or not gateway_onchain_enabled(merchant_id, self.settings, method.method)
-                        or not config.supports_asset(TOKEN)
-                    ):
-                        raise ValidationError(f"On-chain method {method.method} is not enabled")
+                    if not self._chain_selectable(merchant_id, method.method, method.token):
+                        raise ValidationError(
+                            f"On-chain method {method.method} {method.token} is not enabled"
+                        )
                     continue
                 self.provider.require_enabled(merchant_id)
                 rail = await session.scalar(
@@ -254,6 +272,26 @@ class TelegramCheckoutService:
                 )
             )
         return profile
+
+    def _chain_selectable(self, merchant_id: UUID, chain: str, token: str) -> bool:
+        """Mirror of PaymentService.select_payment_option gating for this merchant."""
+        if not is_chain_supported(chain):
+            return False
+        config = get_chain_config(chain)
+        if not config.supports_asset(token) or config.is_native_asset(token):
+            return False
+        modern = gateway_onchain_enabled(merchant_id, self.settings, chain)
+        if config.chain_type != ChainType.EVM:
+            return self.settings.non_evm_enabled and modern
+        if not modern:
+            # EVM outside the receipt rollout stays on the poller path for every merchant.
+            return True
+        try:
+            blocks = json.loads(self.settings.non_evm_start_blocks)
+        except ValueError:
+            return False
+        start = blocks.get(chain) if isinstance(blocks, dict) else None
+        return isinstance(start, int) and not isinstance(start, bool) and start >= 1
 
     # --- screens ---
 
@@ -488,7 +526,7 @@ class TelegramCheckoutService:
             invoice = await InvoiceService(session).create_invoice(
                 merchant,
                 surcharged(amount, method.surcharge_percent),
-                TOKEN,
+                method.token,
                 [method.method] if method.is_chain else [],
                 ttl_minutes=profile.invoice_ttl_minutes,
                 metadata=metadata,
@@ -498,19 +536,21 @@ class TelegramCheckoutService:
             )
             invoice_id, public_id = invoice.id, invoice.public_id
         if method.is_chain:
-            await self._select_onchain(merchant_id, invoice_id, method.method)
+            await self._select_onchain(merchant_id, invoice_id, method.method, method.token)
         else:
             operation = await self.provider.select_invoice(public_id, UUID(method.method))
             if operation.status != "pending" or not operation.pay_url:
                 raise GatewayError("Provider invoice is not payable")
         return invoice_id
 
-    async def _select_onchain(self, merchant_id: UUID, invoice_id: UUID, chain: str) -> None:
+    async def _select_onchain(
+        self, merchant_id: UUID, invoice_id: UUID, chain: str, token: str
+    ) -> None:
         from src.services.payment_service import PaymentService
 
         async with self.factory() as session:
             invoice = await InvoiceService(session).get_invoice(invoice_id, merchant_id)
-            await PaymentService(session).select_payment_option(invoice, chain, TOKEN)
+            await PaymentService(session).select_payment_option(invoice, chain, token)
 
     async def _invoice_screen(
         self, merchant_id, sid, state, lang, profile, *, check: bool = False
@@ -586,7 +626,8 @@ class TelegramCheckoutService:
         surcharge = Decimal(str((invoice.extra_data or {}).get("surcharge_percent", "0")))
         if operation is not None and operation.pay_url:
             method = self._method_label(profile, str(operation.rail_id))
-            to_pay = f"{text(lang, 'to_pay')}: <b>{token_amount(invoice.amount)} {TOKEN}</b>"
+            due = f"{token_amount(invoice.amount)} {invoice.asset}"
+            to_pay = f"{text(lang, 'to_pay')}: <b>{due}</b>"
             if surcharge:
                 to_pay += f" (+{surcharge.normalize():f}% {text(lang, 'fee')})"
             lines += [to_pay, "", text(lang, "custodial_hint")]
@@ -595,17 +636,20 @@ class TelegramCheckoutService:
             )
         elif payment is not None:
             session_row, address = payment
-            network = CHAIN_NAMES.get(session_row.chain, session_row.chain)
+            network = CHAIN_NAMES.get(session_row.chain) or get_chain_config(session_row.chain).name
             expires = invoice.expires_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
             lines += [
-                f"{text(lang, 'send')}: <code>{token_amount(invoice.amount)}</code> {TOKEN}",
+                f"{text(lang, 'send')}: <code>{token_amount(invoice.amount)}</code> "
+                + invoice.asset,
                 f"{text(lang, 'network')}: {escape(network, quote=False)}",
                 text(lang, "address"),
                 f"<code>{escape(address.address, quote=False)}</code>",
                 f"{text(lang, 'pay_before')}: {expires}",
                 "",
                 "<i>"
-                + text(lang, "onchain_note", token=TOKEN, network=escape(network, quote=False))
+                + text(
+                    lang, "onchain_note", token=invoice.asset, network=escape(network, quote=False)
+                )
                 + "</i>",
                 text(lang, "onchain_auto"),
             ]
@@ -620,7 +664,19 @@ class TelegramCheckoutService:
                         received=token_amount(received),
                         amount=token_amount(invoice.amount),
                         missing=token_amount(invoice.amount - received),
-                        token=TOKEN,
+                        token=invoice.asset,
+                    )
+                    + "</b>",
+                ]
+            elif session_row.mismatch_reason == "wrong_token":
+                lines += [
+                    "",
+                    "<b>"
+                    + text(
+                        lang,
+                        "wrong_token",
+                        got=escape(session_row.mismatch_token or "?", quote=False),
+                        token=invoice.asset,
                     )
                     + "</b>",
                 ]
@@ -690,7 +746,7 @@ class TelegramCheckoutService:
                 .where(
                     ProviderPaymentReceipt.invoice_id == Invoice.id,
                     ProviderPaymentReceipt.merchant_id == merchant_id,
-                    LedgerAsset.symbol == TOKEN,
+                    LedgerAsset.symbol == Invoice.asset,
                 )
             )
         ]
@@ -703,14 +759,15 @@ class TelegramCheckoutService:
                     .where(
                         OnchainReceipt.invoice_id == Invoice.id,
                         OnchainReceipt.merchant_id == merchant_id,
-                        LedgerAsset.symbol == TOKEN,
+                        LedgerAsset.symbol == Invoice.asset,
                     )
                 )
             )
+        receipts.append(self._evm_evidence_sql())
         return and_(
             Invoice.merchant_id == merchant_id,
             Invoice.status == InvoiceStatus.CONFIRMED,
-            Invoice.asset == TOKEN,
+            Invoice.asset.in_(ASSETS),
             func.jsonb_typeof(user) == "number",
             user.astext.op("~")(USER_ID_PATTERN),
             or_(
@@ -719,6 +776,99 @@ class TelegramCheckoutService:
             ),
             or_(*receipts),
         )
+
+    @staticmethod
+    def _evm_assets() -> list[tuple[str, str, str]]:
+        """(chain, token, lower-case contract) the EVM poller credits for checkout assets."""
+        result = []
+        for chain in get_evm_chains():
+            config = get_chain_config(chain)
+            for token in ASSETS:
+                asset = config.get_token(token)
+                if asset is not None:
+                    result.append((chain, token, asset.contract_address.lower()))
+        return result
+
+    def _evm_evidence_sql(self):
+        """SQL twin of _evm_evidence(): the legacy EVM poller path, which writes no receipt."""
+        confirmed_sum = (
+            select(func.sum(OnchainTx.amount))
+            .where(
+                OnchainTx.payment_session_id == PaymentSession.id,
+                OnchainTx.status == TxStatus.CONFIRMED,
+            )
+            .scalar_subquery()
+        )
+        sessions = (
+            select(func.count(PaymentSession.id))
+            .where(PaymentSession.invoice_id == Invoice.id)
+            .scalar_subquery()
+        )
+        assets = [
+            and_(
+                PaymentSession.chain == chain,
+                PaymentSession.token == token,
+                ~exists().where(
+                    OnchainTx.payment_session_id == PaymentSession.id,
+                    OnchainTx.token_contract != contract,
+                ),
+            )
+            for chain, token, contract in self._evm_assets()
+        ]
+        return and_(
+            ~exists().where(ProviderPaymentReceipt.invoice_id == Invoice.id),
+            ~exists().where(OnchainReceipt.invoice_id == Invoice.id),
+            sessions == 1,
+            exists(
+                select(PaymentSession.id).where(
+                    PaymentSession.invoice_id == Invoice.id,
+                    PaymentSession.status == PaymentSessionStatus.PAID,
+                    PaymentSession.token == Invoice.asset,
+                    or_(*assets) if assets else false(),
+                    PaymentSession.received_amount >= Invoice.amount,
+                    PaymentSession.received_amount == confirmed_sum,
+                )
+            ),
+        )
+
+    async def _evm_evidence(self, invoice: Invoice) -> tuple[str, Decimal] | None:
+        """(chain, received) when the EVM poller confirmed exactly this invoice in full."""
+        async with self.factory() as session:
+            if await session.scalar(
+                select(
+                    exists().where(ProviderPaymentReceipt.invoice_id == invoice.id)
+                    | exists().where(OnchainReceipt.invoice_id == invoice.id)
+                )
+            ):
+                return None
+            payments = (
+                await session.scalars(
+                    select(PaymentSession).where(PaymentSession.invoice_id == invoice.id)
+                )
+            ).all()
+            if len(payments) != 1:
+                return None
+            payment = payments[0]
+            txs = (
+                await session.scalars(
+                    select(OnchainTx).where(OnchainTx.payment_session_id == payment.id)
+                )
+            ).all()
+        contract = {(c, t): k for c, t, k in self._evm_assets()}.get((payment.chain, payment.token))
+        received = payment.received_amount
+        confirmed = [tx.amount for tx in txs if tx.status == TxStatus.CONFIRMED]
+        if (
+            contract is None
+            or payment.status != PaymentSessionStatus.PAID
+            or payment.token != invoice.asset
+            or any(tx.token_contract != contract for tx in txs)
+            or received is None
+            or received < invoice.amount
+            or not confirmed
+            or sum(confirmed, Decimal(0)) != received
+        ):
+            return None
+        return payment.chain, received
 
     async def _legacy_products(self, merchant_id: UUID) -> list[str]:
         profile = await self.get_profile(merchant_id)
@@ -792,7 +942,11 @@ class TelegramCheckoutService:
             acked = await session.scalar(
                 select(exists().where(CheckoutPaymentAck.invoice_id == invoice_id))
             )
-        if invoice is None or invoice.status != InvoiceStatus.CONFIRMED:
+        if (
+            invoice is None
+            or invoice.status != InvoiceStatus.CONFIRMED
+            or invoice.asset not in ASSETS
+        ):
             return None
         meta = invoice.extra_data or {}
         user_id = meta.get("telegram_user_id")
@@ -811,11 +965,17 @@ class TelegramCheckoutService:
         if requested < CENT or requested > invoice.amount:
             return None
         receipt = (await self.provider.receipt(merchant_id, invoice_id))["receipt"]
-        if receipt is None or receipt["asset"] != TOKEN:
+        if receipt is None:
+            evidence = await self._evm_evidence(invoice)
+            if evidence is None:
+                return None
+            network, gross = evidence
+        elif receipt["asset"] != invoice.asset:
             return None
-        gross = Decimal(receipt["gross"])
-        network = receipt["network"]
-        # Provider receipts carry "<rail type>:<network>"; chain receipts the chain id.
+        else:
+            gross = Decimal(receipt["gross"])
+            network = receipt["network"]
+        # Provider receipts carry "<rail type>:<network>"; chain evidence the chain id.
         custodial = ":" in network
         if custodial:
             credit = requested.quantize(CENT, rounding=ROUND_DOWN)

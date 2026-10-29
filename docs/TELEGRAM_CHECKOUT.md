@@ -49,8 +49,16 @@ async def topup(query: CallbackQuery):
 - Сумма в USD (расчёт в USDT 1:1), всегда 2 знака:
   - кастодиальный рельс (CryptoBot/xRocket/Wallet): запрошенная сумма; клиент
     платит её плюс `surcharge_percent` метода (округление вверх до цента);
-  - перевод в сети (TON/Solana): запрошенная сумма плюс переплата сверх счёта,
+  - перевод в сети (TON/Solana и EVM: base, arbitrum, bsc, polygon, avax,
+    optimism; USDT или USDC 1:1): запрошенная сумма плюс переплата сверх счёта,
     вниз до цента. Недоплата и просрочка не зачисляются никогда.
+  - EVM подтверждает прежний поллер (`evm_log_poller`) без квитанции шлюза.
+    Позиция появляется, только если у счёта ровно одна сессия в статусе `paid`,
+    её токен равен активу счёта, все переводы на адрес — контракт этого токена,
+    сумма подтверждённых `onchain_txs` равна `received_amount` и не меньше суммы
+    счёта. Недоплату в пределах допуска (`UNDERPAYMENT_TOLERANCE_*`, по умолчанию
+    1% / 0.02) поллер подтверждает, но лента её не зачисляет — только вручную;
+    поздний перевод (после истечения) счёт не подтверждает.
 - Старые счета с метаданными `telegram_user_id` + `product` попадают в ленту,
   только если `product` есть в `legacy_products` профиля (по умолчанию пусто;
   LLMASS: `["llmass-topup"]`): рельс — сумма счёта, сеть — пришедшее вниз до
@@ -71,7 +79,8 @@ async def topup(query: CallbackQuery):
 
 Профиль: `product_title`, `currency_label` (`USD`), `preset_amounts`,
 `min_amount`, `max_amount`, `custom_amount`, `methods`
-(`[{method: <rail uuid>|"ton"|"solana", label, surcharge_percent}]`),
+(`[{method: <rail uuid>|<chain>, label, surcharge_percent, token}]`, `token` —
+`USDT`/`USDC` только для сетей, по умолчанию `USDT`),
 `default_language` (`ru`/`en`), `invoice_ttl_minutes`, `legacy_products`. Суммы — строки с ≤2
 знаками; рельсы проверяются на принадлежность мерчанту и USDT, сети — на
 включённый on-chain шлюз.

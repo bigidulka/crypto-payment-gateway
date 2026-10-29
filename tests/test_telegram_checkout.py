@@ -18,7 +18,7 @@ from src.api.providers.router import provider_service
 from src.core.config import get_settings
 from src.core.rate_limit import limiter
 from src.crypto.encryption import encrypt_secret
-from src.db.models import DepositAddress, Invoice, PaymentSession
+from src.db.models import DepositAddress, Invoice, InvoiceStatus, PaymentSession
 from src.main import create_app
 from src.services.invoice_service import InvoiceService
 from src.services.onchain_gateway_service import OnchainGatewayService
@@ -122,7 +122,7 @@ async def test_profile_validation(gateway, checkout, monkeypatch):
     )
     bad = [
         profile(gateway, methods=[{"method": str(foreign), "label": "x"}]),
-        profile(gateway, methods=[{"method": "bsc", "label": "x"}]),
+        profile(gateway, methods=[{"method": "tron", "label": "x"}]),
         profile(gateway, methods=[{"method": "solana", "label": "Solana"}]),
         profile(gateway, min_amount=1.5),
         profile(gateway, preset_amounts=["1000"]),
@@ -257,7 +257,7 @@ async def test_onchain_flow_underpay_then_overpay_credits_floor(gateway, checkou
     assert (await checkout.http.put("/v1/checkout/profile", json=body)).status_code == 200
     address = str(Keypair.from_seed(uuid4().bytes * 2).pubkey())
 
-    async def stub_selection(self, merchant_id, invoice_id, chain):
+    async def stub_selection(self, merchant_id, invoice_id, chain, token):
         async with gateway.factory() as session:
             invoice = await session.get(Invoice, invoice_id)
             deposit = DepositAddress(
@@ -275,7 +275,7 @@ async def test_onchain_flow_underpay_then_overpay_credits_floor(gateway, checkou
                 PaymentSession(
                     invoice_id=invoice.id,
                     chain=chain,
-                    token="USDT",
+                    token=token,
                     deposit_address_id=deposit.id,
                     expires_at=invoice.expires_at,
                 )
@@ -459,6 +459,149 @@ async def test_session_lock_is_owned_and_released_by_its_owner(gateway, checkout
     await checkout.redis.delete(lock)
     assert "Choose how to pay" in (await checkout.press(start, "$10"))["text"]
     assert await checkout.redis.get(lock) is None
+
+
+async def evm_select(self, merchant_id, invoice_id, chain, token):
+    """Stands in for the HD-seeded legacy deposit lease; the address is a fresh EVM key."""
+    async with self.factory() as session:
+        invoice = await session.get(Invoice, invoice_id)
+        deposit = DepositAddress(
+            address="0x" + uuid4().hex + uuid4().hex[:8],
+            encrypted_privkey=encrypt_secret(
+                "unit-key", get_settings().encryption_key.get_secret_value()
+            ),
+            chain_group="evm",
+            derivation_path="m/44'/60'/0'/0/1",
+            derivation_index=uuid4().int % 2**31,
+        )
+        session.add(deposit)
+        await session.flush()
+        session.add(
+            PaymentSession(
+                invoice_id=invoice.id,
+                chain=chain,
+                token=token,
+                deposit_address_id=deposit.id,
+                expires_at=invoice.expires_at,
+            )
+        )
+        invoice.status = InvoiceStatus.AWAITING_PAYMENT
+        await session.commit()
+
+
+async def evm_pay(gateway, invoice_id, amounts, *, received=None, contract=None):
+    """Replays what src/workers/evm_log_poller.py writes for a confirmed EVM transfer."""
+    from sqlalchemy.orm import selectinload
+
+    from src.services.payment_service import PaymentService
+
+    async with gateway.factory() as session:
+        payment = await session.scalar(
+            select(PaymentSession)
+            .options(
+                selectinload(PaymentSession.deposit_address),
+                selectinload(PaymentSession.invoice),
+            )
+            .where(PaymentSession.invoice_id == invoice_id)
+        )
+        service = PaymentService(session)
+        txs = []
+        for index, amount in enumerate(amounts):
+            payment.received_amount = Decimal(amount)
+            tx = await service.record_onchain_tx(
+                payment, "0x" + uuid4().hex * 2, 100, index, "0x" + "11" * 20, Decimal(amount)
+            )
+            if contract is not None:
+                tx.token_contract = contract
+            txs.append(tx)
+        if received is not None:
+            payment.received_amount = Decimal(received)
+        for tx in txs:
+            assert await service.update_tx_confirmations(tx, 20, 15)
+        await service.process_confirmed_payment(payment, payment.invoice)
+
+
+async def test_evm_methods_screens_and_poller_evidence_feed(gateway, checkout, monkeypatch):
+    monkeypatch.setenv("TREASURY_ADDRESS", "0x" + "22" * 20)
+    get_settings.cache_clear()
+    gateway.service.settings = get_settings()
+    http = checkout.http
+    bsc = {"method": "bsc", "label": "USDT · BNB"}
+    base_usdc = {"method": "base", "label": "USDC · Base", "token": "USDC"}
+    for bad in (
+        [{"method": "ton", "label": "x", "token": "USDC"}],
+        [{"method": str(gateway.rail_id), "label": "x", "token": "USDC"}],
+        [{"method": "bsc", "label": "x", "token": "BNB"}],
+    ):
+        assert (
+            await http.put("/v1/checkout/profile", json=profile(gateway, methods=bad))
+        ).status_code == 422, bad
+    # An EVM chain moved to the receipt path needs its explicit scan start block.
+    monkeypatch.setenv("ONCHAIN_GATEWAY_ENABLED", "true")
+    monkeypatch.setenv("ONCHAIN_GATEWAY_CHAINS", "bsc")
+    get_settings.cache_clear()
+    gateway.service.settings = get_settings()
+    assert (
+        await http.put("/v1/checkout/profile", json=profile(gateway, methods=[bsc]))
+    ).status_code == 422
+    monkeypatch.setenv("ONCHAIN_GATEWAY_CHAINS", "ton,solana")
+    get_settings.cache_clear()
+    gateway.service.settings = get_settings()
+    body = profile(gateway, methods=[bsc, base_usdc], preset_amounts=["10", "25"])
+    assert (await http.put("/v1/checkout/profile", json=body)).status_code == 200
+    stored = (await http.get("/v1/checkout/profile")).json()["methods"]
+    assert [(m["method"], m["token"]) for m in stored] == [("bsc", "USDT"), ("base", "USDC")]
+    monkeypatch.setattr(TelegramCheckoutService, "_select_onchain", evm_select)
+
+    async def issue(label, preset="$10", user=USER):
+        start = await checkout.screen({"type": "start"}, user=user)
+        methods = await checkout.press(start, preset, user=user)
+        assert any("m" + "baseusdc" in b["callback_data"] for r in methods["buttons"] for b in r)
+        screen = await checkout.press(methods, label, user=user)
+        async with gateway.factory() as session:
+            invoice = await session.scalar(
+                select(Invoice)
+                .where(Invoice.merchant_id == gateway.merchant.id)
+                .order_by(Invoice.created_at.desc())
+            )
+        return screen, invoice
+
+    async def feed(query=""):
+        result = await http.get("/v1/checkout/payments" + query)
+        assert result.status_code == 200, result.text
+        return result.json()["items"]
+
+    # Tolerated underpayment: the poller confirms it, the feed never credits it.
+    short_screen, short = await issue("USDT · BNB")
+    assert (
+        "BNB Smart Chain" in short_screen["text"]
+        and "<code>10.00</code> USDT" in short_screen["text"]
+    )
+    await evm_pay(gateway, short.id, ["9.99"])
+    # Wrong token contract on the session's address: never credited.
+    _, wrong = await issue("USDT · BNB", user=USER + 1)
+    usdc = "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"
+    await evm_pay(gateway, wrong.id, ["10"], contract=usdc)
+    # Two transfers whose sum disagrees with what the poller recorded: review only.
+    _, split = await issue("USDT · BNB", user=USER + 2)
+    await evm_pay(gateway, split.id, ["10", "10"])
+    # A USDC invoice on Base, overpaid: credit = requested + overpayment, floored.
+    paid_screen, good = await issue("USDC · Base", preset="$25", user=USER + 3)
+    assert good.asset == "USDC" and "<code>25.00</code> USDC" in paid_screen["text"]
+    await evm_pay(gateway, good.id, ["25.019"])
+    for invoice in (short, wrong, split, good):
+        async with gateway.factory() as session:
+            assert (await session.get(Invoice, invoice.id)).status == InvoiceStatus.CONFIRMED
+    [item] = await feed("?limit=1")
+    assert item["invoice_id"] == str(good.id) and item["telegram_user_id"] == USER + 3
+    assert item["credit_amount"] == "25.01" and item["method"] == "base"
+    assert item["network"] == "base" and Decimal(item["gross"]) == Decimal("25.019")
+    assert item["external_id"] == f"gateway-{good.id}"
+    for bad in (short, wrong, split):
+        assert (await http.get(f"/v1/checkout/payments/{bad.id}")).status_code == 404
+        assert (await http.post(f"/v1/checkout/payments/{bad.id}/ack")).status_code == 404
+    assert (await http.post(f"/v1/checkout/payments/{good.id}/ack")).status_code == 200
+    assert await feed() == []
 
 
 async def test_sdk_connector_end_to_end_over_http(gateway, checkout):
