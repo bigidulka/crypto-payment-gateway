@@ -64,7 +64,8 @@ class DepositAddress(Base, UUIDMixin):
 
     # HD wallet derivation info
     derivation_path: Mapped[str] = mapped_column(String(50), nullable=False)
-    derivation_index: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    # Unique per chain group: every group derives from its own HD seed.
+    derivation_index: Mapped[int] = mapped_column(Integer, nullable=False)
 
     # Legacy флаг использования. Новая логика использует lease_status.
     is_used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
