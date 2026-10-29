@@ -20,6 +20,7 @@ from src.core.exceptions import AppException
 from src.crypto.encryption import decrypt_secret
 from src.db.models import (
     GatewayInvoiceOptions,
+    GatewayLiquidityRecognition,
     GatewayOperation,
     GatewayPayoutReceipt,
     GatewayRailConnection,
@@ -820,6 +821,23 @@ class GatewayProviderService:
             raise GatewayError("Ledger reservations require reconciliation")
         return balance, held, provider_reserve
 
+    async def _open_invoice_atomic(self, session, rail_id, asset_id) -> int:
+        # A paid but not yet ingested invoice may already sit in the provider
+        # balance; never recognize it as pre-gateway liquidity.
+        return int(
+            await session.scalar(
+                select(func.coalesce(func.sum(GatewayOperation.amount_atomic), 0)).where(
+                    GatewayOperation.rail_id == rail_id,
+                    GatewayOperation.ledger_asset_id == asset_id,
+                    GatewayOperation.operation_type == "invoice",
+                    GatewayOperation.status.in_(
+                        ["submitting", "pending", "unknown", "reconciliation_required"]
+                    ),
+                )
+            )
+            or 0
+        )
+
     async def _provider_balance(self, snapshot):
         adapter = self._build(snapshot)
         sampled_at = datetime.now(UTC)
@@ -868,8 +886,11 @@ class GatewayProviderService:
                     if asset
                     else (0, 0, 0)
                 )
+                open_invoices = (
+                    await self._open_invoice_atomic(session, rail_id, asset.id) if asset else 0
+                )
                 row = provider.get(symbol) if provider is not None else None
-                available = None
+                available = unledgered = None
                 state = availability
                 if provider is not None:
                     if row is None:
@@ -881,6 +902,16 @@ class GatewayProviderService:
                         available = atomic_to_decimal(
                             max(0, min(ledger - held, provider_atomic - provider_reserve)), decimals
                         )
+                        unledgered = atomic_to_decimal(
+                            max(
+                                0,
+                                provider_atomic
+                                - provider_reserve
+                                - (ledger - held)
+                                - open_invoices,
+                            ),
+                            decimals,
+                        )
                 result.append(
                     {
                         "rail_id": str(rail_id),
@@ -889,6 +920,7 @@ class GatewayProviderService:
                         "ledger_balance": atomic_to_decimal(ledger, decimals),
                         "reserved": atomic_to_decimal(held, decimals),
                         "available": available,
+                        "unledgered_available": unledgered,
                         "provider_available": row.available if row else None,
                         "provider_held": row.held if row else None,
                         "availability": state,
@@ -908,6 +940,7 @@ class GatewayProviderService:
         idempotency_key: str,
         *,
         destination_type="telegram_user_id",
+        recognize_unledgered=False,
     ) -> OperationResult:
         self.require_enabled(merchant_id)
         if (
@@ -930,15 +963,16 @@ class GatewayProviderService:
             requested = decimal_to_atomic(amount, decimals)
         except ValueError as exc:
             raise GatewayError("Invalid exact payout amount", status_code=422) from exc
-        request_digest = digest(
-            {
-                "rail": str(rail_id),
-                "asset": symbol,
-                "amount": str(requested),
-                "destination": destination,
-                "destination_type": destination_type,
-            }
-        )
+        request_identity = {
+            "rail": str(rail_id),
+            "asset": symbol,
+            "amount": str(requested),
+            "destination": destination,
+            "destination_type": destination_type,
+        }
+        if recognize_unledgered:
+            request_identity["recognize_unledgered"] = True
+        request_digest = digest(request_identity)
         async with self.factory() as session:
             previous = await session.scalar(
                 select(GatewayOperation).where(
@@ -984,6 +1018,15 @@ class GatewayProviderService:
             ledger, held, provider_reserve = await self._funds(
                 session, merchant_id, connection, asset_row.id, sampled_at
             )
+            shortfall = requested - (ledger - held)
+            open_invoices = 0
+            if shortfall > 0 and recognize_unledgered:
+                # The account belongs to this merchant alone (unique identity), so
+                # funds no ledger fact explains predate the gateway and are its own.
+                open_invoices = await self._open_invoice_atomic(session, rail_id, asset_row.id)
+                surplus = actual_available - provider_reserve - (ledger - held) - open_invoices
+                if shortfall <= surplus:
+                    ledger += shortfall
             if requested > min(ledger - held, actual_available - provider_reserve):
                 raise GatewayError(
                     "Insufficient verified available balance",
@@ -1007,6 +1050,18 @@ class GatewayProviderService:
             session.add(operation)
             await session.flush()
             operation_id = operation.id
+            if shortfall > 0 and recognize_unledgered:
+                await self._recognize(
+                    session,
+                    connection,
+                    operation,
+                    shortfall,
+                    actual_available=actual_available,
+                    provider_reserve=provider_reserve,
+                    outstanding=ledger - shortfall - held,
+                    open_invoices=open_invoices,
+                    sampled_at=sampled_at,
+                )
         adapter = self._build(snapshot)
         try:
             payout = await adapter.payout(
@@ -1023,6 +1078,75 @@ class GatewayProviderService:
         finally:
             await adapter.close()
         return await self._finish_payout(merchant_id, operation_id, payout)
+
+    async def _recognize(
+        self,
+        session,
+        connection,
+        operation,
+        amount,
+        *,
+        actual_available,
+        provider_reserve,
+        outstanding,
+        open_invoices,
+        sampled_at,
+    ):
+        recognition_id = uuid4()
+        evidence = digest(
+            {
+                "recognition": str(recognition_id),
+                "account": connection.account_identity,
+                "rail": str(connection.rail_id),
+                "asset": str(operation.ledger_asset_id),
+                "amount": str(amount),
+                "provider_available": str(actual_available),
+                "provider_reserve": str(provider_reserve),
+                "ledger_outstanding": str(outstanding),
+                "open_invoices": str(open_invoices),
+                "payout": str(operation.id),
+                "sampled_at": sampled_at.isoformat(),
+            }
+        )
+        journal = await LedgerPostingService(session).post_in_transaction(
+            merchant_id=operation.merchant_id,
+            source_namespace="gateway_liquidity_recognition",
+            source_external_id=str(recognition_id),
+            source_digest=evidence,
+            idempotency_key=f"gateway-liquidity:{recognition_id}",
+            lines=[
+                LedgerLine(
+                    connection.receivable_account_id,
+                    operation.ledger_asset_id,
+                    LedgerDirection.DEBIT,
+                    amount,
+                ),
+                LedgerLine(
+                    connection.payable_account_id,
+                    operation.ledger_asset_id,
+                    LedgerDirection.CREDIT,
+                    amount,
+                ),
+            ],
+        )
+        session.add(
+            GatewayLiquidityRecognition(
+                id=recognition_id,
+                merchant_id=operation.merchant_id,
+                rail_id=connection.rail_id,
+                ledger_asset_id=operation.ledger_asset_id,
+                amount_atomic=amount,
+                provider_available_atomic=actual_available,
+                provider_reserve_atomic=provider_reserve,
+                ledger_outstanding_atomic=outstanding,
+                open_invoice_atomic=open_invoices,
+                payout_operation_id=operation.id,
+                evidence_digest=evidence,
+                ledger_transaction_id=journal.id,
+                sampled_at=sampled_at,
+            )
+        )
+        await session.flush()
 
     async def _finish_payout(self, merchant_id, operation_id, payout: RailPayout):
         async with self.factory() as session, session.begin():

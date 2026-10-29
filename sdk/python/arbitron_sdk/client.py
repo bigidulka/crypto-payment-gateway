@@ -279,6 +279,14 @@ class ArbitronClient:
         )
         return ProviderOperation.from_api(data)
 
+    async def select_invoice_provider(self, invoice_id: str, rail_id: str) -> ProviderOperation:
+        """Merchant-authenticated selection; replay returns the same provider invoice."""
+        return ProviderOperation.from_api(
+            await self._request(
+                "POST", f"/v1/invoices/{invoice_id}/provider", json={"rail_id": rail_id}
+            )
+        )
+
     async def invoice_receipt(self, invoice_id: str) -> dict:
         """Verified gross/net receipt. A missing receipt never confirms payment."""
         return await self._request("GET", f"/v1/invoices/{invoice_id}/receipt")
@@ -296,22 +304,26 @@ class ArbitronClient:
         destination: str,
         idempotency_key: str,
         destination_type: str = "telegram_user_id",
+        recognize_unledgered_liquidity: bool = False,
     ) -> ProviderOperation:
-        """Persisted payout: replay this key after a lost response; never generate a replacement."""
+        """Persisted payout: replay this key after a lost response; never generate a replacement.
+
+        ``recognize_unledgered_liquidity`` lets the sole owner of a provider account
+        spend funds that predate the gateway; the gateway proves and records them once.
+        """
         if not idempotency_key:
             raise ValueError("Persistent payout idempotency key is required")
-        data = await self._request(
-            "POST",
-            "/v1/payouts",
-            json={
-                "rail_id": rail_id,
-                "amount": self._exact_amount(amount),
-                "asset": asset.upper(),
-                "destination": destination,
-                "destination_type": destination_type,
-                "idempotency_key": idempotency_key,
-            },
-        )
+        body = {
+            "rail_id": rail_id,
+            "amount": self._exact_amount(amount),
+            "asset": asset.upper(),
+            "destination": destination,
+            "destination_type": destination_type,
+            "idempotency_key": idempotency_key,
+        }
+        if recognize_unledgered_liquidity:
+            body["recognize_unledgered_liquidity"] = True
+        data = await self._request("POST", "/v1/payouts", json=body)
         return ProviderOperation.from_api(data)
 
     async def get_operation(self, operation_id: str) -> ProviderOperation:

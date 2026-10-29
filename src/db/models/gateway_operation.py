@@ -203,3 +203,48 @@ class GatewayPayoutReceipt(Base):
             name="ck_gateway_payout_evidence",
         ),
     )
+
+
+class GatewayLiquidityRecognition(Base):
+    """Pre-gateway provider funds proven once, bound to the payout that needs them."""
+
+    __tablename__ = "gateway_liquidity_recognitions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UniversalUUID(), primary_key=True, default=uuid.uuid4)
+    merchant_id: Mapped[uuid.UUID] = mapped_column(UniversalUUID(), nullable=False)
+    rail_id: Mapped[uuid.UUID] = mapped_column(UniversalUUID(), nullable=False)
+    ledger_asset_id: Mapped[uuid.UUID] = mapped_column(UniversalUUID(), nullable=False)
+    amount_atomic: Mapped[int] = mapped_column(Numeric(), nullable=False)
+    provider_available_atomic: Mapped[int] = mapped_column(Numeric(), nullable=False)
+    provider_reserve_atomic: Mapped[int] = mapped_column(Numeric(), nullable=False)
+    ledger_outstanding_atomic: Mapped[int] = mapped_column(Numeric(), nullable=False)
+    open_invoice_atomic: Mapped[int] = mapped_column(Numeric(), nullable=False)
+    payout_operation_id: Mapped[uuid.UUID] = mapped_column(UniversalUUID(), nullable=False)
+    evidence_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    ledger_transaction_id: Mapped[uuid.UUID] = mapped_column(UniversalUUID(), nullable=False)
+    sampled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["rail_id"], ["gateway_rail_connections.rail_id"], ondelete="RESTRICT"
+        ),
+        ForeignKeyConstraint(["ledger_asset_id"], ["ledger_assets.id"], ondelete="RESTRICT"),
+        ForeignKeyConstraint(
+            ["payout_operation_id"], ["gateway_operations.id"], ondelete="RESTRICT"
+        ),
+        ForeignKeyConstraint(
+            ["merchant_id", "ledger_transaction_id"],
+            ["ledger_transactions.merchant_id", "ledger_transactions.id"],
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("ledger_transaction_id", name="uq_liquidity_recognition_journal"),
+        UniqueConstraint("payout_operation_id", name="uq_liquidity_recognition_payout"),
+        CheckConstraint(
+            "amount_atomic > 0 AND amount_atomic <= provider_available_atomic"
+            " - provider_reserve_atomic - ledger_outstanding_atomic - open_invoice_atomic",
+            name="ck_liquidity_recognition_surplus",
+        ),
+    )

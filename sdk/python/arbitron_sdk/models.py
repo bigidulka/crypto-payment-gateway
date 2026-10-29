@@ -114,13 +114,18 @@ class ProviderBalance:
     availability: str
     payout_mode: str
     as_of: str
+    unledgered_available: Decimal | None = None
 
     @classmethod
     def from_api(cls, data: dict) -> "ProviderBalance":
+        def optional(name):
+            return Decimal(str(data[name])) if data.get(name) is not None else None
+
         return cls(str(data["rail_id"]), data["asset"], data["network"],
-            Decimal(str(data["available"])) if data.get("available") is not None else None,
+            optional("available"),
             Decimal(str(data["ledger_balance"])), Decimal(str(data["reserved"])),
-            data["availability"], data["payout_mode"], data["as_of"])
+            data["availability"], data["payout_mode"], data["as_of"],
+            optional("unledgered_available"))
 
 
 @dataclass(frozen=True)

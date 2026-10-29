@@ -34,7 +34,7 @@ from .models import (
 from .product import ProductPayments
 from .webhooks import WebhookVerificationError, verify_webhook
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "ProductPayments",

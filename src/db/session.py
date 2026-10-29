@@ -6,7 +6,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -19,6 +19,10 @@ from src.core.config import get_settings
 
 async def has_onchain_scan_schema(session: AsyncSession) -> bool:
     """Durable enrolment survives feature rollback; old schemas need no new-table query."""
+    if session.bind.dialect.name != "postgresql":
+        return await session.run_sync(
+            lambda sync: inspect(sync.connection()).has_table("onchain_scan_cursors")
+        )
     return bool(
         await session.scalar(text("SELECT to_regclass('public.onchain_scan_cursors') IS NOT NULL"))
     )
@@ -57,6 +61,7 @@ _RUNTIME_PROTECTED_TABLES = (
     "onchain_receipts",
     "onchain_operations",
     "gateway_rail_connections",
+    "gateway_liquidity_recognitions",
     "gateway_invoice_options",
     "gateway_operations",
     "gateway_payout_receipts",

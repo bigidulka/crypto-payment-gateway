@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from sqlalchemy import select
 
 from src.api.deps import MerchantDep, SessionDep
-from src.core.rate_limit import limiter
+from src.core.rate_limit import RATE_LIMITS, limiter
 from src.db.models import GatewayInvoiceOptions, GatewayOperation, Invoice
 from src.db.session import get_session_factory
 from src.payments.rails.base import RailError
@@ -52,6 +52,7 @@ class PayoutRequest(BaseModel):
     destination: str = Field(min_length=1, max_length=32)
     destination_type: Literal["telegram_user_id", "user_id"] = "telegram_user_id"
     idempotency_key: str = Field(min_length=1, max_length=128)
+    recognize_unledgered_liquidity: bool = False
 
     @field_validator("amount", mode="before")
     @classmethod
@@ -68,6 +69,7 @@ class BalanceResponse(BaseModel):
     ledger_balance: Decimal
     reserved: Decimal
     available: Decimal | None
+    unledgered_available: Decimal | None = None
     provider_available: Decimal | None
     provider_held: Decimal | None
     availability: str
@@ -146,6 +148,7 @@ async def payout(request: Request, body: PayoutRequest, merchant: MerchantDep, s
                 body.destination,
                 body.idempotency_key,
                 destination_type=body.destination_type,
+                recognize_unledgered=body.recognize_unledgered_liquidity,
             )
         )
     )
@@ -168,6 +171,27 @@ async def reconcile(
         else service.reconcile_payout(merchant.id, operation_id)
     )
     return asdict(result)
+
+
+@router.post("/invoices/{invoice_id}/provider", status_code=202)
+@limiter.limit(RATE_LIMITS["create_invoice"])
+async def merchant_select_provider(
+    request: Request,
+    invoice_id: UUID,
+    body: ProviderSelect,
+    merchant: MerchantDep,
+    session: SessionDep,
+    service: ServiceDep,
+):
+    """Server-side method selection; the merchant key, not the client IP, bounds it."""
+    invoice = await session.scalar(
+        select(Invoice).where(Invoice.id == invoice_id, Invoice.merchant_id == merchant.id)
+    )
+    if invoice is None:
+        raise HTTPException(404, "Invoice not found")
+    return public_operation(
+        await provider_call(service.select_invoice(invoice.public_id, body.rail_id))
+    )
 
 
 @router.get("/invoices/{invoice_id}/receipt", response_model=ReceiptResponse)

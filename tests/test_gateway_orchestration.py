@@ -56,7 +56,7 @@ async def gateway(monkeypatch):
     async with engine.connect() as conn:
         assert (
             await conn.scalar(text("SELECT version_num FROM alembic_version"))
-            == "0015_onchain_operations"
+            == "0016_liquidity_recognition"
         )
         assert await conn.scalar(text("SELECT current_database()")) == url.database
         role = (
@@ -299,10 +299,20 @@ async def test_sdk_through_http_api_checkout_receipt_and_payout(gateway, monkeyp
                 assert (await client.invoice_methods(invoice.public_id))["items"][0][
                     "type"
                 ] == "xrocket"
-                selected = await client.select_provider(invoice.public_id, str(gateway.rail_id))
+                selected = await client.select_invoice_provider(
+                    invoice.invoice_id, str(gateway.rail_id)
+                )
                 assert (
                     selected.pay_url == "https://t.me/local_test" and selected.status == "pending"
                 )
+                replay = await client.select_provider(invoice.public_id, str(gateway.rail_id))
+                assert replay.id == selected.id and gateway.state.posts == 1
+                async with ArbitronClient(endpoint, "invalid") as outsider:
+                    with pytest.raises(ArbitronError) as error:
+                        await outsider.select_invoice_provider(
+                            invoice.invoice_id, str(gateway.rail_id)
+                        )
+                    assert error.value.status == 401
                 assert (await client.invoice_receipt(invoice.invoice_id))["receipt"] is None
                 gateway.state.paid = True
                 await gateway.service.poll_batch()
@@ -315,6 +325,7 @@ async def test_sdk_through_http_api_checkout_receipt_and_payout(gateway, monkeyp
                     balance.available == Decimal("15.48120000")
                     and balance.availability == "verified"
                 )
+                assert balance.unledgered_available == 0
                 payout = await client.payout(
                     rail_id=str(gateway.rail_id),
                     amount="15.4812",
@@ -721,5 +732,159 @@ async def test_pending_payout_receipt_must_keep_original_recipient(gateway):
                     "WHERE rail_id=:id"
                 ),
                 {"identity": "f" * 64, "id": gateway.rail_id},
+            )
+        await session.rollback()
+
+
+async def recognitions(gateway):
+    from src.db.models import GatewayLiquidityRecognition
+
+    async with gateway.factory() as session:
+        return (
+            await session.scalars(
+                select(GatewayLiquidityRecognition).where(
+                    GatewayLiquidityRecognition.merchant_id == gateway.merchant.id
+                )
+            )
+        ).all()
+
+
+@pytest.mark.asyncio
+async def test_pre_gateway_funds_require_explicit_recognition_bound_to_payout(gateway):
+    # Funds already held by the sole-owner account before any gateway fact.
+    gateway.state.provider_balance = Decimal("500")
+    with pytest.raises(GatewayError, match="Insufficient"):
+        await gateway.service.create_payout(
+            gateway.merchant.id, gateway.rail_id, Decimal("50"), "USDT", "123", str(uuid4())
+        )
+    balance = (await gateway.service.balances(gateway.merchant.id, gateway.rail_id))[0]
+    assert balance["available"] == 0 and balance["unledgered_available"] == Decimal("500")
+    key = str(uuid4())
+    operation = await gateway.service.create_payout(
+        gateway.merchant.id,
+        gateway.rail_id,
+        Decimal("50"),
+        "USDT",
+        "123",
+        key,
+        recognize_unledgered=True,
+    )
+    assert operation.status == "completed" and gateway.state.payout_posts == 1
+    replay = await gateway.service.create_payout(
+        gateway.merchant.id,
+        gateway.rail_id,
+        Decimal("50"),
+        "USDT",
+        "123",
+        key,
+        recognize_unledgered=True,
+    )
+    assert replay.id == operation.id and gateway.state.payout_posts == 1
+    with pytest.raises(GatewayError, match="another payout"):
+        await gateway.service.create_payout(
+            gateway.merchant.id, gateway.rail_id, Decimal("50"), "USDT", "123", key
+        )
+    rows = await recognitions(gateway)
+    assert len(rows) == 1 and int(rows[0].amount_atomic) == 5000000000
+    assert rows[0].payout_operation_id == operation.id
+    after = (await gateway.service.balances(gateway.merchant.id, gateway.rail_id))[0]
+    assert after["ledger_balance"] == 0 and after["unledgered_available"] == Decimal("450")
+
+
+@pytest.mark.asyncio
+async def test_recognition_excludes_ledger_obligations_and_open_invoices(gateway):
+    await credit(gateway)
+    gateway.state.provider_balance = Decimal("500")
+    gateway.state.paid = False
+    invoice = await new_invoice(gateway, amount=Decimal("100"))
+    await gateway.service.select_invoice(invoice.public_id, gateway.rail_id)
+    balance = (await gateway.service.balances(gateway.merchant.id, gateway.rail_id))[0]
+    # 500 physical - 97 owed by ledger - 100 possibly paid but not yet ingested.
+    assert balance["available"] == Decimal("97")
+    assert balance["unledgered_available"] == Decimal("303")
+    with pytest.raises(GatewayError, match="Insufficient"):
+        await gateway.service.create_payout(
+            gateway.merchant.id,
+            gateway.rail_id,
+            Decimal("400.000001"),
+            "USDT",
+            "123",
+            str(uuid4()),
+            recognize_unledgered=True,
+        )
+    assert not await recognitions(gateway)
+    operation = await gateway.service.create_payout(
+        gateway.merchant.id,
+        gateway.rail_id,
+        Decimal("400"),
+        "USDT",
+        "123",
+        str(uuid4()),
+        recognize_unledgered=True,
+    )
+    assert operation.status == "completed"
+    rows = await recognitions(gateway)
+    assert [int(row.amount_atomic) for row in rows] == [30300000000]
+    assert int(rows[0].open_invoice_atomic) == 10000000000
+    assert int(rows[0].ledger_outstanding_atomic) == 9700000000
+
+
+@pytest.mark.asyncio
+async def test_parallel_recognizing_payouts_never_recognize_the_same_funds_twice(gateway):
+    gateway.state.provider_balance = Decimal("500")
+    results = await asyncio.gather(
+        *(
+            gateway.service.create_payout(
+                gateway.merchant.id,
+                gateway.rail_id,
+                Decimal("300"),
+                "USDT",
+                "123",
+                str(uuid4()),
+                recognize_unledgered=True,
+            )
+            for _ in range(2)
+        ),
+        return_exceptions=True,
+    )
+    operations = [r for r in results if not isinstance(r, BaseException)]
+    assert len(operations) == 1
+    assert any(isinstance(r, GatewayError) and r.code == "INSUFFICIENT_FUNDS" for r in results)
+    assert gateway.state.payout_posts == 1 and len(await recognitions(gateway)) == 1
+
+
+@pytest.mark.asyncio
+async def test_database_refuses_unproven_or_mutated_recognition(gateway):
+    gateway.state.provider_balance = Decimal("500")
+    operation = await gateway.service.create_payout(
+        gateway.merchant.id,
+        gateway.rail_id,
+        Decimal("10"),
+        "USDT",
+        "123",
+        str(uuid4()),
+        recognize_unledgered=True,
+    )
+    (row,) = await recognitions(gateway)
+    async with gateway.factory() as session:
+        with pytest.raises(DBAPIError):
+            await session.execute(
+                text("UPDATE gateway_liquidity_recognitions SET amount_atomic=1 WHERE id=:id"),
+                {"id": row.id},
+            )
+        await session.rollback()
+    async with gateway.factory() as session:
+        with pytest.raises(DBAPIError):
+            await session.execute(
+                text(
+                    "INSERT INTO gateway_liquidity_recognitions(id,merchant_id,rail_id,"
+                    "ledger_asset_id,amount_atomic,provider_available_atomic,"
+                    "provider_reserve_atomic,ledger_outstanding_atomic,open_invoice_atomic,"
+                    "payout_operation_id,evidence_digest,ledger_transaction_id,sampled_at) "
+                    "SELECT :id,merchant_id,rail_id,ledger_asset_id,1,500000000,0,0,0,"
+                    ":operation,evidence_digest,ledger_transaction_id,now() "
+                    "FROM gateway_liquidity_recognitions WHERE id=:source"
+                ),
+                {"id": uuid4(), "operation": operation.id, "source": row.id},
             )
         await session.rollback()
