@@ -11,6 +11,6 @@
   ],
   "source_credential_literal_scan": "PASS_ALL_APPLICATION_MODULES_AND_STATIC_CONFIG",
   "protected_configuration": "Outside Git, image and source manifest",
-  "application_source_commit": "c0d3d69",
+  "application_source_commit": "c9ed7fe",
   "previous_runtime_base": "58dc6db9399ef5a177fe47eabf2751c86cab0fc8"
 }

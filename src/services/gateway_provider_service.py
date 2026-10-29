@@ -8,7 +8,7 @@ import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from uuid import UUID, uuid4
 
 from sqlalchemy import case, func, select
@@ -65,6 +65,13 @@ def digest(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     ).hexdigest()
+
+
+def spendable_atomic(value: Decimal, decimals: int) -> int:
+    """Provider balances may carry dust below the ledger precision; never round it up."""
+    return decimal_to_atomic(
+        value.quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_DOWN), decimals, allow_zero=True
+    )
 
 
 def credentials_digest(value: str) -> str:
@@ -972,9 +979,7 @@ class GatewayProviderService:
                     if row is None:
                         state = "unknown"
                     else:
-                        provider_atomic = decimal_to_atomic(
-                            row.available, decimals, allow_zero=True
-                        )
+                        provider_atomic = spendable_atomic(row.available, decimals)
                         available = atomic_to_decimal(
                             max(0, min(ledger - held, provider_atomic - provider_reserve)), decimals
                         )
@@ -1070,7 +1075,7 @@ class GatewayProviderService:
             raise GatewayError("CryptoBot requires Telegram recipient", status_code=422)
         if symbol not in provider:
             raise GatewayError("Authoritative asset balance is unavailable", status_code=503)
-        actual_available = decimal_to_atomic(provider[symbol].available, decimals, allow_zero=True)
+        actual_available = spendable_atomic(provider[symbol].available, decimals)
         async with self.factory() as session, session.begin():
             snapshot, connection = await self._connection(session, merchant_id, rail_id)
             await session.scalar(

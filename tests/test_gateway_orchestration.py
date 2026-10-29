@@ -1030,3 +1030,11 @@ async def test_signed_provider_push_verifies_and_credits_once(gateway):
             )
             == 1
         )
+
+
+@pytest.mark.asyncio
+async def test_provider_balance_dust_below_ledger_precision_rounds_down(gateway):
+    gateway.state.provider_balance = Decimal("141.1608401234567")
+    [row] = await gateway.service.balances(gateway.merchant.id, gateway.rail_id)
+    assert row["provider_available"] == Decimal("141.1608401234567")
+    assert row["unledgered_available"] == Decimal("141.16084012")
