@@ -211,7 +211,8 @@ class PaymentService:
         await self.session.flush()
         if modern:
             from src.db.models import OnchainScanCursor
-            self.session.add(OnchainScanCursor(session_id=session.id, chain=chain, last_block=blocks[chain]-1))
+            start = await self._session_scan_start(chain, blocks[chain])
+            self.session.add(OnchainScanCursor(session_id=session.id, chain=chain, last_block=start - 1))
         await self.address_leases.bind_payment_session(
             deposit_address,
             session.id,
@@ -459,6 +460,26 @@ class PaymentService:
         )
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def _session_scan_start(self, chain: str, configured: int) -> int:
+        """First block a new session must scan.
+
+        The deposit address is shown only after this session exists, so no payment can
+        precede the current head; one scan window of margin covers clock skew and
+        finality lag. Without a readable head the configured start stays, only slower.
+        """
+        from src.blockchain.prepared import ChainRPCError
+        from src.services.onchain_gateway_service import adapter_for
+
+        adapter = adapter_for(chain)
+        try:
+            head = await adapter.get_latest_block()
+        except ChainRPCError:
+            logger.warning("Chain head unavailable; %s session scans from configured start", chain)
+            return configured
+        finally:
+            await adapter.close()
+        return max(configured, head - get_chain_config(chain).scan_window)
 
     async def _get_existing_session(
         self,

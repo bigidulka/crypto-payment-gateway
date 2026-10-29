@@ -554,3 +554,23 @@ async def test_ton_requests_are_paced_and_retry_only_rejected_rate_limits(monkey
         await adapter.close()
     finally:
         get_settings.cache_clear()
+
+
+async def test_new_session_scans_from_near_head_not_from_activation(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from src.blockchain.prepared import ChainRPCError
+    from src.services import onchain_gateway_service
+    from src.services.payment_service import PaymentService
+
+    adapter = AsyncMock()
+    monkeypatch.setattr(onchain_gateway_service, "adapter_for", lambda chain: adapter)
+    service = PaymentService(AsyncMock())
+    adapter.get_latest_block.return_value = 1_000_000
+    # Solana scan window is 1000 slots: a week-old activation block is skipped.
+    assert await service._session_scan_start("solana", 10) == 999_000
+    adapter.get_latest_block.return_value = 500
+    assert await service._session_scan_start("solana", 10) == 10
+    adapter.get_latest_block.side_effect = ChainRPCError("down")
+    assert await service._session_scan_start("solana", 10) == 10
+    assert adapter.close.await_count == 3
