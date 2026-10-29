@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from src.core.config import get_settings
 from src.core.exceptions import ValidationError
 from src.db.models import (
+    GatewayOperation,
     GatewayPayoutReceipt,
     Invoice,
     InvoiceEvent,
@@ -958,3 +959,74 @@ async def test_derivation_index_is_unique_per_chain_group_only(gateway):
         with pytest.raises(DBAPIError):
             async with session.begin():
                 session.add(address("ton"))
+
+
+def xrocket_push(secret, invoice_id, *, age_ms=0):
+    import hashlib
+    import hmac
+    import json
+    import time
+
+    body = json.dumps(
+        {
+            "id": str(uuid4()),
+            "type": "invoice",
+            "data": {"event": "invoice_status_changed", "invoice": {"id": invoice_id}},
+        }
+    ).encode()
+    timestamp = str(int(time.time() * 1000) - age_ms)
+    signature = hmac.new(secret.encode(), timestamp.encode() + b"." + body, hashlib.sha256)
+    headers = {
+        "signature-timestamp": timestamp,
+        "signature-version": "v1",
+        "signature": signature.hexdigest(),
+    }
+    return body, headers
+
+
+@pytest.mark.asyncio
+async def test_signed_provider_push_verifies_and_credits_once(gateway):
+    from pydantic import SecretStr
+
+    from src.payments.rails.base import WebhookRejected
+
+    secret = "push-secret-" + uuid4().hex
+    gateway.service.settings = gateway.service.settings.model_copy(
+        update={"provider_webhook_secrets": SecretStr(f"{gateway.rail_id}={secret}")}
+    )
+    invoice = await new_invoice(gateway)
+    op = await gateway.service.select_invoice(invoice.public_id, gateway.rail_id)
+    async with gateway.factory() as session:
+        reference = (await session.get(GatewayOperation, op.id)).provider_reference
+
+    # A push claiming payment carries no paid fact: the provider still says active.
+    body, headers = xrocket_push(secret, reference)
+    result = await gateway.service.handle_provider_webhook(gateway.rail_id, body, headers)
+    assert result.status == "pending"
+
+    gateway.state.paid = True
+    for forged in (
+        xrocket_push("wrong-" + secret, reference),
+        xrocket_push(secret, reference, age_ms=600_000),
+    ):
+        with pytest.raises(WebhookRejected):
+            await gateway.service.handle_provider_webhook(gateway.rail_id, *forged)
+
+    body, headers = xrocket_push(secret, reference)
+    replies = await asyncio.gather(
+        *(gateway.service.handle_provider_webhook(gateway.rail_id, body, headers) for _ in range(2))
+    )
+    assert {reply.status for reply in replies} == {"completed"}
+    unknown = await gateway.service.handle_provider_webhook(
+        gateway.rail_id, *xrocket_push(secret, "not-ours")
+    )
+    assert unknown is None
+    async with gateway.factory() as session:
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(ProviderPaymentReceipt)
+                .where(ProviderPaymentReceipt.merchant_id == gateway.merchant.id)
+            )
+            == 1
+        )

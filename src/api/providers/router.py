@@ -11,7 +11,7 @@ from src.api.deps import MerchantDep, SessionDep
 from src.core.rate_limit import RATE_LIMITS, limiter
 from src.db.models import GatewayInvoiceOptions, GatewayOperation, Invoice
 from src.db.session import get_session_factory
-from src.payments.rails.base import RailError
+from src.payments.rails.base import RailError, WebhookRejected
 from src.services.gateway_provider_service import GatewayError, GatewayProviderService
 
 router = APIRouter()
@@ -192,6 +192,22 @@ async def merchant_select_provider(
     return public_operation(
         await provider_call(service.select_invoice(invoice.public_id, body.rail_id))
     )
+
+
+@router.post("/provider-webhooks/{rail_id}", include_in_schema=False)
+async def provider_webhook(rail_id: UUID, request: Request, service: ServiceDep):
+    """Unauthenticated provider push; the signature only gates a verification pass."""
+    body = await request.body()
+    if len(body) > 65536:
+        raise HTTPException(413, "Payload too large")
+    try:
+        await service.handle_provider_webhook(rail_id, body, request.headers)
+    except WebhookRejected as exc:
+        raise HTTPException(401, "Invalid provider signature") from exc
+    except RailError:
+        # Authentic push, provider read failed: the poller verifies it later.
+        pass
+    return {"ok": True}
 
 
 @router.get("/invoices/{invoice_id}/receipt", response_model=ReceiptResponse)

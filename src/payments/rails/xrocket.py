@@ -6,6 +6,11 @@ Verification uses invoice payment facts, never the requested invoice amount.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import time
+from collections.abc import Mapping
 from decimal import Decimal
 
 from src.payments.rails.base import (
@@ -20,6 +25,7 @@ from src.payments.rails.base import (
     RailPayout,
     RailPayoutRequest,
     RailType,
+    WebhookRejected,
 )
 from src.payments.rails.http import ProviderHttp, amount, identifier, money_sum, payment_url
 
@@ -27,6 +33,8 @@ API_BASES = {
     "MAIN_NET": "https://pay.api.xrocket.exchange",
     "TEST_NET": "https://pay.api.testnet.xrocket.exchange",
 }
+# Signature-Timestamp freshness bound for Current API pushes.
+WEBHOOK_WINDOW_MS = 300_000
 STATUS = {
     "active": RailInvoiceStatus.PENDING,
     "partially_paid": RailInvoiceStatus.PENDING,
@@ -272,6 +280,40 @@ class XRocketRail(Rail):
         if provider_payout_id and result.provider_payout_id != provider_payout_id:
             raise RailError("xrocket", "payout identity mismatch", outcome_unknown=True)
         return result
+
+    def webhook_invoice_id(
+        self, body: bytes, headers: Mapping[str, str], secret: str = ""
+    ) -> str | None:
+        # Current API: HMAC-SHA256("{Signature-Timestamp}.{body}") keyed by the
+        # app webhook secret as-is; the API token is a different credential.
+        timestamp = headers.get("signature-timestamp", "")
+        if (
+            not secret
+            or headers.get("signature-version") != "v1"
+            or not timestamp.isascii()
+            or not timestamp.isdecimal()
+            or abs(time.time() * 1000 - int(timestamp)) > WEBHOOK_WINDOW_MS
+        ):
+            raise WebhookRejected("xrocket signature headers are missing or stale")
+        expected = hmac.new(
+            secret.encode(), timestamp.encode() + b"." + body, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(headers.get("signature", ""), expected):
+            raise WebhookRejected("xrocket signature mismatch")
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return None
+        if not isinstance(data, dict) or data.get("type") != "invoice":
+            return None
+        event = data.get("data")
+        invoice = event.get("invoice") if isinstance(event, dict) else None
+        if not isinstance(invoice, dict):
+            return None
+        invoice_id = invoice.get("id")
+        if not isinstance(invoice_id, (int, str)) or isinstance(invoice_id, bool):
+            return None
+        return str(invoice_id) or None
 
     async def close(self) -> None:
         await self._http.close()

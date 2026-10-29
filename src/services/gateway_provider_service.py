@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -629,6 +629,46 @@ class GatewayProviderService:
                     "provider_fee": atomic_to_decimal(gross - net, asset.atomic_decimals),
                 },
             }
+
+    async def handle_provider_webhook(
+        self, rail_id: UUID, body: bytes, headers: Mapping[str, str]
+    ) -> OperationResult | None:
+        """Authenticate a provider push and verify the named invoice immediately.
+
+        The push is only a wake-up: payment facts come from poll_invoice, and the
+        poller remains the fallback for lost or rejected deliveries.
+        """
+        async with self.factory() as session:
+            merchant_id = await session.scalar(
+                select(GatewayRailConnection.merchant_id).where(
+                    GatewayRailConnection.rail_id == rail_id
+                )
+            )
+            if merchant_id is None:
+                raise GatewayError("Payment method is unavailable", status_code=404)
+            self.require_enabled(merchant_id)
+            snapshot, _ = await self._connection(session, merchant_id, rail_id)
+        adapter = self._build(snapshot)
+        try:
+            invoice_id = adapter.webhook_invoice_id(
+                body, headers, self.settings.provider_webhook_secret_map.get(str(rail_id), "")
+            )
+        finally:
+            await adapter.close()
+        if invoice_id is None:
+            return None
+        async with self.factory() as session:
+            operation_id = await session.scalar(
+                select(GatewayOperation.id).where(
+                    GatewayOperation.merchant_id == merchant_id,
+                    GatewayOperation.rail_id == rail_id,
+                    GatewayOperation.operation_type == "invoice",
+                    GatewayOperation.provider_reference == invoice_id,
+                )
+            )
+        if operation_id is None:
+            return None
+        return await self.poll_invoice(merchant_id, operation_id)
 
     async def poll_invoice(self, merchant_id: UUID, operation_id: UUID) -> OperationResult:
         self.require_enabled(merchant_id)

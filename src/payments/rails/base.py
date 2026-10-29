@@ -17,6 +17,7 @@ TG Wallet - все они умеют одно и то же, насколько �
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
@@ -148,6 +149,10 @@ class RailError(Exception):
         self.outcome_unknown = outcome_unknown
 
 
+class WebhookRejected(Exception):
+    """A push notification failed provider authentication."""
+
+
 class Rail(ABC):
     """
     Базовый класс рельса.
@@ -204,6 +209,16 @@ class Rail(ABC):
     async def payout(self, request: RailPayoutRequest) -> RailPayout:
         """Выплата пользователю. Рельсы без выплат кидают NotImplementedError."""
         raise NotImplementedError(f"{self.rail_type} does not support payouts")
+
+    def webhook_invoice_id(
+        self, body: bytes, headers: Mapping[str, str], secret: str = ""
+    ) -> str | None:
+        """Provider invoice ID named by an authentic push, or None if irrelevant.
+
+        A push only schedules server-side verification; it never carries a paid
+        fact. Raises WebhookRejected when the provider signature does not match.
+        """
+        raise WebhookRejected(f"{self.rail_type.value} push notifications are unsupported")
 
     async def close(self) -> None:
         """Освободить HTTP-ресурсы, если есть."""
