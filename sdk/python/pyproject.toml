@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arbitron-sdk"
-version = "0.3.1"
+version = "0.4.0"
 description = "Python client for the Arbitron payment gateway"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,6 +12,7 @@ license = { text = "Proprietary" }
 dependencies = ["aiohttp>=3.9"]
 
 [project.optional-dependencies]
+aiogram = ["aiogram>=3.4,<4"]
 test = ["pytest>=8", "pytest-asyncio>=0.23"]
 
 [tool.setuptools.packages.find]

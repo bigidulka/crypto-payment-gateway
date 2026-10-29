@@ -367,3 +367,34 @@ class ArbitronClient:
             "POST" if reconcile else "GET",
             f"/v1/onchain/operations/{operation_id}" + ("/reconcile" if reconcile else ""),
         )
+
+    # --- Telegram checkout (меню оплаты рисует шлюз) ---
+
+    async def checkout_profile(self) -> dict:
+        return await self._request("GET", "/v1/checkout/profile")
+
+    async def put_checkout_profile(self, profile: dict[str, Any]) -> dict:
+        return await self._request("PUT", "/v1/checkout/profile", json=profile)
+
+    async def checkout_screen(
+        self, telegram_user_id: int, action: dict[str, Any], *, lang: str | None = None
+    ) -> dict:
+        """Следующий экран меню оплаты для пользователя Telegram."""
+        return await self._request(
+            "POST",
+            "/v1/checkout/telegram",
+            json={"telegram_user_id": telegram_user_id, "lang": lang, "action": action},
+        )
+
+    async def checkout_payments(self, *, limit: int = 50) -> list[dict]:
+        """Подтверждённые оплаты, ещё не подтверждённые ботом (ack)."""
+        return (await self._request("GET", "/v1/checkout/payments", params={"limit": limit}))[
+            "items"
+        ]
+
+    async def checkout_payment(self, invoice_id: str) -> dict:
+        return await self._request("GET", f"/v1/checkout/payments/{invoice_id}")
+
+    async def ack_checkout_payment(self, invoice_id: str) -> dict:
+        """Идемпотентно: после ack позиция больше не приходит в ленту."""
+        return await self._request("POST", f"/v1/checkout/payments/{invoice_id}/ack")

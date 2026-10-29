@@ -145,3 +145,11 @@ xRocket — transfer. Потерянная отправка сохраняет �
 Пример с durable заказом и дедупликацией после рестарта:
 [product_payment.py](../../examples/product_payment.py).
 API и rollout: [provider-payments.md](../../docs/provider-payments.md).
+
+## 0.4.0: меню оплаты в Telegram рисует шлюз
+
+`TelegramCheckout(client, credit)` показывает экраны шлюза и зачисляет только
+подтверждённые оплаты из ленты: `credit(telegram_user_id, amount, external_id, item)`
+идемпотентно по `external_id`, ack — только после истины. Адаптер aiogram 3
+(`pip install arbitron-sdk[aiogram]`): `arbitron_sdk.aiogram.checkout_router`
+и `send_checkout`. Подробно и пример бота: `docs/TELEGRAM_CHECKOUT.md` шлюза.

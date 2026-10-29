@@ -18,8 +18,12 @@ Arbitron Payment Gateway - Python SDK.
 
     # на входящем вебхуке:
     event = verify_webhook(body_bytes, headers, secret)
+
+Меню оплаты в Telegram целиком рисует шлюз — см. `TelegramCheckout`
+и необязательный `arbitron_sdk.aiogram`.
 """
 
+from .checkout import Screen, TelegramCheckout
 from .client import ArbitronClient, ArbitronError
 from .models import (
     ChainInfo,
@@ -34,10 +38,12 @@ from .models import (
 from .product import ProductPayments
 from .webhooks import WebhookVerificationError, verify_webhook
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 __all__ = [
     "ProductPayments",
+    "Screen",
+    "TelegramCheckout",
     "ArbitronClient",
     "ArbitronError",
     "ChainInfo",
