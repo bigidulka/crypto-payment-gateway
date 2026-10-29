@@ -68,7 +68,7 @@ BEGIN
     SELECT 1 FROM public.gateway_rail_connections c
     JOIN public.gateway_operations o ON o.id=NEW.payout_operation_id AND o.merchant_id=c.merchant_id
       AND o.rail_id=c.rail_id AND o.operation_type='payout' AND o.ledger_asset_id=NEW.ledger_asset_id
-      AND o.amount_atomic>=NEW.amount_atomic
+      AND o.amount_atomic>=NEW.amount_atomic AND o.status='submitting'
     JOIN public.ledger_transactions t ON t.id=NEW.ledger_transaction_id AND t.merchant_id=c.merchant_id
     WHERE c.rail_id=NEW.rail_id AND c.merchant_id=NEW.merchant_id
       AND t.status='posted' AND t.source_namespace='gateway_liquidity_recognition'

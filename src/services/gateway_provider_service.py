@@ -7,7 +7,7 @@ import hmac
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID, uuid4
 
@@ -73,6 +73,10 @@ def credentials_digest(value: str) -> str:
 
 def account_digest(rail_type: str, network: str, account: str) -> str:
     return digest({"provider": rail_type, "network": network, "account": account})
+
+
+# Clock skew allowance before asking the provider whether an invoice expired.
+PROVIDER_EXPIRY_GRACE = timedelta(minutes=2)
 
 
 class GatewayError(AppException):
@@ -647,11 +651,14 @@ class GatewayProviderService:
             operation.updated_at = datetime.now(UTC)
             await session.flush()
             snapshot, connection = await self._connection(session, merchant_id, operation.rail_id)
-            mapping_id, status, created_at = (
+            mapping_id, status, created_at, reference = (
                 operation.mapping_id,
                 operation.status,
                 operation.created_at,
+                operation.provider_reference,
             )
+            payable_account_id = connection.payable_account_id
+            expires_at = (await session.get(Invoice, operation.invoice_id)).expires_at
             if mapping_id is not None:
                 mapping = await session.get(ProviderPaymentMapping, mapping_id)
                 binding = ProviderVerificationBinding(
@@ -684,11 +691,20 @@ class GatewayProviderService:
                     merchant_id, mapping_id, BoundVerifier(adapter, binding, snapshot)
                 )
                 if observation is None:
+                    if expires_at + PROVIDER_EXPIRY_GRACE <= datetime.now(UTC):
+                        return await self._close_expired(merchant_id, operation_id, adapter, reference)
                     return await self.get_operation(merchant_id, operation_id)
                 if observation.settled_amount_atomic is None:
                     # No price-based credit when actual provider fees are unknown.
                     raise ProviderReconciliationConflict("settlement evidence is unavailable")
                 async with session.begin():
+                    # Same lock as payouts and liquidity recognition: a payout never
+                    # sees provider funds that are neither open nor yet in the ledger.
+                    await session.scalar(
+                        select(LedgerAccount.id)
+                        .where(LedgerAccount.id == payable_account_id)
+                        .with_for_update()
+                    )
                     await service.consume_verified_observation(merchant_id, observation)
                     operation = await session.scalar(
                         select(GatewayOperation)
@@ -724,6 +740,26 @@ class GatewayProviderService:
             return await self.get_operation(merchant_id, operation_id)
         finally:
             await adapter.close()
+
+    async def _close_expired(self, merchant_id, operation_id, adapter, reference):
+        # Provider TTL never exceeds the invoice TTL; only the provider's own
+        # EXPIRED verdict ends the operation, so a late paid invoice still credits.
+        provider_invoice = await adapter.get_invoice(reference)
+        if provider_invoice.status != RailInvoiceStatus.EXPIRED:
+            return await self.get_operation(merchant_id, operation_id)
+        async with self.factory() as session, session.begin():
+            operation = await session.scalar(
+                select(GatewayOperation)
+                .where(
+                    GatewayOperation.id == operation_id,
+                    GatewayOperation.merchant_id == merchant_id,
+                )
+                .with_for_update()
+            )
+            if operation.status == "pending":
+                operation.status, operation.failure_code = "failed", "provider_invoice_expired"
+                await session.flush()
+            return OperationResult.from_row(operation)
 
     async def poll_batch(self, limit: int = 50) -> int:
         if not self.settings.ledger_rail_orchestration_enabled:
