@@ -7,12 +7,13 @@ await send_checkout(checkout, bot, chat_id, user_id, lang)   # кнопка «П
 from __future__ import annotations
 
 import inspect
+import logging
 from collections.abc import Callable
 from typing import Any
 
 try:
     from aiogram import F, Router
-    from aiogram.exceptions import TelegramBadRequest
+    from aiogram.exceptions import TelegramAPIError
     from aiogram.types import (
         CallbackQuery,
         InlineKeyboardButton,
@@ -25,6 +26,8 @@ except ImportError as exc:  # pragma: no cover - exercised without aiogram
 
 from .checkout import CALLBACK_PREFIX, Screen, TelegramCheckout
 from .client import ArbitronError
+
+log = logging.getLogger(__name__)
 
 UNAVAILABLE = {
     "ru": "Оплата временно недоступна. Попробуйте позже.",
@@ -66,26 +69,37 @@ def checkout_router(
 
     @router.callback_query(F.data.startswith(CALLBACK_PREFIX))
     async def on_callback(query: CallbackQuery) -> None:
-        lang = await _language(lang_of, query.from_user)
+        answered = False
         try:
-            screen = await checkout.callback(query.from_user.id, query.data, lang)
-        except ArbitronError:
-            await query.answer(_unavailable(lang), show_alert=True)
-            return
-        if screen.text is not None and isinstance(query.message, Message):
+            lang = await _language(lang_of, query.from_user)
             try:
-                await query.message.edit_text(**screen_kwargs(screen))
-            except TelegramBadRequest as exc:
-                if "message is not modified" not in str(exc):
-                    raise
-        await query.answer(screen.toast)
+                screen = await checkout.callback(query.from_user.id, query.data, lang)
+            except ArbitronError:
+                answered = True
+                await query.answer(_unavailable(lang), show_alert=True)
+                return
+            # Answer first: Telegram keeps the button spinner until the query is answered.
+            answered = True
+            try:
+                await query.answer(screen.toast)
+            except TelegramAPIError as exc:
+                # A slow invoice may outlive the query; the screen still has to be shown.
+                log.warning("checkout callback answer failed: %s", type(exc).__name__)
+            if screen.text is not None:
+                await _show(query, screen)
+        finally:
+            if not answered:
+                try:
+                    await query.answer()
+                except TelegramAPIError:
+                    pass
 
     def awaiting(message: Message) -> bool:
         return (
             message.from_user is not None
             and isinstance(message.text, str)
             and not message.text.startswith("/")
-            and checkout.awaiting_input(message.from_user.id)
+            and checkout.wants_input(message.from_user.id, message.text)
         )
 
     @router.message(awaiting)
@@ -100,6 +114,24 @@ def checkout_router(
             await message.answer(**screen_kwargs(screen))
 
     return router
+
+
+async def _show(query: CallbackQuery, screen: Screen) -> None:
+    """Edit the menu message; if Telegram refuses, send the screen as a new message."""
+    kwargs = screen_kwargs(screen)
+    message = query.message
+    if isinstance(message, Message):
+        try:
+            await message.edit_text(**kwargs)
+            return
+        except TelegramAPIError as exc:
+            if "message is not modified" in str(exc):
+                return
+            log.warning("checkout menu edit failed, sending a new message: %s", type(exc).__name__)
+        await message.answer(**kwargs)
+        return
+    chat_id = message.chat.id if message is not None else query.from_user.id
+    await query.bot.send_message(chat_id, **kwargs)
 
 
 async def send_checkout(

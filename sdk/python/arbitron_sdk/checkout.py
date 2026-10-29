@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -27,7 +28,8 @@ from .webhooks import verify_webhook
 log = logging.getLogger(__name__)
 
 CALLBACK_PREFIX = "ap:"
-INPUT_TTL_SECONDS = 600
+INPUT_TTL_SECONDS = 300
+_AMOUNT_TEXT = re.compile(r"^\s*\$?\s*[0-9]{1,7}(?:[.,][0-9]{1,2})?\s*$")
 PAGE_SIZE = 50
 MAX_PAGES = 20
 
@@ -116,6 +118,7 @@ class TelegramCheckout:
         self._page_size = page_size
         self._awaiting: dict[int, float] = {}
         self._sync_lock = asyncio.Lock()
+        self._tasks: set[asyncio.Task] = set()
 
     @staticmethod
     def is_ours(callback_data: object) -> bool:
@@ -129,6 +132,19 @@ class TelegramCheckout:
             self._awaiting.pop(user_id, None)
             return False
         return True
+
+    def wants_input(self, user_id: int, text: object) -> bool:
+        """Перехватывать ли сообщение как свою сумму.
+
+        Только текст, похожий на сумму, пока меню ждёт ввод. Любой другой текст
+        закрывает ожидание и уходит обычным обработчикам бота.
+        """
+        if not self.awaiting_input(user_id):
+            return False
+        if isinstance(text, str) and _AMOUNT_TEXT.match(text):
+            return True
+        self._awaiting.pop(user_id, None)
+        return False
 
     async def start(self, user_id: int, lang: str | None = None) -> Screen:
         return await self._screen(user_id, lang, {"type": "start"})
@@ -146,29 +162,38 @@ class TelegramCheckout:
         except (AttributeError, TypeError, ValueError) as exc:
             raise ArbitronError("Gateway returned an invalid screen") from exc
         if screen.text is not None:
-            if screen.expect_input:
-                self._awaiting[user_id] = time.monotonic() + self._input_ttl
-            else:
+            if not screen.expect_input:
                 self._awaiting.pop(user_id, None)
+            elif not self.awaiting_input(user_id):
+                # A rejected amount keeps the window; it never extends it.
+                self._awaiting[user_id] = time.monotonic() + self._input_ttl
         if screen.paid:
-            try:
-                await self.sync()
-            except Exception:
-                log.exception("checkout sync after payment failed; the loop retries")
+            task = asyncio.create_task(self._sync_quietly())
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
         return screen
+
+    async def _sync_quietly(self) -> None:
+        try:
+            await self.sync()
+        except Exception:
+            log.exception("checkout sync after payment failed; the loop retries")
 
     async def sync(self) -> int:
         """Зачислить подтверждённые оплаты. Возвращает число зачисленных позиций."""
         async with self._sync_lock:
             credited = 0
+            after = None
+            # Pages past items that were not credited, until the gateway has none left.
             for _ in range(MAX_PAGES):
-                items = await self.client.checkout_payments(limit=self._page_size)
-                progressed = False
+                items = await self.client.checkout_payments(limit=self._page_size, after=after)
+                if not items:
+                    break
                 for item in items:
                     if await self._credit_item(item):
                         credited += 1
-                        progressed = True
-                if len(items) < self._page_size or not progressed:
+                after = items[-1].get("invoice_id") if isinstance(items[-1], dict) else None
+                if not isinstance(after, str):
                     break
             return credited
 

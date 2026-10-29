@@ -386,11 +386,12 @@ class ArbitronClient:
             json={"telegram_user_id": telegram_user_id, "lang": lang, "action": action},
         )
 
-    async def checkout_payments(self, *, limit: int = 50) -> list[dict]:
-        """Подтверждённые оплаты, ещё не подтверждённые ботом (ack)."""
-        return (await self._request("GET", "/v1/checkout/payments", params={"limit": limit}))[
-            "items"
-        ]
+    async def checkout_payments(self, *, limit: int = 50, after: str | None = None) -> list[dict]:
+        """Подтверждённые оплаты без ack; `after` — invoice_id последней виденной позиции."""
+        params: dict[str, Any] = {"limit": limit}
+        if after:
+            params["after"] = after
+        return (await self._request("GET", "/v1/checkout/payments", params=params))["items"]
 
     async def checkout_payment(self, invoice_id: str) -> dict:
         return await self._request("GET", f"/v1/checkout/payments/{invoice_id}")

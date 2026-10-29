@@ -1,5 +1,6 @@
 """Telegram checkout connector against a local fake gateway."""
 
+import asyncio
 import sys
 import time
 from decimal import Decimal
@@ -47,7 +48,9 @@ METHODS = {
 
 @pytest.fixture
 async def gateway():
-    state = SimpleNamespace(items=[dict(ITEM)], acked=[], screens=[], next_screen=METHODS)
+    state = SimpleNamespace(
+        items=[dict(ITEM)], acked=[], screens=[], next_screen=METHODS, page_cap=100
+    )
     app = web.Application()
 
     async def screen(request):
@@ -57,9 +60,14 @@ async def gateway():
         return web.json_response(state.next_screen)
 
     async def payments(request):
-        return web.json_response(
-            {"items": [i for i in state.items if i["invoice_id"] not in state.acked]}
-        )
+        pending = [i for i in state.items if i["invoice_id"] not in state.acked]
+        after = request.query.get("after")
+        if after:
+            ids = [i["invoice_id"] for i in state.items]
+            pending = [i for i in pending if ids.index(i["invoice_id"]) > ids.index(after)]
+        # page_cap simulates a gateway page cut short by server-side filtering.
+        limit = min(int(request.query["limit"]), state.page_cap)
+        return web.json_response({"items": pending[:limit]})
 
     async def ack(request):
         state.acked.append(request.match_info["invoice_id"])
@@ -144,13 +152,43 @@ async def test_screens_track_input_and_paid_screen_syncs(gateway):
     gateway.state.next_screen = {**METHODS, "text": None, "toast": "busy"}
     await checkout.input(42, "12.50")
     assert checkout.awaiting_input(42)
+    # A rejected amount keeps the input window without extending it.
+    deadline = checkout._awaiting[42]
+    gateway.state.next_screen = {**METHODS, "expect_input": True}
+    await checkout.input(42, "100000")
+    assert checkout._awaiting[42] == deadline
+    for text in ("12", "7.50", "$7,5", " 7.5 "):
+        assert checkout.wants_input(42, text)
+    assert not checkout.wants_input(43, "12")
+    assert not checkout.wants_input(42, "hello support") and not checkout.awaiting_input(42)
+    assert not checkout.wants_input(42, "12")
     gateway.state.next_screen = {**METHODS, "paid": True}
     assert (await checkout.callback(42, "ap:abc:k")).paid
+    # The post-payment sync runs in the background, not inside the callback.
+    await asyncio.gather(*checkout._tasks)
     assert not checkout.awaiting_input(42) and credited == [f"gateway-{INVOICE}"]
     expiring = TelegramCheckout(gateway.client, credit, input_ttl_seconds=-1)
     gateway.state.next_screen = {**METHODS, "expect_input": True}
     await expiring.start(7)
     assert not expiring.awaiting_input(7)
+
+
+async def test_sync_pages_past_uncredited_items_and_short_pages(gateway):
+    second = "5b2f0a71-6c1d-4a4e-8f0e-1d2c3b4a5f60"
+    third = "7c3e1b82-7d2e-4b5f-9a1f-2e3d4c5b6a71"
+    gateway.state.items = [
+        dict(ITEM),
+        {**ITEM, "invoice_id": second, "external_id": f"gateway-{second}"},
+        {**ITEM, "invoice_id": third, "external_id": f"gateway-{third}"},
+    ]
+    gateway.state.page_cap = 1
+
+    async def credit(user_id, amount, external_id, item):
+        return external_id != f"gateway-{INVOICE}"
+
+    checkout = TelegramCheckout(gateway.client, credit, page_size=2)
+    assert await checkout.sync() == 2
+    assert gateway.state.acked == [second, third]
 
 
 def test_screen_rejects_foreign_buttons():
@@ -199,18 +237,25 @@ async def test_aiogram_router_edits_message_and_answers_input(gateway, monkeypat
     assert markup.inline_keyboard[1][0].url == "https://t.me/pay"
     assert screen_kwargs(Screen(text="x"))["reply_markup"] is None
 
+    from aiogram.exceptions import TelegramBadRequest
+
     router = checkout_router(checkout, lang_of=lambda user: "ru")
     assert isinstance(router, aiogram.Router)
-    edits, answers, replies = [], [], []
+    events = []
+    failures = {}
 
     async def edit_text(self, **kwargs):
-        edits.append(kwargs)
+        if "edit" in failures:
+            raise failures.pop("edit")
+        events.append(("edit", kwargs["text"]))
 
     async def answer_query(self, text=None, **kwargs):
-        answers.append(text)
+        if "answer" in failures:
+            raise failures.pop("answer")
+        events.append(("answer", text))
 
     async def answer_message(self, **kwargs):
-        replies.append(kwargs)
+        events.append(("message", kwargs.get("text")))
 
     monkeypatch.setattr(Message, "edit_text", edit_text)
     monkeypatch.setattr(Message, "answer", answer_message)
@@ -226,7 +271,8 @@ async def test_aiogram_router_edits_message_and_answers_input(gateway, monkeypat
     on_message = router.message.handlers[0]
     gateway.state.next_screen = {**METHODS, "expect_input": True, "toast": "hint"}
     await on_callback.call(query)
-    assert edits[-1]["text"] == METHODS["text"] and answers == ["hint"]
+    # The query is answered before the message is edited.
+    assert events == [("answer", "hint"), ("edit", METHODS["text"])]
     assert gateway.state.screens[-1]["lang"] == "ru"
     assert (await on_message.check(message))[0]
     command = Message.model_construct(
@@ -235,7 +281,32 @@ async def test_aiogram_router_edits_message_and_answers_input(gateway, monkeypat
     assert not (await on_message.check(command))[0]
     gateway.state.next_screen = METHODS
     await on_message.call(message)
-    assert replies[-1]["text"] == METHODS["text"]
+    assert events[-1] == ("message", METHODS["text"])
+    # Ordinary text while the menu waits falls through to the bot's own handlers.
+    gateway.state.next_screen = {**METHODS, "expect_input": True}
+    await on_callback.call(query)
+    chat = Message.model_construct(
+        message_id=3, date=0, chat=message.chat, from_user=user, text="help me"
+    )
+    assert not (await on_message.check(chat))[0] and not checkout.awaiting_input(42)
+    events.clear()
     gateway.state.next_screen = {**METHODS, "text": None, "toast": "not yours"}
     await on_callback.call(query)
-    assert len(edits) == 1 and answers[-1] == "not yours"
+    assert events == [("answer", "not yours")]
+    # An uneditable message gets the screen as a new message.
+    events.clear()
+    gateway.state.next_screen = METHODS
+    failures["edit"] = TelegramBadRequest(method=None, message="message can't be edited")
+    await on_callback.call(query)
+    assert events == [("answer", None), ("message", METHODS["text"])]
+    # A stale query cannot answer, yet the screen is still shown.
+    events.clear()
+    failures["answer"] = TelegramBadRequest(method=None, message="query is too old")
+    await on_callback.call(query)
+    assert events == [("edit", METHODS["text"])]
+    # An unexpected failure still answers the query.
+    events.clear()
+    monkeypatch.setattr(checkout, "callback", lambda *a: (_ for _ in ()).throw(RuntimeError()))
+    with pytest.raises(RuntimeError):
+        await on_callback.call(query)
+    assert events == [("answer", None)]
